@@ -612,7 +612,7 @@ typedef enum {
   REP8 (NODE_EL, SIGNED, UNSIGNED, BOOL, STRUCT, UNION, ENUM, ENUM_CONST, MEMBER),
   REP8 (NODE_EL, CONST, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC),
   REP8 (NODE_EL, STAR, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT),
-  REP6 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR, CLASS, STRING),
+  REP7 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR, CLASS, STRING, CONCAT),
 } node_code_t;
 
 #undef REP_SEP
@@ -906,6 +906,7 @@ static void error (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   n_errors++;
   va_start (args, format);
   print_pos (f, pos, TRUE);
+  fprintf (f, "error -- ");
   vfprintf (f, format, args);
   va_end (args);
   fprintf (f, "\n");
@@ -1708,6 +1709,11 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
                                             new_str_node (c2m_ctx, N_STR16, empty_str, pos))
                           : new_node_token (c2m_ctx, pos, VARR_ADDR (char, symbol_text), T_CH,
                                             new_ch16_node (c2m_ctx, ' ', pos)));
+      } else if (wide_type == 'f') { //fstring
+        t = (stop == '\"' ? new_node_token (c2m_ctx, pos, VARR_ADDR (char, symbol_text), T_STR,
+                                            new_str_node (c2m_ctx, N_STRING, empty_str, pos))
+                          : new_node_token (c2m_ctx, pos, VARR_ADDR (char, symbol_text), T_CH,
+                                            new_ch16_node (c2m_ctx, ' ', pos)));
       } else {
         t = (stop == '\"' ? new_node_token (c2m_ctx, pos, VARR_ADDR (char, symbol_text), T_STR,
                                             new_str_node (c2m_ctx, N_STR, empty_str, pos))
@@ -1719,7 +1725,8 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
     }
     default:
       if (isalpha (curr_c) || curr_c == '_') {
-        if (curr_c == 'L' || curr_c == 'u' || curr_c == 'U') {
+		// Unicode, fstring
+        if (curr_c == 'L' || curr_c == 'u' || curr_c == 'U' || curr_c == 'f') {
           wide_type = curr_c;
           if ((curr_c = cs_get (c2m_ctx)) == '\"' || curr_c == '\'') {
             VARR_PUSH (char, symbol_text, wide_type);
@@ -5835,8 +5842,16 @@ static int arithmetic_type_p (const struct type *type) {
   return integer_type_p (type) || floating_type_p (type);
 }
 
+static int string_type_p (const struct type *type) {
+	if (type->mode == TM_PTR && type->pos_node && type->pos_node->code == N_STR)
+		return 1;
+	return (type->mode == TM_BASIC || type->mode == TM_PTR) 
+		&& (type->u.basic_type == TP_STRING || type->u.basic_type == TM_PTR);
+}
+
 static int scalar_type_p (const struct type *type) {
-  return arithmetic_type_p (type) || type->mode == TM_PTR;
+  // RSD: Added string_type_p
+  return arithmetic_type_p (type) || string_type_p (type) || type->mode == TM_PTR;
 }
 
 static struct type get_ptr_int_type (int signed_p) {
@@ -6790,10 +6805,17 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
     case N_SIGNED:
     case N_SHORT:
     case N_LONG: set_type_pos_node (type, n); break;
-	case N_STRING:
 	  // FIXME: Just set it to char ???
       set_type_pos_node (type, n);
 	  type->u.basic_type = TP_CHAR;
+	  type->type_qual.const_p = 1; // Set constant
+	  type->raw_size = 8; // ptr size
+	  type->align = 8; // 64b alignment
+	  break;
+	case N_STRING:
+	  // FIXME: Just set it to char ???
+      set_type_pos_node (type, n);
+	  type->u.basic_type = TP_STRING;
 	  type->type_qual.const_p = 1; // Set constant
 	  type->raw_size = 8; // ptr size
 	  type->align = 8; // 64b alignment
@@ -7366,11 +7388,14 @@ static void check_type (c2m_ctx_t c2m_ctx, struct type *type, int level, int fun
   }
 }
 
+// NB: This will always generate a warning or error
 static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct type *right,
                                     struct expr *expr, node_t assign_node) {
   node_code_t code = assign_node->code;
   const char *msg;
 
+  // TODO I don't know...
+  //printf("1. check_assignment_types\n");
   if (right == NULL) right = expr->type;
   if (arithmetic_type_p (left)) {
     if (!arithmetic_type_p (right)
@@ -7388,6 +7413,14 @@ static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct
         error (c2m_ctx, POS (assign_node), "%s", msg);
       }
     }
+  } else if (string_type_p (left)) {
+	  if (!string_type_p (right)) {
+        msg = (code == N_CALL ? "incompatible argument type for string type parameter"
+               : code != N_RETURN
+                 ? "incompatible types in assignment to an string type lvalue"
+                 : "incompatible return-expr type in function returning an string value");
+        error (c2m_ctx, POS (assign_node), "%s", msg);
+	  }
   } else if (left->mode == TM_STRUCT || left->mode == TM_UNION) {
     if ((right->mode != TM_STRUCT && right->mode != TM_UNION)
         || !compatible_types_p (left, right, TRUE)) {
@@ -7808,8 +7841,9 @@ check_one_value:
   if (initializer->code != N_LIST
       && !(type->mode == TM_ARR
            && init_compatible_string_p (initializer, type->u.arr_type->el_type))) {
-    if ((cexpr = initializer->attr)->const_p || initializer->code == N_STR
+    if ((cexpr  = initializer->attr)->const_p || initializer->code == N_STR
         || initializer->code == N_STR16 || initializer->code == N_STR32 || !const_only_p) {
+		//TODO handle N_STRING for fstring
       check_assignment_types (c2m_ctx, type, NULL, cexpr, initializer);
     } else {
       setup_const_addr_p (c2m_ctx, initializer);
@@ -8156,6 +8190,65 @@ static void get_int_node (c2m_ctx_t c2m_ctx, node_t *op, struct expr **e, struct
   (*e)->c.i_val = i;  // ???
 }
 
+// NB This is super unsafe and likely to crash...
+// TODO: Use the NL_ macros and add more checks
+static node_t get_array_node_from_spec ( node_t specdecl_node ) {
+	if( specdecl_node->code != N_SPEC_DECL ||
+		specdecl_node->u.ops.head == NULL ||
+		specdecl_node->u.ops.head->code != N_SHARE)
+		return NULL;
+
+	return specdecl_node->u.ops.head->op_link.next->u.ops.head->op_link.next->u.ops.head;	
+}
+
+// Get an item from an array
+// TODO: Use the NL_ macros
+static node_t get_array_member_id(c2m_ctx_t c2m_ctx, node_t ind) {
+	node_t id_node, i_node, spec_node;
+	node_t list_node, init_node;
+	struct expr *e;
+	unsigned long count=0; 
+
+	if(ind->code != N_IND) {
+		printf("get_array_member not called with N_IND\n");
+		return NULL;
+	}
+
+	if(ind->u.ops.tail && ind->u.ops.head &&
+			ind->u.ops.head->code == N_ID &&
+			ind->u.ops.tail->code == N_I) {
+		id_node = ind->u.ops.head; // N_ID (ID node of array)
+		i_node = ind->u.ops.tail; // N_I integer (array count offset)
+	} else {
+		printf("get_array_member Invalid array (head->N_ID or tail->N_I not found)\n");
+		return NULL;
+	}
+	// Get the array index from the N_I int node;
+	count = i_node->u.ul;
+	printf("get_array_member: array index = %lu\n", count);
+	// Expression of ind node
+	spec_node = ((struct expr *)(id_node->attr))->u.lvalue_node;
+	// List node from expression -> lvalue_node->tail
+	list_node = spec_node->u.ops.tail;
+	if(list_node->code != N_LIST) {
+		printf("get_array_member Invalid expression, N_LIST not found)\n");
+		return NULL;
+	}
+	// Get first N_INIT in the array
+	init_node = list_node->u.ops.head;
+	// Iterate list to item
+	while(count-- && init_node->op_link.next)
+		init_node = init_node->op_link.next;
+	if(count > 0) {
+		printf("get_array_member ERROR --- array overflow\n");
+	}
+
+	// Should be the dara item in the list
+	return init_node->u.ops.tail;
+
+	return NULL;	
+}
+
 static struct expr *check_assign_op (c2m_ctx_t c2m_ctx, node_t r, struct expr *e1, struct expr *e2,
                                      struct type *t1, struct type *t2) {
   struct expr *e = NULL;
@@ -8231,6 +8324,7 @@ static struct expr *check_assign_op (c2m_ctx_t c2m_ctx, node_t r, struct expr *e
   case N_SUB:
   case N_ADD_ASSIGN:
   case N_SUB_ASSIGN: {
+
     mir_size_t size;
     int add_p
       = (r->code == N_ADD || r->code == N_ADD_ASSIGN || r->code == N_INC || r->code == N_POST_INC);
@@ -8238,6 +8332,7 @@ static struct expr *check_assign_op (c2m_ctx_t c2m_ctx, node_t r, struct expr *e
     e = create_expr (c2m_ctx, r);
     e->type->mode = TM_BASIC;
     e->type->u.basic_type = TP_INT;
+
     if (arithmetic_type_p (t1) && arithmetic_type_p (t2)) {
       t = arithmetic_conversion (t1, t2);
       e->type->u.basic_type = t.u.basic_type;
@@ -8639,7 +8734,9 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     break;
   case N_STR:
   case N_STR16:
-  case N_STR32: {
+  case N_STR32: 
+  case N_STRING: {
+	// TODO: Handle fstring in N_STRING
     struct arr_type *arr_type;
     int size = r->code == N_STR ? 1 : r->code == N_STR16 ? 2 : 4;
 
@@ -8888,6 +8985,20 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
   case N_DIV:
   case N_MOD:
     process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
+    // FIXME: Perform N_ADD overload **HERE**
+	//printf("N_ADD %d == %d\n", t1->u.basic_type, t2->u.basic_type);
+	if(t1 && t2 && t1->pos_node && t2->pos_node &&
+		t1->u.basic_type == TP_STRING &&
+		t2->u.basic_type == TP_STRING ) {
+
+	  printf("Check for N_ADD to N_CONCAT\n");
+	  if(t1->pos_node->u.ops.head->code == N_STRING ||
+		 t2->pos_node->u.ops.head->code == N_STRING) {
+			// Overload N_ADD to N_CONCAT
+			printf("Overload N_ADD to N_CONCAT\n");
+			r->code = N_CONCAT;
+	  }
+	}
     e = check_assign_op (c2m_ctx, r, e1, e2, t1, t2);
     break;
   case N_AND_ASSIGN:
@@ -12308,6 +12419,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_STR16:
   case N_STR32: res = new_op (NULL, MIR_new_ref_op (ctx, get_string_data (c2m_ctx, r))); break;
   case N_STR:
+  case N_STRING: // TODO: handle fstring
     res
       = new_op (NULL,
                 MIR_new_str_op (ctx, (MIR_str_t){r->u.s.len, r->u.s.s}));  //???what to do with decl
@@ -13586,6 +13698,132 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label (c2m_ctx, r);
     top_gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, NULL);
     break;
+// This is broken - it does print the variable name though! :)
+	/*
+  case N_CONCAT: {
+    // Get the two string operands
+    node_t str1_node = NL_HEAD(r->u.ops);
+    node_t str2_node = NL_EL(r->u.ops, 1);
+    
+    // Ensure operands are N_STR nodes
+    assert(str1_node->code == N_STR && str2_node->code == N_STR);
+    
+    // Extract string data and lengths
+    const char *str1 = str1_node->u.s.s;
+    size_t len1 = str1_node->u.s.len;
+    const char *str2 = str2_node->u.s.s;
+    size_t len2 = str2_node->u.s.len;
+    
+    // Calculate total length including null terminator
+    size_t total_len = len1 + len2 + 1;
+    
+    // Allocate stack space and get a register to hold the pointer
+    MIR_reg_t stack_ptr_reg = MIR_new_func_reg(ctx, curr_func->u.func, MIR_T_I64, "concat_ptr");
+    MIR_append_insn(ctx, curr_func,
+                    MIR_new_insn(ctx, MIR_ALLOCA,
+                                 MIR_new_reg_op(ctx, stack_ptr_reg),
+                                 MIR_new_int_op(ctx, total_len)));
+    
+    // Copy the first string to the stack
+    for (size_t i = 0; i < len1; i++) {
+        MIR_op_t mem_op = MIR_new_mem_op(ctx, MIR_T_I8, i, stack_ptr_reg, 0, 1);
+        MIR_op_t char_op = MIR_new_int_op(ctx, (int)str1[i]);
+        MIR_append_insn(ctx, curr_func, MIR_new_insn(ctx, MIR_MOV, mem_op, char_op));
+    }
+    
+    // Copy the second string after the first
+    for (size_t i = 0; i < len2; i++) {
+        MIR_op_t mem_op = MIR_new_mem_op(ctx, MIR_T_I8, len1 + i, stack_ptr_reg, 0, 1);
+        MIR_op_t char_op = MIR_new_int_op(ctx, (int)str2[i]);
+        MIR_append_insn(ctx, curr_func, MIR_new_insn(ctx, MIR_MOV, mem_op, char_op));
+    }
+    
+    // Add null terminator
+    MIR_op_t mem_op = MIR_new_mem_op(ctx, MIR_T_I8, len1 + len2, stack_ptr_reg, 0, 1);
+    MIR_op_t null_op = MIR_new_int_op(ctx, 0);
+    MIR_append_insn(ctx, curr_func, MIR_new_insn(ctx, MIR_MOV, mem_op, null_op));
+    
+    // Set the result as the pointer to the concatenated string
+    res = new_op(NULL, MIR_new_reg_op(ctx, stack_ptr_reg));
+    break;
+  } */
+  case N_CONCAT: {
+    // Get the two string operand nodes from the linked list
+    node_t str1_node = NL_HEAD(r->u.ops);         // First operand
+    node_t str2_node = NL_EL(r->u.ops, 1);        // Second operand
+	node_t str1data, str2data;
+
+	// Get array values (returns N_STR)
+	if(str1_node->code == N_IND)
+		str1_node = get_array_member_id(c2m_ctx, str1_node);
+	if(str2_node->code == N_IND)
+		str2_node = get_array_member_id(c2m_ctx, str2_node);
+
+	// Locate the N_ID nodes
+	if(str1_node->code != N_STR) {
+		for(; str1_node->code != N_ID && str1_node->u.ops.tail; str1_node = str1_node->u.ops.tail );
+		// Access the expression attributes for both strings
+		struct expr *e1 = str1_node->attr;
+		// Find the string2  N_STR
+		str1data = e1->u.lvalue_node;
+		for(; str1data && str1data->code != N_STR && str1data->u.ops.tail ; str1data = str1data->u.ops.tail );
+	} else {
+		str1data = str1_node;
+	}
+
+	if(str2_node->code != N_STR) {
+		for(; str2_node->code != N_ID && str2_node->u.ops.tail; str2_node = str2_node->u.ops.tail );
+    	struct expr *e2 = str2_node->attr;
+		// Find the string2  N_STR
+		str2data = e2->u.lvalue_node;
+		for(; str2data && str2data != NULL && str2data->code != N_STR && str2data->u.ops.tail ; str2data = str2data->u.ops.tail );
+	} else {
+		str2data = str2_node;
+	}
+
+	if (str1data == NULL || str2data == NULL) {
+        warning (c2m_ctx, POS (r), "N_CONCAT MIR gen failure: invalid lvalue strings");
+		break;
+	}
+    
+    // Extract the string pointers and lengths
+    const char *str1 = str1data->u.s.s;    // Pointer to first string
+    size_t len1 = str1data->u.s.len-1;       // Length of first string
+    const char *str2 = str2data->u.s.s;    // Pointer to second string
+    size_t len2 = str2data->u.s.len;       // Length of second string
+    
+    // Calculate total length for the concatenated string, including null terminator
+    size_t total_len = len1 + len2;
+    
+    // Allocate stack space for the concatenated string
+    //op_t stack_ptr_op = get_new_temp(c2m_ctx, MIR_T_I64);
+    //emit_alloca(c2m_ctx, stack_ptr_op, MIR_new_int_op(ctx, total_len));
+
+    // Allocate stack space and get a register to hold the pointer
+    MIR_reg_t stack_ptr_reg = MIR_new_func_reg(ctx, curr_func->u.func, MIR_T_I64, "concat_ptr");
+    MIR_append_insn(ctx, curr_func,
+                    MIR_new_insn(ctx, MIR_ALLOCA,
+                                 MIR_new_reg_op(ctx, stack_ptr_reg),
+                                 MIR_new_int_op(ctx, total_len)));
+    
+    // Copy the first string to the start of the allocated memory (offset 0)
+    gen_memcpy(c2m_ctx, 0, stack_ptr_reg, 
+               new_op(NULL, MIR_new_str_op(ctx, (MIR_str_t){len1, str1})), len1);
+    
+    // Copy the second string immediately after the first (offset len1)
+    gen_memcpy(c2m_ctx, len1, stack_ptr_reg, 
+               new_op(NULL, MIR_new_str_op(ctx, (MIR_str_t){len2, str2})), len2);
+    
+    // Add null terminator at the end (offset len1 + len2)
+    MIR_op_t mem_op = MIR_new_mem_op(ctx, MIR_T_I8, len1 + len2, stack_ptr_reg, 0, 1);
+    MIR_op_t null_op = MIR_new_int_op(ctx, 0);
+    emit2(c2m_ctx, MIR_MOV, mem_op, null_op);
+    
+    // Set the result to point to the concatenated string
+    res = new_op(NULL, MIR_new_reg_op(ctx, stack_ptr_reg));
+    break;
+  }
+  
   default: abort ();
   }
 finish:
@@ -13763,7 +14001,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, UNSIGNED, BOOL, STRUCT, UNION, ENUM, ENUM_CONST, MEMBER, CONST);
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
-    REP5 (C, MODULE, ASM, ATTR, CLASS, STRING);
+    REP6 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT);
   default: abort ();
   }
 #undef C
@@ -14068,6 +14306,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_INIT:
   case N_FIELD_ID:
   case N_TYPE:
+  case N_CONCAT:
   case N_ST_ASSERT:
   case N_ASM:
     fprintf (f, "\n");
