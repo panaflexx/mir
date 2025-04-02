@@ -264,6 +264,8 @@ enum basic_type {
   TP_STRING,
 };
 
+static void print_type (c2m_ctx_t c2m_ctx, FILE *f, struct type *type);
+
 struct type_qual {
   unsigned int const_p : 1, restrict_p : 1, volatile_p : 1, atomic_p : 1; /* Type qualifiers */
 };
@@ -1320,6 +1322,9 @@ static token_t new_id_token (c2m_ctx_t c2m_ctx, pos_t pos, const char *id_str) {
 
   token = new_token (c2m_ctx, pos, str.s, T_ID, N_IGNORE);
   token->node = new_str_node (c2m_ctx, N_ID, str, pos);
+  // NOTE RSD - for time reason new_str_node sets the tail to some odd value
+  // This prevents a crash in N_CONCAT string checking
+  token->node->u.ops.tail= NULL;
   return token;
 }
 
@@ -4598,100 +4603,6 @@ D (sc_spec) {
   return r;
 }
 
-#if 0
-DA (type_spec) {
-  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
-  node_t op1, op2, op3, op4, r;
-  int struct_p, id_p = FALSE;
-  pos_t pos;
-
-  if (MP (T_VOID, pos)) {
-    r = new_pos_node (c2m_ctx, N_VOID, pos);
-  } else if (MP (T_CHAR, pos)) {
-    r = new_pos_node (c2m_ctx, N_CHAR, pos);
-  } else if (MP (T_STRING, pos)) {
-    r = new_pos_node (c2m_ctx, N_STRING, pos);
-  } else if (MP (T_SHORT, pos)) {
-    r = new_pos_node (c2m_ctx, N_SHORT, pos);
-  } else if (MP (T_INT, pos)) {
-    r = new_pos_node (c2m_ctx, N_INT, pos);
-  } else if (MP (T_LONG, pos)) {
-    r = new_pos_node (c2m_ctx, N_LONG, pos);
-  } else if (MP (T_FLOAT, pos)) {
-    r = new_pos_node (c2m_ctx, N_FLOAT, pos);
-  } else if (MP (T_DOUBLE, pos)) {
-    r = new_pos_node (c2m_ctx, N_DOUBLE, pos);
-  } else if (MP (T_SIGNED, pos)) {
-    r = new_pos_node (c2m_ctx, N_SIGNED, pos);
-  } else if (MP (T_UNSIGNED, pos)) {
-    r = new_pos_node (c2m_ctx, N_UNSIGNED, pos);
-  } else if (MP (T_BOOL, pos)) {
-    r = new_pos_node (c2m_ctx, N_BOOL, pos);
-  } else if (MP (T_COMPLEX, pos)) {
-    if (record_level == 0) error (c2m_ctx, pos, "complex numbers are not supported");
-    return err_node;
-  } else if (MP (T_ATOMIC, pos)) { /* atomic-type-specifier */
-    PT ('(');
-    P (type_name);
-    PT (')');
-    error (c2m_ctx, pos, "Atomic types are not supported");
-  } else if ((struct_p = MP (T_STRUCT, pos)) || MP (T_UNION, pos) || MP (T_CLASS, pos)) {
-    /* struct-or-union-specifier, struct-or-union */
-    if (!MN (T_ID, op1)) {
-      op1 = new_node (c2m_ctx, N_IGNORE);
-    } else {
-      id_p = TRUE;
-    }
-    if (M ('{')) {
-      if (!C ('}') && !M (';')) {
-        P (struct_declaration_list);
-      } else {
-        (c2m_options->pedantic_p ? error : warning) (c2m_ctx, pos, "empty struct/union");
-        r = new_node (c2m_ctx, N_LIST);
-      }
-      PT ('}');
-    } else if (!id_p) {
-      return err_node;
-    } else {
-      r = new_node (c2m_ctx, N_IGNORE);
-    }
-    r = new_pos_node2 (c2m_ctx, struct_p ? N_STRUCT : N_UNION, pos, op1, r);
-  } else if (MP (T_ENUM, pos)) { /* enum-specifier */
-    if (!MN (T_ID, op1)) {
-      op1 = new_node (c2m_ctx, N_IGNORE);
-    } else {
-      id_p = TRUE;
-    }
-    op2 = new_node (c2m_ctx, N_LIST);
-    if (M ('{')) { /* enumerator-list */
-      for (;;) {   /* enumerator */
-        PTN (T_ID);
-        op3 = r; /* enumeration-constant */
-        if (!M ('=')) {
-          op4 = new_node (c2m_ctx, N_IGNORE);
-        } else {
-          P (const_expr);
-          op4 = r;
-        }
-        op_append (c2m_ctx, op2, new_node2 (c2m_ctx, N_ENUM_CONST, op3, op4));
-        if (!M (',')) break;
-        if (C ('}')) break;
-      }
-      PT ('}');
-    } else if (!id_p) {
-      return err_node;
-    } else {
-      op2 = new_node (c2m_ctx, N_IGNORE);
-    }
-    r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
-  } else if (arg == NULL) {
-    P (typedef_name);
-  } else {
-    r = err_node;
-  }
-  return r;
-}
-#endif
 // Updated for T_CLASS 
 DA (type_spec) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
@@ -4793,7 +4704,6 @@ DA (type_spec) {
   }
   return r;
 }
-
 
 D (struct_declaration_list) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
@@ -5847,8 +5757,6 @@ static int symbol_find (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
   int found_p;
   symbol_t el, symbol;
 
-  //printf("symbol_find: %s\n", id->u.s.s);
-
   symbol.mode = mode;
   symbol.id = id;
   symbol.scope = scope;
@@ -5864,7 +5772,7 @@ static void symbol_insert (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, 
   const char *smode = (mode == S_TAG ? "s_tag" :
 					   mode == S_REGULAR ? "s_regular" : "s_label");
 
-  printf("symbol_insert: %s type %s\n", id->u.s.s, smode);
+  //printf("symbol_insert: %s type %s\n", id->u.s.s, smode);
 
   symbol.mode = mode;
   symbol.id = id;
@@ -6732,10 +6640,12 @@ static node_t find_def (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
 
   for (;;) {
     if (!symbol_find (c2m_ctx, mode, id, scope, &sym)) {
-      if (scope == NULL) {
+      if (scope == NULL) 
 		  return NULL;
-	  }
-      scope = ((struct node_scope *) scope->attr)->scope;
+	  if(scope->attr)
+		  scope = ((struct node_scope *) scope->attr)->scope;
+	  else
+		  scope = NULL;
     } else {
       if (aux_node) *aux_node = sym.aux_node;
       return sym.def_node;
@@ -6761,7 +6671,7 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
     found_p = sym.def_node != NULL;
   }
   if (!found_p) {
-	// Classes have to have both, since they implement their own definition(tag)
+	// Classes need both, since they implement their own definition(tag)
 	if (r->code == N_CLASS)
 		symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
 	symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
@@ -6835,6 +6745,7 @@ static node_t skip_struct_scopes (node_t scope) {
     ;
   return scope;
 }
+
 static void check (c2m_ctx_t c2m_ctx, node_t node, node_t context);
 
 static void set_class_layout(c2m_ctx_t c2m_ctx, node_t decl_node, struct type *type) {
@@ -6988,6 +6899,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
     case N_SHORT:
     case N_LONG: set_type_pos_node (type, n); break;
 	  // FIXME: Just set it to char ???
+	  printf("THIS MIGht bReAK\n");
       set_type_pos_node (type, n);
 	  type->u.basic_type = TP_CHAR;
 	  type->type_qual.const_p = 1; // Set constant
@@ -7067,12 +6979,12 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
         type->u.basic_type = TP_INT;
       } else {
         assert (def->code == N_SPEC_DECL);
-        decl = def->attr;	
+        decl = def->attr;
         decl->used_p = TRUE;
         assert (decl->decl_spec.typedef_p);
 		if (decl->decl_spec.type) {
 			*type = *decl->decl_spec.type;
-			printf("N_ID %s has type\n", n->u.s.s);
+			//printf("N_ID %s has type\n", n->u.s.s);
 		} else {
 			printf("ERROR: N_ID %s has no type\n", n->u.s.s);
 		}
@@ -7119,6 +7031,9 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
 		class_type = create_type(c2m_ctx, NULL);
 		class_type->mode = TM_CLASS;
 		class_type->u.tag_type = res_tag_type;
+		// FIXME: This might be right or wrong...
+		class_type->raw_size = type->raw_size;
+		class_type->align = type->align;
 
 		// Store the type in the N_CLASS node's attr
 		decl->decl_spec.type = class_type;
@@ -7593,14 +7508,11 @@ static void check_type (c2m_ctx_t c2m_ctx, struct type *type, int level, int fun
   }
 }
 
-// NB: This will always generate a warning or error
 static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct type *right,
                                     struct expr *expr, node_t assign_node) {
   node_code_t code = assign_node->code;
   const char *msg;
 
-  // TODO I don't know...
-  //printf("1. check_assignment_types\n");
   if (right == NULL) right = expr->type;
   if (arithmetic_type_p (left)) {
     if (!arithmetic_type_p (right)
@@ -7901,6 +7813,9 @@ static int check_const_addr_p (c2m_ctx_t c2m_ctx, node_t r, node_t *base, mir_ll
     }
     return TRUE;
   case N_IND:
+    //printf("1.N_IND: r->type->mode=");
+	//print_type(c2m_ctx, stdout, ((struct expr *) NL_HEAD (r->u.ops)->attr)->type);
+	//printf("\n");
     if (((struct expr *) NL_HEAD (r->u.ops)->attr)->type->mode != TM_PTR) return FALSE;
     if (!check_const_addr_p (c2m_ctx, NL_HEAD (r->u.ops), base, offset, deref)) return FALSE;
     if (!(e = NL_EL (r->u.ops, 1)->attr)->const_p) return FALSE;
@@ -8048,7 +7963,7 @@ check_one_value:
            && init_compatible_string_p (initializer, type->u.arr_type->el_type))) {
     if ((cexpr  = initializer->attr)->const_p || initializer->code == N_STR
         || initializer->code == N_STR16 || initializer->code == N_STR32 || !const_only_p) {
-		//TODO handle N_STRING for fstring
+	  //TODO handle N_STRING for fstring
       check_assignment_types (c2m_ctx, type, NULL, cexpr, initializer);
     } else {
       setup_const_addr_p (c2m_ctx, initializer);
@@ -8529,7 +8444,6 @@ static struct expr *check_assign_op (c2m_ctx_t c2m_ctx, node_t r, struct expr *e
   case N_SUB:
   case N_ADD_ASSIGN:
   case N_SUB_ASSIGN: {
-
     mir_size_t size;
     int add_p
       = (r->code == N_ADD || r->code == N_ADD_ASSIGN || r->code == N_INC || r->code == N_POST_INC);
@@ -9191,7 +9105,8 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
   case N_MOD:
     process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
     // FIXME: Perform N_ADD overload **HERE**
-	//printf("N_ADD %d == %d\n", t1->u.basic_type, t2->u.basic_type);
+	//if(t1 && t2)
+	//	printf("N_ADD %d == %d\n", t1->u.basic_type, t2->u.basic_type);
 	if(r->code == N_ADD && t1 && t2 && t1->pos_node && t2->pos_node &&
 		t1->u.basic_type == TP_STRING &&
 		t2->u.basic_type == TP_STRING ) {
@@ -9361,8 +9276,8 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
   case N_DEREF_FIELD: {
     symbol_t sym;
     decl_t decl;
-    node_t width;
-    struct expr *width_expr;
+    node_t width, func=NULL, func_op;;
+    struct expr *width_expr, method;
 
     process_unop (c2m_ctx, r, &op1, &e1, &t1, r);
     e = create_expr (c2m_ctx, r);
@@ -9376,11 +9291,25 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS) {
       error (c2m_ctx, POS (r), "request for member %s in something not a structure, union or class",
              op2->u.s.s);
-    } else if (!symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym)) {
-      error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : "union",
+    } else if (!symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
+	  !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
+		// FIXME: Needs to be able to find clsss cuntions
+		  error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
              op2->u.s.s);
-    } else {
+    } 
+	if (func) {
+      assert (func.code == N_FUNC_DEF);
+	  printf("Found class method call\n");
+      decl = func->attr;
+      *e->type = *decl->decl_spec.type; // Set to function type (TM_FUNC)
+      // Note: N_CALL will handle this as a method call, so no need to set lvalue_node
+	} else {
       assert (sym.def_node->code == N_MEMBER);
+	  if(sym.def_node == NULL) {
+		  error (c2m_ctx, POS (r), "undefined member %s", op2->u.s.s);
+		  break;
+	  }
+
       decl = sym.def_node->attr;
       *e->type = *decl->decl_spec.type;
       e->u.lvalue_node = sym.def_node;
@@ -9600,6 +9529,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     if (curr_scope != top_scope) VARR_PUSH (decl_t, func_decls_for_allocation, decl);
     break;
   }
+#if 0
   case N_CALL: {
     struct func_type *func_type = NULL; /* to remove an uninitialized warning */
     struct type *ret_type;
@@ -9753,7 +9683,93 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
                    op1->u.s.s);
         }
       }
-    } else {
+    } else if (op1->code == N_FIELD || op1->code == N_DEREF_FIELD) {
+ 		// Check if this is a method call (N_FIELD: obj.method, N_DEREF_FIELD: ptr->method)
+        // Method call handling
+		op1 = NL_HEAD(r->u.ops);
+		arg_list = NL_NEXT(op1);
+		check(c2m_ctx, op1, r);
+		e1 = op1->attr;
+		t1 = e1->type;
+
+        node_t obj = NL_HEAD(op1->u.ops);        // Object (obj or ptr)
+        node_t method_id = NL_NEXT(obj);         // Method name (N_ID)
+        struct type *obj_type = ((struct expr *)obj->attr)->type;
+
+        // Adjust type for pointer dereference
+        if (op1->code == N_DEREF_FIELD) {
+            if (obj_type->mode != TM_PTR) {
+                error(c2m_ctx, POS(r), "dereference operator applied to non-pointer in method call");
+                break;
+            }
+            obj_type = obj_type->u.ptr_type;
+        }
+
+        // Verify object is a class
+        if (obj_type->mode != TM_CLASS) {
+            error(c2m_ctx, POS(r), "method call attempted on non-class object");
+            break;
+        }
+
+        // Find method definition in class scope
+        node_t func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+        if (!func_def) {
+            error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
+            break;
+        }
+        if (func_def->code != N_FUNC_DEF) {
+            error(c2m_ctx, POS(r), "member '%s' is not a function", method_id->u.s.s);
+            break;
+        }
+
+        // Get function type from method definition
+        decl_t decl = func_def->attr;
+        struct type *func_type_type = decl->decl_spec.type;
+        if (func_type_type->mode != TM_FUNC) {
+            error(c2m_ctx, POS(r), "method '%s' does not have function type", method_id->u.s.s);
+            break;
+        }
+        func_type = func_type_type->u.func_type;
+        ret_type = func_type->ret_type;
+
+        // Create 'this' argument
+        node_t this_arg;
+        if (op1->code == N_FIELD) {
+            // obj.method(): Pass address of object
+            this_arg = new_node1(c2m_ctx, N_ADDR, obj);
+            check(c2m_ctx, this_arg, r);
+        } else {
+            // ptr->method(): Pass pointer directly
+            this_arg = obj;
+        }
+
+        // Build full argument list with 'this' prepended
+        node_t full_arg_list = new_node(c2m_ctx, N_LIST);
+        op_append(c2m_ctx, full_arg_list, this_arg);
+        for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
+            op_append(c2m_ctx, full_arg_list, arg);
+        }
+
+        // Check arguments against parameters (including 'this')
+        param_list = func_type->param_list;
+        param = NL_HEAD(param_list->u.ops);
+        for (arg = NL_HEAD(full_arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
+            check(c2m_ctx, arg, r);
+            e2 = arg->attr;
+            if (param == NULL) {
+                if (!func_type->dots_p) {
+                    error(c2m_ctx, POS(arg), "too many arguments in method call");
+                }
+                continue;
+            }
+            struct decl_spec *decl_spec = get_param_decl_spec(param);
+            check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
+            param = NL_NEXT(param);
+        }
+        if (param != NULL) {
+            error(c2m_ctx, POS(r), "too few arguments in method call");
+        }
+	} else {
       check (c2m_ctx, op1, r);
       e1 = op1->attr;
       t1 = e1->type;
@@ -9801,6 +9817,290 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     }
     curr_call_arg_area_offset = saved_call_arg_area_offset_before_args;
     if (param != NULL) error (c2m_ctx, POS (r), "too few arguments");
+    break;
+  }
+#endif
+  case N_CALL: {
+    struct func_type *func_type = NULL; /* to remove an uninitialized warning */
+    struct type *ret_type;
+    node_t list, spec_list, decl, param_list, start_param, param, arg_list, first_arg, arg;
+    node_t saved_scope = curr_scope;
+    struct decl_spec *decl_spec;
+    mir_size_t saved_call_arg_area_offset_before_args;
+    struct type res_type;
+    int builtin_call_p, alloca_p = FALSE, va_arg_p = FALSE, va_start_p = FALSE;
+    int add_overflow_p = FALSE, sub_overflow_p = FALSE, mul_overflow_p = FALSE, expect_p = FALSE;
+    int jcall_p = FALSE, jret_p = FALSE, prop_set_p = FALSE, prop_eq_p = FALSE, prop_ne_p = FALSE;
+
+    op1 = NL_HEAD(r->u.ops);
+    if (op1->code == N_ID) {
+      alloca_p = str_eq_p(op1->u.s.s, ALLOCA);
+      add_overflow_p = strcmp(op1->u.s.s, ADD_OVERFLOW) == 0;
+      sub_overflow_p = strcmp(op1->u.s.s, SUB_OVERFLOW) == 0;
+      mul_overflow_p = strcmp(op1->u.s.s, MUL_OVERFLOW) == 0;
+      expect_p = strcmp(op1->u.s.s, EXPECT) == 0;
+      jcall_p = strcmp(op1->u.s.s, JCALL) == 0;
+      jret_p = strcmp(op1->u.s.s, JRET) == 0;
+      prop_set_p = strcmp(op1->u.s.s, PROP_SET) == 0;
+      prop_eq_p = strcmp(op1->u.s.s, PROP_EQ) == 0;
+      prop_ne_p = strcmp(op1->u.s.s, PROP_NE) == 0;
+    }
+    if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
+      va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
+      va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
+      if (!va_arg_p && !va_start_p && !alloca_p) {
+        spec_list = new_node(c2m_ctx, N_LIST);
+        op_append(c2m_ctx, spec_list, new_node(c2m_ctx, N_INT));
+        list = new_node(c2m_ctx, N_LIST);
+        op_append(c2m_ctx, list, new_node1(c2m_ctx, N_FUNC, new_node(c2m_ctx, N_LIST)));
+        decl = new_pos_node5(c2m_ctx, N_SPEC_DECL, POS(op1), new_node1(c2m_ctx, N_SHARE, spec_list),
+                             new_node2(c2m_ctx, N_DECL, copy_node(c2m_ctx, op1), list),
+                             new_node(c2m_ctx, N_IGNORE), new_node(c2m_ctx, N_IGNORE),
+                             new_node(c2m_ctx, N_IGNORE));
+        curr_scope = top_scope;
+        check(c2m_ctx, decl, NULL);
+        curr_scope = saved_scope;
+        assert(top_scope->code == N_MODULE);
+        list = NL_HEAD(top_scope->u.ops);
+        assert(list->code == N_LIST);
+        op_prepend(c2m_ctx, list, decl);
+      }
+    }
+    builtin_call_p = alloca_p || va_arg_p || va_start_p || add_overflow_p || sub_overflow_p
+                     || mul_overflow_p || expect_p || jcall_p || jret_p || prop_set_p || prop_eq_p
+                     || prop_ne_p;
+    if (!builtin_call_p || jcall_p) VARR_PUSH(node_t, call_nodes, r);
+    arg_list = NL_NEXT(op1);
+    if (builtin_call_p) {
+      if (func_block_scope != NULL && (va_arg_p || va_start_p))
+        ((struct node_scope *)func_block_scope->attr)->stack_var_p = TRUE;
+      for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+        check(c2m_ctx, arg, r);
+      init_type(&res_type);
+      if (alloca_p) {
+        res_type.mode = TM_PTR;
+        res_type.u.ptr_type = &VOID_TYPE;
+      } else {
+        res_type.mode = TM_BASIC;
+        res_type.u.basic_type = (va_arg_p || add_overflow_p || sub_overflow_p || mul_overflow_p ? TP_INT
+                                : expect_p || prop_eq_p || prop_ne_p                           ? TP_LONG
+                                                                                               : TP_VOID);
+      }
+      ret_type = &res_type;
+      if (builtin_call_p
+          && ((va_start_p && NL_LENGTH(arg_list->u.ops) != 1)
+              || (alloca_p && NL_LENGTH(arg_list->u.ops) != 1)
+              || (add_overflow_p && NL_LENGTH(arg_list->u.ops) != 3)
+              || (sub_overflow_p && NL_LENGTH(arg_list->u.ops) != 3)
+              || (mul_overflow_p && NL_LENGTH(arg_list->u.ops) != 3)
+              || (expect_p && NL_LENGTH(arg_list->u.ops) != 2)
+              || (jret_p && NL_LENGTH(arg_list->u.ops) != 1)
+              || (va_arg_p && NL_LENGTH(arg_list->u.ops) != 2)
+              || (prop_set_p && NL_LENGTH(arg_list->u.ops) != 2)
+              || ((prop_eq_p || prop_ne_p) && NL_LENGTH(arg_list->u.ops) != 2))) {
+        error(c2m_ctx, POS(op1), "wrong number of arguments in %s call", op1->u.s.s);
+      } else {
+        if (va_arg_p) {
+          arg = NL_EL(arg_list->u.ops, 1);
+          e2 = arg->attr;
+          t2 = e2->type;
+          if (t2->mode != TM_PTR)
+            error(c2m_ctx, POS(arg), "wrong type of 2nd argument of %s call", BUILTIN_VA_ARG);
+          else
+            ret_type = t2->u.ptr_type;
+        } else if (add_overflow_p || sub_overflow_p || mul_overflow_p) {
+          arg = NL_EL(arg_list->u.ops, 2);
+          e2 = arg->attr;
+          t2 = e2->type;
+          if (t2->mode != TM_PTR || !standard_integer_type_p(t2->u.ptr_type)
+              || t2->u.ptr_type->u.basic_type < TP_INT)
+            error(c2m_ctx, POS(arg), "wrong type of 3rd argument of %s call",
+                  add_overflow_p ? ADD_OVERFLOW : sub_overflow_p ? SUB_OVERFLOW : MUL_OVERFLOW);
+          for (int i = 0; i < 2; i++) {
+            arg = NL_EL(arg_list->u.ops, i);
+            e2 = arg->attr;
+            if (!integer_type_p(e2->type))
+              error(c2m_ctx, POS(arg), "non-integer type of %d argument of %s call", i,
+                    add_overflow_p ? ADD_OVERFLOW : sub_overflow_p ? SUB_OVERFLOW : MUL_OVERFLOW);
+          }
+        } else if (expect_p) {
+          for (int i = 0; i < 2; i++) {
+            arg = NL_EL(arg_list->u.ops, i);
+            e2 = arg->attr;
+            if (!integer_type_p(e2->type))
+              error(c2m_ctx, POS(arg), "non-integer type of %d argument of %s call", i, EXPECT);
+          }
+        } else if (jret_p) {
+          arg = NL_HEAD(arg_list->u.ops);
+          e2 = arg->attr;
+          t2 = e2->type;
+          if (t2->mode != TM_PTR)
+            error(c2m_ctx, POS(arg), "non-pointer type of 1st argument of %s call", JRET);
+        } else if (jcall_p) {
+          arg = NL_HEAD(arg_list->u.ops);
+          e2 = arg->attr;
+          t2 = e2->type;
+          if (t2->mode != TM_PTR || (t2 = t2->u.ptr_type)->mode != TM_FUNC) {
+            error(c2m_ctx, POS(r), "calling non-function in %s", JCALL);
+            break;
+          }
+          func_type = t2->u.func_type;
+          ret_type = func_type->ret_type;
+          if (!void_type_p(ret_type)) {
+            error(c2m_ctx, POS(arg), "calling non-void function in %s", JCALL);
+            break;
+          }
+        } else if (prop_set_p || prop_eq_p || prop_ne_p) {
+          arg = NL_HEAD(arg_list->u.ops);
+          e2 = arg->attr;
+          if (!e2->u.lvalue_node)
+            error(c2m_ctx, POS(r), "1st arg of %s should be lvalue", op1->u.s.s);
+          arg = NL_NEXT(arg);
+          e2 = arg->attr;
+          t2 = e2->type;
+          if (!e2->const_p || !integer_type_p(t2))
+            error(c2m_ctx, POS(arg),
+                  "property value in 2nd arg of %s call should be an integer constant",
+                  op1->u.s.s);
+        }
+      }
+    } else {
+      check(c2m_ctx, op1, r);
+      e1 = op1->attr;
+      t1 = e1->type;
+      // Check if this is a method call (N_FIELD: obj.method, N_DEREF_FIELD: ptr->method)
+      if ((op1->code == N_FIELD || op1->code == N_DEREF_FIELD)) {
+        node_t obj = NL_HEAD(op1->u.ops);        // Object (obj or ptr)
+        struct type *obj_type = ((struct expr *)obj->attr)->type;
+
+        // For N_DEREF_FIELD, dereference the pointer to get the actual type
+        if (op1->code == N_DEREF_FIELD) {
+          if (obj_type->mode != TM_PTR) {
+            error(c2m_ctx, POS(r), "dereference operator applied to non-pointer in method call");
+            break;
+          }
+          obj_type = obj_type->u.ptr_type;  // Get the pointed-to type
+        }
+
+        // Only proceed with method call logic if the object is a class (TM_CLASS)
+        if (obj_type->mode == TM_CLASS) {
+          node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
+
+          // Find method definition in class scope
+          node_t func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+          if (!func_def) {
+            error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
+            break;
+          }
+          if (func_def->code != N_FUNC_DEF) {
+            error(c2m_ctx, POS(r), "member '%s' is not a function", method_id->u.s.s);
+            break;
+          }
+
+          // Get function type from method definition
+          decl_t decl = func_def->attr;
+          struct type *func_type_type = decl->decl_spec.type;
+          if (func_type_type->mode != TM_FUNC) {
+            error(c2m_ctx, POS(r), "method '%s' does not have function type", method_id->u.s.s);
+            break;
+          }
+          func_type = func_type_type->u.func_type;
+          ret_type = func_type->ret_type;
+
+          // Create 'this' argument
+          node_t this_arg;
+          if (op1->code == N_FIELD) {
+            // obj.method(): Pass address of object
+            this_arg = new_node1(c2m_ctx, N_ADDR, obj);
+            check(c2m_ctx, this_arg, r);
+          } else {
+            // ptr->method(): Pass pointer directly
+            this_arg = obj;
+          }
+
+          // Build full argument list with 'this' prepended
+          node_t full_arg_list = new_node(c2m_ctx, N_LIST);
+          op_append(c2m_ctx, full_arg_list, this_arg);
+          for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
+            op_append(c2m_ctx, full_arg_list, arg);
+          }
+
+          // Check arguments against parameters (including 'this')
+          param_list = func_type->param_list;
+          param = NL_HEAD(param_list->u.ops);
+          for (arg = NL_HEAD(full_arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
+            check(c2m_ctx, arg, r);
+            e2 = arg->attr;
+            if (param == NULL) {
+              if (!func_type->dots_p) {
+                error(c2m_ctx, POS(arg), "too many arguments in method call");
+              }
+              continue;
+            }
+            struct decl_spec *decl_spec = get_param_decl_spec(param);
+            check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
+            param = NL_NEXT(param);
+          }
+          if (param != NULL) {
+            error(c2m_ctx, POS(r), "too few arguments in method call");
+          }
+        } else {
+          // Not a class, treat as regular function call (e.g., struct delegate)
+          if (t1->mode != TM_PTR || (t1 = t1->u.ptr_type)->mode != TM_FUNC) {
+            error(c2m_ctx, POS(r), "called object is not a function or function pointer");
+            break;
+          }
+          func_type = t1->u.func_type;
+          ret_type = func_type->ret_type;
+        }
+      } else {
+        // Regular function call
+        if (t1->mode != TM_PTR || (t1 = t1->u.ptr_type)->mode != TM_FUNC) {
+          error(c2m_ctx, POS(r), "called object is not a function or function pointer");
+          break;
+        }
+        func_type = t1->u.func_type;
+        ret_type = func_type->ret_type;
+      }
+    }
+
+    e = create_expr(c2m_ctx, r);
+    *e->type = *ret_type;
+    e->builtin_call_p = builtin_call_p;
+    if ((ret_type->mode != TM_BASIC || ret_type->u.basic_type != TP_VOID)
+        && incomplete_type_p(c2m_ctx, ret_type)) {
+      error(c2m_ctx, POS(r), "function return type is incomplete");
+    }
+    if (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION) {
+      set_type_layout(c2m_ctx, ret_type);
+      if (!builtin_call_p && curr_scope != top_scope)
+        update_call_arg_area_offset(c2m_ctx, ret_type, TRUE);
+    }
+    if (builtin_call_p && !jcall_p) break;
+    first_arg = jcall_p ? NL_EL(arg_list->u.ops, 1) : NL_HEAD(arg_list->u.ops);
+    param_list = func_type->param_list;
+    param = start_param = NL_HEAD(param_list->u.ops);
+    if (void_param_p(start_param)) { /* f(void) */
+      if (first_arg != NULL) error(c2m_ctx, POS(first_arg), "too many arguments");
+      break;
+    }
+    saved_call_arg_area_offset_before_args = curr_call_arg_area_offset;
+    for (arg = first_arg; arg != NULL; arg = NL_NEXT(arg)) {
+      check(c2m_ctx, arg, r);
+      e2 = arg->attr;
+      if (start_param == NULL || start_param->code == N_ID) continue; /* no params or ident list */
+      if (param == NULL) {
+        if (!func_type->dots_p) error(c2m_ctx, POS(arg), "too many arguments");
+        start_param = NULL; /* ignore the rest args */
+        continue;
+      }
+      assert(param->code == N_SPEC_DECL || param->code == N_TYPE);
+      decl_spec = get_param_decl_spec(param);
+      check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
+      param = NL_NEXT(param);
+    }
+    curr_call_arg_area_offset = saved_call_arg_area_offset_before_args;
+    if (param != NULL) error(c2m_ctx, POS(r), "too few arguments");
     break;
   }
   case N_GENERIC: {
@@ -9894,8 +10194,6 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       decl_t decl = r->attr;
       // Set the type to TM_CLASS if the specifier is a class type
       if (decl_spec.type->mode == TM_CLASS) 
-        decl->decl_spec.type = decl_spec.type;
-      else // Handle basic types or errors if not a class
         decl->decl_spec.type = decl_spec.type;
       
       const char *antialias = check_attrs (c2m_ctx, r, decl, attrs, TRUE);
@@ -10446,15 +10744,12 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     check (c2m_ctx, expr, r);
     break;
   }
-  /*
   case N_CLASS: {
+	printf("N_CLASS set scope\n");
     node_t id = NL_HEAD (r->u.ops);
     node_t decl_list = NL_NEXT (id);
 
-	printf("XXXXX UNTESTED XXXXX N_CLASS set scope\n");
     if (decl_list->code != N_IGNORE) {
-	  // Add class to the symbol table!
-	  symbol_insert (c2m_ctx, S_REGULAR, r->u.ops.head, curr_scope, r, NULL);
       create_node_scope (c2m_ctx, r);
       check (c2m_ctx, decl_list, r);
       finish_scope (c2m_ctx);
@@ -10462,7 +10757,6 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     }
     break;
   }
-  */
   default: 
     printf("ERROR: invalid r->code = %d\n", r->code);
   	abort ();
@@ -13989,7 +14283,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 
 	// Check for static string first
 	if(str1_node && str1_node->code != N_STR && str1_node->u.ops.tail && str1_node->u.ops.tail->code == N_STR)
-		str1_node = str1_node->u.ops.tail;
+	//if(str1_node && str1_node->code != N_STR)
+	//	if(str1_node->u.ops.tail && str1_node->u.ops.tail > 0x1000)
+	//		if(str1_node->u.ops.tail->code == N_STR)
+				str1_node = str1_node->u.ops.tail;
 
 	// Locate the N_ID nodes
 	if(str1_node->code != N_STR) {
@@ -14005,7 +14302,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 
 	// Check for static string first
 	if(str2_node && str2_node->code != N_STR && str2_node->u.ops.tail && str2_node->u.ops.tail->code == N_STR)
-		str2_node = str2_node->u.ops.tail;
+	//if(str2_node && str2_node->code != N_STR)
+	//	if(str2_node->u.ops.tail && str2_node->u.ops.tail > 0x1000)
+	//		if(str2_node->u.ops.tail->code == N_STR)
+				str2_node = str2_node->u.ops.tail;
 
 	if(str2_node->code != N_STR) {
 		for(; str2_node->code != N_ID && str2_node->u.ops.tail; str2_node = str2_node->u.ops.tail );
