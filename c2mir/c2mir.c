@@ -262,6 +262,7 @@ enum basic_type {
   TP_DOUBLE,
   TP_LDOUBLE,
   TP_STRING,
+  TP_GENERIC,
 };
 
 static void print_type (c2m_ctx_t c2m_ctx, FILE *f, struct type *type);
@@ -991,6 +992,16 @@ static void add_stream (c2m_ctx_t c2m_ctx, FILE *f, const char *fname,
   }
   cs = new_stream (alloc, f, fname, getc_func);
   VARR_PUSH (stream_t, streams, cs);
+}
+
+static void print_streams (c2m_ctx_t c2m_ctx)  {
+    stream_t s = NULL;
+	int slen = VARR_LENGTH (stream_t, streams);
+	printf("print_streams: streams=%p len = %d\n",streams, slen);
+
+	for(size_t i = 0; i < slen; i++) {
+		s = VARR_GET (stream_t, streams, i);
+	}
 }
 
 static int str_getc (c2m_ctx_t c2m_ctx) {
@@ -4000,6 +4011,7 @@ static void record_stop (c2m_ctx_t c2m_ctx, size_t mark, int restore_p) {
   read_token (c2m_ctx);
 }
 
+/*
 static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
@@ -4019,6 +4031,91 @@ static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   }
 #endif
   fprintf (f, "\n");
+  n_errors++;
+}
+*/
+static void syntax_error(c2m_ctx_t c2m_ctx, const char *expected_name) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  FILE *f;
+
+  if ((f = c2m_options->message_file) == NULL) return;
+
+  //print_streams(c2m_ctx);
+  // Print the position (file:line:column)
+  print_pos(f, curr_token->pos, TRUE);
+
+  // Print the error message
+  fprintf(f, "syntax error on %s", get_token_name(c2m_ctx, curr_token->code));
+  fprintf(f, " (expected '%s'):\n", expected_name);
+
+  // Assume curr_token->pos has line and column fields
+  unsigned int error_line = curr_token->pos.lno;
+  unsigned int error_column = curr_token->pos.ln_pos;
+
+  // Access the source code buffer from curr_input
+  // FIXME
+  const char *source = NULL;// curr_input->code;
+  size_t source_len = 0; //curr_input.code_len;
+
+  if (source != NULL && source_len > 0) {
+    // Scan the source to find the line
+    unsigned int current_line = 1;
+    const char *line_start = source;
+    const char *line_end = source;
+    int line_found = 0;
+
+    // Iterate through the source to find the error line
+    for (size_t i = 0; i < source_len && source[i] != '\0'; i++) {
+      if (source[i] == '\n') {
+        if (current_line == error_line) {
+          // Found the line; line_end is just before the newline
+          line_end = source + i;
+          line_found = 1;
+          break;
+        }
+        current_line++;
+        line_start = source + i + 1; // Start of next line
+      }
+    }
+
+    // If we reached the end without a newline, check if it’s the error line
+    if (!line_found && current_line == error_line) {
+      line_end = source + source_len; // End of buffer
+      line_found = 1;
+    }
+
+    if (line_found && line_end >= line_start) {
+      // Copy the line to a buffer for printing (exclude newline)
+      size_t line_len = line_end - line_start;
+      char line_buffer[1024]; // Adjust size as needed
+      if (line_len >= sizeof(line_buffer)) {
+        line_len = sizeof(line_buffer) - 1; // Truncate if too long
+      }
+      strncpy(line_buffer, line_start, line_len);
+      line_buffer[line_len] = '\0';
+
+      // Print the source line
+      fprintf(f, "%s\n", line_buffer);
+
+      // Print a caret (^) at the error column
+      for (unsigned int i = 0; i < error_column - 1; i++) {
+        // Preserve tabs for alignment
+        if (i < line_len && line_buffer[i] == '\t') {
+          fprintf(f, "\t");
+        } else {
+          fprintf(f, " ");
+        }
+      }
+      fprintf(f, "^\n");
+    } else {
+      fprintf(f, "<could not display source line>\n");
+    }
+  } else {
+    // Fallback if source is unavailable
+    //fprintf(f, "<source line unavailable>\n");
+  }
+
+  // Increment error count
   n_errors++;
 }
 
@@ -4642,6 +4739,7 @@ DA (type_spec) {
     error (c2m_ctx, pos, "Atomic0Atomic types are not supported");
   } else if ((struct_p = MP(T_STRUCT, pos) ? 1 : (MP(T_UNION, pos) ? 2 : (MP(T_CLASS, pos) ? 3 : 0)))) {
     /* struct-or-union-specifier, struct-or-union */
+	//printf("FOUND %s\n", struct_p == 1 ? "STRUCT": struct_p == 2 ? "UNION" : "CLASS" );
     if (!MN (T_ID, op1)) {
       op1 = new_node (c2m_ctx, N_IGNORE);
     } else {
@@ -4651,7 +4749,7 @@ DA (type_spec) {
       if (!C ('}') && !M (';')) {
         P (struct_declaration_list);
       } else {
-        (c2m_options->pedantic_p ? error : warning) (c2m_ctx, pos, "empty struct/union");
+        (c2m_options->pedantic_p ? error : warning) (c2m_ctx, pos, "empty struct/union/class");
         r = new_node (c2m_ctx, N_LIST);
       }
       PT ('}');
@@ -4666,6 +4764,8 @@ DA (type_spec) {
       r = new_pos_node2 (c2m_ctx, N_UNION, pos, op1, r);
     } else if (struct_p == 3) {
       r = new_pos_node2 (c2m_ctx, N_CLASS, pos, op1, r);
+	  // FIXME: This is probably wrong
+	  //tpname_add (c2m_ctx, op1, curr_scope, true);
     } else {
 	  error(c2m_ctx, pos, "Invalid struct/union/class declaraion");
 	}
@@ -4845,6 +4945,8 @@ D (class_declaration) {
 
   return r;
 }
+
+
 
 D (spec_qual_list) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
@@ -5504,8 +5606,10 @@ D (transl_unit) {
   while (!C (T_EOFILE)) { /* external-declaration */
     if ((r = TRY (declaration)) != err_node) {
       // Successfully parsed a declaration (e.g., "int x;")
+	  //printf("DECL found\n");
     } else if ((r = TRY (class_declaration)) != err_node) {
       // Successfully parsed a class definition (e.g., "class MyClass { ... };")
+	  printf("class_declaration found\n");
     } else {
       // Attempt to parse a function definition
       PAE (declaration_specs, (node_t) 1, err);
@@ -5698,6 +5802,7 @@ DEF_HTAB (case_t);
 
 struct check_ctx {
   node_t curr_scope;
+  node_t curr_class;
   VARR (node_t) * label_uses;
   node_t func_block_scope;
   unsigned curr_func_scope_num;
@@ -5714,6 +5819,7 @@ struct check_ctx {
 };
 
 #define curr_scope check_ctx->curr_scope
+#define curr_class check_ctx->curr_class
 #define label_uses check_ctx->label_uses
 #define func_block_scope check_ctx->func_block_scope
 #define curr_func_scope_num check_ctx->curr_func_scope_num
@@ -5772,13 +5878,16 @@ static void symbol_insert (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, 
   const char *smode = (mode == S_TAG ? "s_tag" :
 					   mode == S_REGULAR ? "s_regular" : "s_label");
 
-  //printf("symbol_insert: %s type %s\n", id->u.s.s, smode);
+  //printf("symbol_insert: %s type %s class ? %s\n", id->u.s.s, smode, c2m_ctx->curr_class?"YES":"NO");
 
   symbol.mode = mode;
   symbol.id = id;
   symbol.scope = scope;
   symbol.def_node = def_node;
   symbol.aux_node = aux_node;
+  //if(scope == NULL)
+  //	  printf("COMPILER: symbol_insert %s %s scope = NULL\n", id->u.s.s, smode);
+
   VARR_CREATE (node_t, symbol.defs, alloc, 4);
   VARR_PUSH (node_t, symbol.defs, def_node);
   HTAB_DO (symbol_t, symbol_tab, symbol, HTAB_INSERT, el);
@@ -6072,6 +6181,7 @@ static int type_eq_p (struct type *type1, struct type *type2) {
   switch (type1->mode) {
   case TM_BASIC: return type1->u.basic_type == type2->u.basic_type;
   case TM_ENUM:
+  case TM_CLASS:
   case TM_STRUCT:
   case TM_UNION: return type1->u.tag_type == type2->u.tag_type;
   case TM_PTR: return type_eq_p (type1->u.ptr_type, type2->u.ptr_type);
@@ -6139,7 +6249,7 @@ static int compatible_types_p (struct type *type1, struct type *type2, int ignor
       return FALSE;
     // ??? check parameter types
   } else {
-    assert (type1->mode == TM_STRUCT || type1->mode == TM_UNION || type1->mode == TM_ENUM);
+    assert (type1->mode == TM_STRUCT || type1->mode == TM_UNION || type1->mode == TM_ENUM || type1->mode == TM_CLASS);
     return (type1->u.tag_type == type2->u.tag_type
             && (ignore_quals_p || type_qual_eq_p (&type1->type_qual, &type2->type_qual)));
   }
@@ -6243,7 +6353,7 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
   } else if (type->mode == TM_UNDEF) {
     align = 0; /* error type */
   } else {
-    assert (type->mode == TM_STRUCT || type->mode == TM_UNION);
+    assert (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS);
     if (incomplete_type_p (c2m_ctx, type)) {
       align = -1;
     } else {
@@ -6342,7 +6452,7 @@ static void update_field_layout (int *bf_p, mir_size_t *overall_size, mir_size_t
 
 /* Update offsets inside unnamed anonymous struct/union member. */
 static void update_members_offset (struct type *type, mir_size_t offset) {
-  assert ((type->mode == TM_STRUCT || type->mode == TM_UNION)
+  assert ((type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS)
           && type->unnamed_anon_struct_union_member_type_p);
   assert (offset != MIR_SIZE_MAX || type->raw_size == MIR_SIZE_MAX);
   for (node_t el = NL_HEAD (NL_EL (type->u.tag_type->u.ops, 1)->u.ops); el != NULL;
@@ -6412,7 +6522,7 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
           decl->bit_offset = bits < 0 ? -1 : bound_bit - bits;
           if (bits == 0) bf_p = FALSE;
           decl->width = bits;
-          if (type->mode == TM_UNION || type->mode == TM_CLASS) {
+          if (type->mode == TM_UNION) { // This will make raw_size the max size of all the members
             offset = prev_size = 0;
             bf_p = FALSE;
             bits = -1;
@@ -6642,10 +6752,13 @@ static node_t find_def (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
     if (!symbol_find (c2m_ctx, mode, id, scope, &sym)) {
       if (scope == NULL) 
 		  return NULL;
-	  if(scope->attr)
+	  if(scope->attr) {
 		  scope = ((struct node_scope *) scope->attr)->scope;
-	  else
-		  scope = NULL;
+	  } else {
+		  printf("COMPILER: find_def: Scope has NULL attr\n");
+		  return NULL;
+	  }
+
     } else {
       if (aux_node) *aux_node = sym.aux_node;
       return sym.def_node;
@@ -6672,9 +6785,10 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
   }
   if (!found_p) {
 	// Classes need both, since they implement their own definition(tag)
-	if (r->code == N_CLASS)
-		symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
-	symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
+	//if (r->code != N_CLASS)
+	//	symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
+	//else 
+		symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
   } else if (sym.def_node->code != r->code) {
     error (c2m_ctx, POS (id), "kind of tag %s is unmatched with previous declaration", id->u.s.s);
   } else if ((tab_decl_list = NL_EL (sym.def_node->u.ops, 1))->code != N_IGNORE
@@ -6698,7 +6812,8 @@ static void def_symbol (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
   if (id->code == N_IGNORE) return;
   assert (id->code == N_ID && scope != NULL);
   assert (scope->code == N_MODULE || scope->code == N_BLOCK || scope->code == N_STRUCT
-          || scope->code == N_UNION || scope->code == N_FUNC || scope->code == N_FOR);
+          || scope->code == N_UNION || scope->code == N_FUNC || scope->code == N_FOR ||
+		  scope->code == N_CLASS);
   decl_spec = ((decl_t) def_node->attr)->decl_spec;
   if (decl_spec.thread_local_p && !decl_spec.static_p && !decl_spec.extern_p)
     error (c2m_ctx, POS (id), "auto %s is declared as thread local", id->u.s.s);
@@ -6740,7 +6855,7 @@ static void make_type_complete (c2m_ctx_t c2m_ctx, struct type *type) {
 }
 
 static node_t skip_struct_scopes (node_t scope) {
-  for (; scope != NULL && (scope->code == N_STRUCT || scope->code == N_UNION);
+  for (; scope != NULL && (scope->code == N_STRUCT || scope->code == N_UNION || scope->code == N_CLASS);
        scope = ((struct node_scope *) scope->attr)->scope)
     ;
   return scope;
@@ -6748,7 +6863,8 @@ static node_t skip_struct_scopes (node_t scope) {
 
 static void check (c2m_ctx_t c2m_ctx, node_t node, node_t context);
 
-static void set_class_layout(c2m_ctx_t c2m_ctx, node_t decl_node, struct type *type) {
+static void set_class_layout (c2m_ctx_t c2m_ctx, node_t decl_node, struct type *type) {
+	printf("set_class_layout decl_node=%s\n", decl_node->u.s.s );
     if (type->u.tag_type == NULL) {
         fprintf(stderr, "Error: tag_type is NULL in set_class_layout\n");
         type->raw_size = 0;
@@ -6760,13 +6876,15 @@ static void set_class_layout(c2m_ctx_t c2m_ctx, node_t decl_node, struct type *t
     node_t decl_list = NL_EL(type->u.tag_type->u.ops, 1);
     if (decl_list->code != N_IGNORE) {
         for (node_t member = NL_HEAD(decl_list->u.ops); member != NULL; member = NL_NEXT(member)) {
-            struct type *member_type = ((decl_t)member->attr)->decl_spec.type;
-            mir_size_t member_size = member_type->raw_size;
-            mir_size_t member_align = member_type->align;
+			if(member->attr) {
+				struct type *member_type = ((decl_t)member->attr)->decl_spec.type;
+				mir_size_t member_size = member_type->raw_size;
+				mir_size_t member_align = member_type->align;
 
-            size = (size + member_align - 1) / member_align * member_align;
-            size += member_size;
-            if (align < member_align) align = member_align;
+				size = (size + member_align - 1) / member_align * member_align;
+				size += member_size;
+				if (align < member_align) align = member_align;
+			}
         }
     }
     type->raw_size = size;
@@ -6784,6 +6902,8 @@ static void set_class_layout(c2m_ctx_t c2m_ctx, node_t decl_node, struct type *t
     // Attach the type with computed layout to decl->decl_spec
     decl->decl_spec.type = type;
 }
+
+static void init_decl (c2m_ctx_t c2m_ctx, decl_t decl);
 
 static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t decl_node) {
   check_ctx_t check_ctx = c2m_ctx->check_ctx;
@@ -6992,21 +7112,19 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       break;
     }
     case N_STRUCT:
-    case N_UNION:
-	case N_CLASS: {
+	case N_CLASS:
+    case N_UNION: {
 	  int new_scope_p;
 	  node_t res_tag_type, id = NL_HEAD (n->u.ops);
 	  node_t decl_list = NL_NEXT (id);
 	  node_t saved_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
-	  const char *type_name = (n->code == N_STRUCT ? "struct" :
-							   n->code == N_UNION ? "union" : "class");
+	  const char *type_name = n->code == N_STRUCT ? "struct" : n->code == N_CLASS ? "class" : "union";
 
 	  set_type_pos_node (type, n);
 
 	  res_tag_type = process_tag (c2m_ctx, n, id, decl_list);
 	  check_type_duplication (c2m_ctx, type, n, type_name, size, sign);
-	  type->mode = (n->code == N_STRUCT ? TM_STRUCT :
-					n->code == N_UNION ? TM_UNION : TM_CLASS);
+	  type->mode = n->code == N_STRUCT ? TM_STRUCT : n->code == N_CLASS ? TM_CLASS : TM_UNION;
 	  type->u.tag_type = res_tag_type;
 	  new_scope_p = (id->code != N_IGNORE || decl_node->code != N_MEMBER
 					 || NL_EL (decl_node->u.ops, 1)->code != N_IGNORE);
@@ -7020,27 +7138,52 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
 	  }
 	  curr_unnamed_anon_struct_union_member = saved_unnamed_anon_struct_union_member;
 
-	  if(n->code == N_CLASS) {
-		struct type *class_type;
-        decl_t decl = n->attr;
-
-		printf("check N_CLASS\n");
-		set_class_layout(c2m_ctx, decl_node, type);
-
-		// Create and populate the class type
-		class_type = create_type(c2m_ctx, NULL);
-		class_type->mode = TM_CLASS;
-		class_type->u.tag_type = res_tag_type;
-		// FIXME: This might be right or wrong...
-		class_type->raw_size = type->raw_size;
-		class_type->align = type->align;
-
-		// Store the type in the N_CLASS node's attr
-		decl->decl_spec.type = class_type;
-		//n->attr = class_type;
-	  }
 	  break;
 	}
+	/*case N_CLASS: {
+	  printf("decl N_CLASS\n");
+	  int new_scope_p;
+	  node_t res_tag_type, id = NL_HEAD(n->u.ops);
+	  node_t decl_list = NL_NEXT(id);
+	  node_t saved_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
+	  const char *type_name = "class";
+	  decl_t decl;
+
+	  set_type_pos_node(type, n);
+
+	  res_tag_type = process_tag (c2m_ctx, n, id, decl_list);
+	  check_type_duplication (c2m_ctx, type, n, type_name, size, sign);
+	  type->mode = TM_CLASS;
+	  type->u.tag_type = res_tag_type;
+	  new_scope_p = (id->code != N_IGNORE || decl_node->code != N_MEMBER
+					 || NL_EL(decl_node->u.ops, 1)->code != N_IGNORE);
+	  type->unnamed_anon_struct_union_member_type_p = !new_scope_p;
+	  curr_unnamed_anon_struct_union_member = new_scope_p ? NULL : decl_node;
+
+	  // Step 1: Create the class type skeleton
+	  struct type *class_type = create_type(c2m_ctx, NULL);
+	  class_type->mode = TM_CLASS;
+	  class_type->u.tag_type = res_tag_type;
+
+	  // Step 2: Initialize decl and associate it with n->attr early
+	  if (!n->attr) {
+		decl = reg_malloc(c2m_ctx, sizeof(struct decl));
+		init_decl(c2m_ctx, decl); // Assuming init_decl initializes the decl structure
+		n->attr = decl;
+	  } else {
+		decl = (decl_t)n->attr;
+	  }
+	  decl->decl_spec.type = class_type;
+
+	   // Step 4: Set the class layout after processing members
+	  set_class_layout(c2m_ctx, decl_node, class_type);
+	  class_type->raw_size = type->raw_size; // Use type->raw_size as set by set_class_layout
+	  class_type->align = type->align;       // Use type->align as set by set_class_layout
+
+	  curr_unnamed_anon_struct_union_member = saved_unnamed_anon_struct_union_member;
+	  printf("decl N_CLASS DONE\n");
+	  break;
+	}*/
     case N_ENUM: {
       node_t res_tag_type, id = NL_HEAD (n->u.ops);
       node_t enum_list = NL_NEXT (id);
@@ -7433,6 +7576,9 @@ static void check_type (c2m_ctx_t c2m_ctx, struct type *type, int level, int fun
   case TM_PTR: check_type (c2m_ctx, type->u.ptr_type, level + 1, FALSE); break;
   case TM_STRUCT:
   case TM_UNION: break;
+  case TM_CLASS:
+  	printf("check_type TM_CLASS\n");
+	break;
   case TM_ARR: {
     struct arr_type *arr_type = type->u.arr_type;
     node_t size_node = arr_type->size;
@@ -7504,7 +7650,10 @@ static void check_type (c2m_ctx_t c2m_ctx, struct type *type, int level, int fun
     }
     break;
   }
-  default: break;  // ???
+  case TM_BASIC: break;
+  default: 
+    //printf("UNKNOWN TM TYPE MODE %d\n", type->mode);
+  	break;  // ???
   }
 }
 
@@ -7547,6 +7696,15 @@ static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct
                : "incompatible return-expr type in function returning a struct/union");
       error (c2m_ctx, POS (assign_node), "%s", msg);
     }
+  } else if (left->mode == TM_CLASS ) {
+    if ((right->mode != TM_CLASS )
+        || !compatible_types_p (left, right, TRUE)) {
+      msg = (code == N_CALL ? "incompatible argument type for class type parameter"
+             : code != N_RETURN
+               ? "incompatible types in assignment to class"
+               : "incompatible return-expr type in function returning a class");
+      error (c2m_ctx, POS (assign_node), "%s", msg);
+	}
   } else if (left->mode == TM_PTR) {
     if (null_const_p (expr, right)) {
     } else if (right->mode != TM_PTR
@@ -9298,7 +9456,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
              op2->u.s.s);
     } 
 	if (func) {
-      assert (func.code == N_FUNC_DEF);
+      assert (func->code == N_FUNC_DEF);
 	  printf("Found class method call\n");
       decl = func->attr;
       *e->type = *decl->decl_spec.type; // Set to function type (TM_FUNC)
@@ -10161,75 +10319,106 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     break;
   }
   case N_SPEC_DECL: {
-    node_t specs = NL_HEAD (r->u.ops);
-    node_t declarator = NL_NEXT (specs);
-    node_t attrs = NL_NEXT (declarator);
-    node_t asm_part = NL_NEXT (attrs);
-    node_t initializer = NL_NEXT (asm_part);
-    node_t unshared_specs = specs->code != N_SHARE ? specs : NL_HEAD (specs->u.ops);
-    struct decl_spec decl_spec = check_decl_spec (c2m_ctx, unshared_specs, r);
+    node_t specs = NL_HEAD(r->u.ops);
+    node_t declarator = NL_NEXT(specs);
+    node_t attrs = NL_NEXT(declarator);
+    node_t asm_part = NL_NEXT(attrs);
+    node_t initializer = NL_NEXT(asm_part);
+    node_t unshared_specs = specs->code != N_SHARE ? specs : NL_HEAD(specs->u.ops);
+    struct decl_spec decl_spec = check_decl_spec(c2m_ctx, unshared_specs, r);
     int i;
     const char *asm_str = NULL;
 
+    // Handle class type creation and setup if the type is a class
+	if (decl_spec.type->mode == TM_CLASS) {
+		printf("N_SPEC_DECL is class\n");
+		// Get the N_CLASS node from specifiers
+		node_t class_node = NL_HEAD(unshared_specs->u.ops);
+		if (false && class_node && class_node->code == N_CLASS) {
+		  // Extract class name and declaration list
+		  node_t id = NL_HEAD(class_node->u.ops);
+		  node_t decl_list = NL_NEXT(id);
+
+		  // Ensure class_node->attr is set (should be done by check_decl_spec)
+		  decl_t decl = (decl_t)class_node->attr;
+		  if (!decl || !decl->decl_spec.type || decl->decl_spec.type->mode != TM_CLASS) {
+			error(c2m_ctx, POS(class_node), "Class type not properly initialized");
+			break;
+		  }
+
+		  // Add named class to symbol table
+		  if (id && id->code == N_ID) {
+			symbol_insert(c2m_ctx, S_REGULAR, id, curr_scope, class_node, NULL);
+		  }
+
+		  // Set up the class scope
+		  create_node_scope(c2m_ctx, class_node);
+
+		  // Assume set_class_layout is called properly later in your flow
+		  set_class_layout(c2m_ctx, class_node, decl->decl_spec.type);
+
+		  // Process the declaration list (N_MEMBER and N_FUNC_DEF) in one pass
+		  if (decl_list && decl_list->code != N_IGNORE) {
+			node_t prev_class = curr_class;
+			curr_class = class_node;
+		  	printf("N_SPEC_DECL do check\n");
+			// Should be N_LIST
+			check(c2m_ctx, decl_list, NL_NEXT(NL_HEAD(class_node->u.ops)) );
+		  	printf("N_SPEC_DECL DONE check\n");
+			curr_class = prev_class;
+		  }
+
+		  // Close the scope
+		  finish_scope(c2m_ctx);
+		}
+	}
+
     if (asm_part->code == N_ASM && decl_spec.register_p) {
-      /* func can have asm which ignore here */
-      if (initializer->code != N_IGNORE) {
-        error (c2m_ctx, POS (r), "asm register decl with initializer");
-      } else if (curr_scope != top_scope) {
-        error (c2m_ctx, POS (r), "asm register decl should be at the top level");
-      } else {
-        asm_str = NL_HEAD (asm_part->u.ops)->u.s.s;
-        for (i = 0; asm_str[i] != '\0' && _MIR_name_char_p (c2m_ctx->ctx, asm_str[i], i == 0); i++)
-          ;
-        if (asm_str[i] != '\0') {
-          error (c2m_ctx, POS (r), "asm register name %s contains wrong char '%c'", asm_str,
-                 asm_str[i]);
-          asm_str = NULL;
+        /* func can have asm which we ignore here */
+        if (initializer->code != N_IGNORE) {
+            error(c2m_ctx, POS(r), "asm register decl with initializer");
+        } else if (curr_scope != top_scope) {
+            error(c2m_ctx, POS(r), "asm register decl should be at the top level");
+        } else {
+            asm_str = NL_HEAD(asm_part->u.ops)->u.s.s;
+            for (i = 0; asm_str[i] != '\0' && _MIR_name_char_p(c2m_ctx->ctx, asm_str[i], i == 0); i++)
+                ;
+            if (asm_str[i] != '\0') {
+                error(c2m_ctx, POS(r), "asm register name %s contains wrong char '%c'", asm_str, asm_str[i]);
+                asm_str = NULL;
+            }
         }
-      }
     }
     if (declarator->code != N_IGNORE) {
-      create_decl (c2m_ctx, curr_scope, r, decl_spec, initializer,
-                   context != NULL && context->code == N_FUNC);
-      decl_t decl = r->attr;
-      // Set the type to TM_CLASS if the specifier is a class type
-      if (decl_spec.type->mode == TM_CLASS) 
-        decl->decl_spec.type = decl_spec.type;
-      
-      const char *antialias = check_attrs (c2m_ctx, r, decl, attrs, TRUE);
-      if (decl->decl_spec.type->mode == TM_PTR && antialias != NULL)
-        decl->decl_spec.type->antialias = MIR_alias (c2m_ctx->ctx, antialias);
-      if (asm_str != NULL) {
-        if (!scalar_type_p (decl->decl_spec.type)) {
-          error (c2m_ctx, POS (r), "asm register decl should have a scalar type");
-        } else {
-          decl->reg_p = decl->asm_p = TRUE;
-          decl->u.asm_str = asm_str;
+        create_decl(c2m_ctx, curr_scope, r, decl_spec, initializer,
+                    context != NULL && context->code == N_FUNC);
+        decl_t decl = r->attr;
+        // Set the type to TM_CLASS if the specifier is a class type
+        if (decl_spec.type->mode == TM_CLASS) 
+            decl->decl_spec.type = decl_spec.type;
+
+        const char *antialias = check_attrs(c2m_ctx, r, decl, attrs, TRUE);
+        if (decl->decl_spec.type->mode == TM_PTR && antialias != NULL)
+            decl->decl_spec.type->antialias = MIR_alias(c2m_ctx->ctx, antialias);
+        if (asm_str != NULL) {
+            if (!scalar_type_p(decl->decl_spec.type)) {
+                error(c2m_ctx, POS(r), "asm register decl should have a scalar type");
+            } else {
+                decl->reg_p = decl->asm_p = TRUE;
+                decl->u.asm_str = asm_str;
+            }
+        } else if ((initializer == NULL || initializer->code == N_IGNORE)
+                   && !decl->decl_spec.typedef_p && !decl->decl_spec.extern_p
+                   && (decl->decl_spec.type->mode == TM_STRUCT
+                       || decl->decl_spec.type->mode == TM_UNION)) {
+            VARR_PUSH(node_t, possible_incomplete_decls, r);
         }
-      } else if ((initializer == NULL || initializer->code == N_IGNORE)
-                 && !decl->decl_spec.typedef_p && !decl->decl_spec.extern_p
-                 && (decl->decl_spec.type->mode == TM_STRUCT
-                     || decl->decl_spec.type->mode == TM_UNION)) {
-        VARR_PUSH (node_t, possible_incomplete_decls, r);
-      }
     } else if (decl_spec.type->mode == TM_STRUCT || decl_spec.type->mode == TM_UNION || 
-			   decl_spec.type->mode == TM_CLASS) {
-      if (NL_HEAD (decl_spec.type->u.tag_type->u.ops)->code != N_ID)
-        error (c2m_ctx, POS (r), "unnamed struct/union with no instances");
-		/*
-		if(decl_spec.type->mode == TM_CLASS) {
-		  // Add class to the symbol table!
-		  node_t class = specs->u.ops.head;
-		  if(class && class->u.ops.head) {
-			  symbol_insert (c2m_ctx, S_REGULAR, class->u.ops.head, curr_scope, class, NULL);
-			  //create_node_scope (c2m_ctx, r);
-			  //check (c2m_ctx, decl_list, r);
-			  //finish_scope (c2m_ctx);
-			  printf("CLASS %s added\n", class->u.ops.head->u.s.s);
-		  }
-		}*/
+               decl_spec.type->mode == TM_CLASS) {
+        if (NL_HEAD(decl_spec.type->u.tag_type->u.ops)->code != N_ID)
+            error(c2m_ctx, POS(r), "unnamed struct/union with no instances");
     } else if (decl_spec.type->mode != TM_ENUM) {
-      error (c2m_ctx, POS (r), "useless declaration");
+        error(c2m_ctx, POS(r), "useless declaration");
     }
     /* We have at least one enum constant according to the syntax. */
     break;
@@ -10327,120 +10516,165 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     break;
   }
   case N_FUNC_DEF: {
-    node_t specs = NL_HEAD (r->u.ops);
-    node_t declarator = NL_NEXT (specs);
-    node_t declarations = NL_NEXT (declarator);
-    node_t block = NL_NEXT (declarations);
-    node_t id = NL_HEAD (declarator->u.ops);
-    struct decl_spec decl_spec = check_decl_spec (c2m_ctx, specs, r);
+    node_t specs = NL_HEAD(r->u.ops);
+    node_t declarator = NL_NEXT(specs);
+    node_t declarations = NL_NEXT(declarator);
+    node_t block = NL_NEXT(declarations);
+    node_t id = NL_HEAD(declarator->u.ops);
+    struct decl_spec decl_spec = check_decl_spec(c2m_ctx, specs, r);
     node_t decl_node, p, next_p, param_list, param_id, param_declarator, func;
     symbol_t sym;
     struct node_scope *ns;
 
-    if (str_eq_p (id->u.s.s, ALLOCA) || str_eq_p (id->u.s.s, BUILTIN_VA_START)
-        || str_eq_p (id->u.s.s, BUILTIN_VA_ARG) || strcmp (id->u.s.s, ADD_OVERFLOW) == 0
-        || strcmp (id->u.s.s, SUB_OVERFLOW) == 0 || strcmp (id->u.s.s, MUL_OVERFLOW) == 0
-        || strcmp (id->u.s.s, EXPECT) == 0 || strcmp (id->u.s.s, JCALL) == 0
-        || strcmp (id->u.s.s, JRET) == 0) {
-      error (c2m_ctx, POS (id), "%s is a builtin function", id->u.s.s);
-      break;
+    // Access check_ctx from c2m_ctx
+    check_ctx_t check_ctx = c2m_ctx->check_ctx;
+
+    // Check if the function is a builtin
+    if (str_eq_p(id->u.s.s, ALLOCA) || str_eq_p(id->u.s.s, BUILTIN_VA_START)
+        || str_eq_p(id->u.s.s, BUILTIN_VA_ARG) || strcmp(id->u.s.s, ADD_OVERFLOW) == 0
+        || strcmp(id->u.s.s, SUB_OVERFLOW) == 0 || strcmp(id->u.s.s, MUL_OVERFLOW) == 0
+        || strcmp(id->u.s.s, EXPECT) == 0 || strcmp(id->u.s.s, JCALL) == 0
+        || strcmp(id->u.s.s, JRET) == 0) {
+        error(c2m_ctx, POS(id), "%s is a builtin function", id->u.s.s);
+        break;
     }
+
+    // Initialize function scope and state
     curr_func_scope_num = 0;
-    create_node_scope (c2m_ctx, block);
-    func_block_scope = curr_scope;
+    create_node_scope(c2m_ctx, block);
+	func_block_scope = curr_scope;
     curr_func_def = r;
     jump_ret_p = FALSE;
     curr_switch = curr_loop = curr_loop_switch = NULL;
     curr_call_arg_area_offset = 0;
-    VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
-    create_decl (c2m_ctx, top_scope, r, decl_spec, NULL, FALSE);
-    curr_scope = func_block_scope;
-    check (c2m_ctx, declarations, r);
-    /* Process parameter identifier list:  */
-    assert (declarator->code == N_DECL);
-    func = NL_HEAD (NL_EL (declarator->u.ops, 1)->u.ops);
-    /* func can be NULL or non-func in case of error */
+    VARR_TRUNC(decl_t, func_decls_for_allocation, 0);
+    create_decl(c2m_ctx, top_scope, r, decl_spec, NULL, FALSE);
+
+    check(c2m_ctx, declarations, r);
+    assert(declarator->code == N_DECL);
+    func = NL_HEAD(NL_EL(declarator->u.ops, 1)->u.ops);
     if (n_errors != 0 && (func == NULL || func->code != N_FUNC)) break;
-    assert (func != NULL && func->code == N_FUNC);
-    param_list = NL_HEAD (func->u.ops);
-    for (p = NL_HEAD (param_list->u.ops); p != NULL; p = next_p) {
-      next_p = NL_NEXT (p);
-      if (p->code != N_ID) break;
-      NL_REMOVE (param_list->u.ops, p);
-      if (!symbol_find (c2m_ctx, S_REGULAR, p, curr_scope, &sym)) {
-        if (c2m_options->pedantic_p) {
-          error (c2m_ctx, POS (p), "parameter %s has no type", p->u.s.s);
+    assert(func != NULL && func->code == N_FUNC);
+    param_list = NL_HEAD(func->u.ops);
+
+    // If it's a class method, add 'this' parameter using curr_class
+    if (curr_class) {
+        printf("CLASS SCOPE\n");
+        // Get the class type from curr_class
+        decl_t class_decl = (decl_t)curr_class->attr;
+        if (!class_decl || !class_decl->decl_spec.type || class_decl->decl_spec.type->mode != TM_CLASS) {
+            error(c2m_ctx, POS(r), "class type not found or invalid for method definition");
+            break;
+        }
+        struct type *class_type = class_decl->decl_spec.type;
+
+        // Create 'this' parameter type: pointer to class type
+        struct type *this_type = create_type(c2m_ctx, NULL);
+        this_type->mode = TM_PTR;
+        this_type->u.ptr_type = class_type;
+        set_type_layout(c2m_ctx, this_type);
+
+        // Create a parameter node for 'this'
+        str_t this_str = uniq_cstr(c2m_ctx, "this");
+        node_t this_param = new_pos_node5(c2m_ctx, N_SPEC_DECL, POS(r),
+                                          new_node(c2m_ctx, N_LIST), // specs
+                                          new_node2(c2m_ctx, N_DECL,
+                                                    new_str_node(c2m_ctx, N_ID, this_str, POS(r)),
+                                                    new_node(c2m_ctx, N_LIST)),
+                                          new_node(c2m_ctx, N_IGNORE),
+                                          new_node(c2m_ctx, N_IGNORE),
+                                          new_node(c2m_ctx, N_IGNORE));
+        // Set the type for 'this' parameter
+        struct decl_spec this_decl_spec = {0}; // Initialize to zero
+        this_decl_spec.type = this_type;
+        // Create declaration for 'this' in the current function scope
+        create_decl(c2m_ctx, curr_scope, this_param, this_decl_spec, NULL, FALSE);
+        // Prepend 'this' to the parameter list
+        NL_PREPEND(param_list->u.ops, this_param);
+    }
+
+    // Process parameter identifier list
+    for (p = NL_HEAD(param_list->u.ops); p != NULL; p = next_p) {
+        next_p = NL_NEXT(p);
+        if (p->code != N_ID) break;
+        NL_REMOVE(param_list->u.ops, p);
+        if (!symbol_find(c2m_ctx, S_REGULAR, p, curr_scope, &sym)) {
+            if (c2m_options->pedantic_p) {
+                error(c2m_ctx, POS(p), "parameter %s has no type", p->u.s.s);
+            } else {
+                warning(c2m_ctx, POS(p), "type of parameter %s defaults to int", p->u.s.s);
+                decl_node = new_pos_node5(c2m_ctx, N_SPEC_DECL, POS(p),
+                                          new_node1(c2m_ctx, N_SHARE,
+                                                    new_node1(c2m_ctx, N_LIST,
+                                                              new_pos_node(c2m_ctx, N_INT, POS(p)))),
+                                          new_pos_node2(c2m_ctx, N_DECL, POS(p),
+                                                        new_str_node(c2m_ctx, N_ID, p->u.s, POS(p)),
+                                                        new_node(c2m_ctx, N_LIST)),
+                                          new_node(c2m_ctx, N_IGNORE),
+                                          new_node(c2m_ctx, N_IGNORE),
+                                          new_node(c2m_ctx, N_IGNORE));
+                NL_APPEND(param_list->u.ops, decl_node);
+                check(c2m_ctx, decl_node, r);
+            }
         } else {
-          warning (c2m_ctx, POS (p), "type of parameter %s defaults to int", p->u.s.s);
-          decl_node = new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (p),
-                                     new_node1 (c2m_ctx, N_SHARE,
-                                                new_node1 (c2m_ctx, N_LIST,
-                                                           new_pos_node (c2m_ctx, N_INT, POS (p)))),
-                                     new_pos_node2 (c2m_ctx, N_DECL, POS (p),
-                                                    new_str_node (c2m_ctx, N_ID, p->u.s, POS (p)),
-                                                    new_node (c2m_ctx, N_LIST)),
-                                     new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
-                                     new_node (c2m_ctx, N_IGNORE));
-          NL_APPEND (param_list->u.ops, decl_node);
-          check (c2m_ctx, decl_node, r);
+            struct decl_spec *decl_spec_ptr;
+            decl_node = sym.def_node;
+            assert(decl_node->code == N_SPEC_DECL);
+            NL_REMOVE(declarations->u.ops, decl_node);
+            NL_APPEND(param_list->u.ops, decl_node);
+            param_declarator = NL_EL(decl_node->u.ops, 1);
+            assert(param_declarator->code == N_DECL);
+            param_id = NL_HEAD(param_declarator->u.ops);
+            if (NL_NEXT(NL_NEXT(param_declarator))->code != N_IGNORE) {
+                error(c2m_ctx, POS(p), "initialized parameter %s", param_id->u.s.s);
+            }
+            decl_spec_ptr = &((decl_t)decl_node->attr)->decl_spec;
+            adjust_param_type(c2m_ctx, &decl_spec_ptr->type);
+            decl_spec = *decl_spec_ptr;
+            if (decl_spec.typedef_p || decl_spec.extern_p || decl_spec.static_p || decl_spec.auto_p
+                || decl_spec.thread_local_p) {
+                error(c2m_ctx, POS(param_id), "storage specifier in a function parameter %s",
+                      param_id->u.s.s);
+            }
         }
-      } else {
-        struct decl_spec *decl_spec_ptr;
+    }
 
-        decl_node = sym.def_node;
-        assert (decl_node->code == N_SPEC_DECL);
-        NL_REMOVE (declarations->u.ops, decl_node);
-        NL_APPEND (param_list->u.ops, decl_node);
-        param_declarator = NL_EL (decl_node->u.ops, 1);
-        assert (param_declarator->code == N_DECL);
-        param_id = NL_HEAD (param_declarator->u.ops);
-        if (NL_NEXT (NL_NEXT (param_declarator))->code != N_IGNORE) {
-          error (c2m_ctx, POS (p), "initialized parameter %s", param_id->u.s.s);
-        }
-        decl_spec_ptr = &((decl_t) decl_node->attr)->decl_spec;
-        adjust_param_type (c2m_ctx, &decl_spec_ptr->type);
-        decl_spec = *decl_spec_ptr;
-        if (decl_spec.typedef_p || decl_spec.extern_p || decl_spec.static_p || decl_spec.auto_p
-            || decl_spec.thread_local_p) {
-          error (c2m_ctx, POS (param_id), "storage specifier in a function parameter %s",
-                 param_id->u.s.s);
-        }
-      }
+    // Process remaining declarations
+    for (p = NL_HEAD(declarations->u.ops); p != NULL; p = NL_NEXT(p)) {
+        if (p->code == N_ST_ASSERT) continue;
+        assert(p->code == N_SPEC_DECL);
+        param_declarator = NL_EL(p->u.ops, 1);
+        if (param_declarator->code == N_IGNORE) continue;
+        assert(param_declarator->code == N_DECL);
+        param_id = NL_HEAD(param_declarator->u.ops);
+        assert(param_id->code == N_ID);
+        error(c2m_ctx, POS(param_id), "declaration for parameter %s but no such parameter",
+              param_id->u.s.s);
     }
-    /* Process the rest declarations: */
-    for (p = NL_HEAD (declarations->u.ops); p != NULL; p = NL_NEXT (p)) {
-      if (p->code == N_ST_ASSERT) continue;
-      assert (p->code == N_SPEC_DECL);
-      param_declarator = NL_EL (p->u.ops, 1);
-      if (param_declarator->code == N_IGNORE) continue;
-      assert (param_declarator->code == N_DECL);
-      param_id = NL_HEAD (param_declarator->u.ops);
-      assert (param_id->code == N_ID);
-      error (c2m_ctx, POS (param_id), "declaration for parameter %s but no such parameter",
-             param_id->u.s.s);
-    }
-    add__func__def (c2m_ctx, block, id->u.s);
-    check (c2m_ctx, block, r);
-    /* Process all label uses: */
-    for (size_t i = 0; i < VARR_LENGTH (node_t, label_uses); i++) {
-      node_t n = VARR_GET (node_t, label_uses, i);
 
-      id = n->code == N_LABEL_ADDR ? NL_HEAD (n->u.ops) : NL_NEXT (NL_HEAD (n->u.ops));
-      if (!symbol_find (c2m_ctx, S_LABEL, id, func_block_scope, &sym)) {
-        error (c2m_ctx, POS (id), "undefined label %s", id->u.s.s);
-      } else if (n->code == N_LABEL_ADDR) {
-        ((struct expr *) n->attr)->u.label_addr_target = sym.def_node;
-      } else {
-        n->attr = sym.def_node;
-      }
+    // Add function definition and check block
+    add__func__def(c2m_ctx, block, id->u.s);
+    check(c2m_ctx, block, r);
+
+    // Process label uses
+    for (size_t i = 0; i < VARR_LENGTH(node_t, label_uses); i++) {
+        node_t n = VARR_GET(node_t, label_uses, i);
+        id = n->code == N_LABEL_ADDR ? NL_HEAD(n->u.ops) : NL_NEXT(NL_HEAD(n->u.ops));
+        if (!symbol_find(c2m_ctx, S_LABEL, id, func_block_scope, &sym)) {
+            error(c2m_ctx, POS(id), "undefined label %s", id->u.s.s);
+        } else if (n->code == N_LABEL_ADDR) {
+            ((struct expr *)n->attr)->u.label_addr_target = sym.def_node;
+        } else {
+            n->attr = sym.def_node;
+        }
     }
-    VARR_TRUNC (node_t, label_uses, 0);
-    assert (curr_scope == top_scope); /* set up in the block */
+    VARR_TRUNC(node_t, label_uses, 0);
+
+    assert(curr_scope == top_scope); // curr_scope is #define as check_ctx->curr_scope above, don't use check_ctx->curr_scope
     func_block_scope = top_scope;
-    process_func_decls_for_allocation (c2m_ctx);
-    /* Add call arg area */
+    process_func_decls_for_allocation(c2m_ctx);
     ns = block->attr;
-    ns->size = round_size (ns->size, MAX_ALIGNMENT);
+    ns->size = round_size(ns->size, MAX_ALIGNMENT);
     ns->size += ns->call_arg_area_size;
     break;
   }
@@ -10489,9 +10723,10 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     break;
   }
   case N_BLOCK:
-    check_labels (c2m_ctx, NL_HEAD (r->u.ops), r);
     if (curr_scope != r)
       create_node_scope (c2m_ctx, r); /* it happens if it is the top func block */
+	// Moved as labels aren't properly scoped
+    check_labels (c2m_ctx, NL_HEAD (r->u.ops), r);
     check (c2m_ctx, NL_EL (r->u.ops, 1), r);
     finish_scope (c2m_ctx);
     break;
@@ -10750,9 +10985,12 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     node_t decl_list = NL_NEXT (id);
 
     if (decl_list->code != N_IGNORE) {
+	  node_t prev_class = curr_class; // Can be NULL
       create_node_scope (c2m_ctx, r);
+	  curr_class = r;
       check (c2m_ctx, decl_list, r);
       finish_scope (c2m_ctx);
+	  curr_class = prev_class;
 	  printf("N_CLASS finish scope\n");
     }
     break;
@@ -10815,6 +11053,7 @@ static void context_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (node_t, context_stack, alloc, 64);
   check (c2m_ctx, n_i1_node, NULL);
   func_block_scope = curr_scope = NULL;
+  curr_class = NULL;
   VARR_CREATE (node_t, label_uses, alloc, 0);
   symbol_init (c2m_ctx);
   in_params_p = FALSE;
@@ -14882,7 +15121,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_BLOCK:
   case N_FOR:
     if (!attr_p
-        || ((n->code == N_STRUCT || n->code == N_UNION)
+        || ((n->code == N_STRUCT || n->code == N_UNION || n->code == N_CLASS)
             && (NL_EL (n->u.ops, 1) == NULL || NL_EL (n->u.ops, 1)->code == N_IGNORE)))
       fprintf (f, "\n");
     else if (n->code == N_MODULE)
