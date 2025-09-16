@@ -2,6 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <alloca.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#ifdef __LINUX__
+#  include <elf.h>
+#endif
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include "mir-alloc-default.c"

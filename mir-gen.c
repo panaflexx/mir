@@ -246,6 +246,7 @@ struct gen_ctx {
   void *bb_wrapper;                /* to jump to lazy basic block generation */
   VARR (spot_attr_t) * spot2attr;  /* map: spot number -> spot_attr */
   VARR (spot_attr_t) * spot_attrs; /* spot attrs wit only non-zero properies */
+  int gen_object_file;
 };
 
 #define optimize_level gen_ctx->optimize_level
@@ -308,7 +309,7 @@ static inline gen_ctx_t *gen_ctx_loc (MIR_context_t ctx) { return (gen_ctx_t *) 
 DEF_VARR (int);
 DEF_VARR (uint8_t);
 DEF_VARR (uint64_t);
-DEF_VARR (MIR_code_reloc_t);
+//DEF_VARR (MIR_code_reloc_t); // Moved to mir.h
 
 #if defined(__x86_64__) || defined(_M_AMD64)
 #include "mir-gen-x86_64.c"
@@ -9499,6 +9500,7 @@ static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int ma
   _MIR_restore_func_insns (ctx, func_item);
   /* ??? We should use atomic here but c2mir does not implement them yet.  */
   func_item->u.func->machine_code = machine_code;
+  func_item->u.func->machine_code_len = code_len; // Added for JIT->obj
   return func_item->addr;
 }
 
@@ -9536,6 +9538,16 @@ void MIR_gen_set_optimize_level (MIR_context_t ctx, unsigned int level) {
   }
   optimize_level = level;
 }
+
+void MIR_gen_set_save_relocs (MIR_context_t ctx, unsigned int level) {
+  gen_ctx_t gen_ctx = *gen_ctx_loc (ctx);
+  if (gen_ctx == NULL) {
+    fprintf (stderr, "Calling MIR_gen_set_save_relocs before MIR_gen_init -- good bye\n");
+    exit (1);
+  }
+  gen_ctx->gen_object_file = (level != 0) ? 1:01;
+}
+
 
 static void generate_bb_version_machine_code (gen_ctx_t gen_ctx, bb_version_t bb_version);
 static void *bb_version_generator (gen_ctx_t gen_ctx, bb_version_t bb_version);
@@ -9653,6 +9665,7 @@ void MIR_gen_init (MIR_context_t ctx) {
   gen_ctx->lr_ctx = NULL;
   gen_ctx->ra_ctx = NULL;
   gen_ctx->combine_ctx = NULL;
+  gen_ctx->gen_object_file = 0;
 #if !MIR_NO_GEN_DEBUG
   debug_file = NULL;
   debug_level = 100;

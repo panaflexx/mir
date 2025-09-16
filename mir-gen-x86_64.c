@@ -600,6 +600,7 @@ struct const_ref {
   size_t pc;             /* where rel32 address should be in code */
   size_t next_insn_disp; /* displacement of the next insn */
   size_t const_num;
+  const char *symbol_name; /* Name of external symbol, NULL if internal */
 };
 
 typedef struct const_ref const_ref_t;
@@ -2978,34 +2979,62 @@ static void store_call_ref (gen_ctx_t gen_ctx, MIR_item_t ref_func_item, uint8_t
 
 static void change_calls (gen_ctx_t gen_ctx, uint8_t *base) {
   MIR_context_t ctx = gen_ctx->ctx;
-  /* changing calls to rel32 calls: */
+  // For non-jit targets, store relocs
+  //VARR (const_ref_t) *const_refs = gen_ctx->target_ctx->const_refs;
+  //VARR (uint64_t) *const_pool = gen_ctx->target_ctx->const_pool;
+  //VARR (MIR_code_reloc_t) *relocs = gen_ctx->target_ctx->relocs;
+
   for (size_t i = 0; i < VARR_LENGTH (const_ref_t, const_refs); i++) {
     const_ref_t cr = VARR_GET (const_ref_t, const_refs, i);
     if (!cr.call_p) continue;
     gen_assert (base[cr.pc - 2] == 0xff);
     gen_assert (base[cr.pc - 1] == 0x15 || base[cr.pc - 1] == 0x25);
-    if (cr.func_item != NULL) store_call_ref (gen_ctx, cr.func_item, (uint8_t *) base + cr.pc - 2);
-    uint64_t v = VARR_GET (uint64_t, const_pool, cr.const_num);
-    int64_t off = (int64_t) v - (int64_t) (base + cr.next_insn_disp);
-    if (!int32_p (off)) continue;
-    uint8_t rel_insn[] = {0x40, 0xe8, 0, 0, 0, 0};   /* rex call rel32 */
-    if (base[cr.pc - 1] == 0x25) rel_insn[1] = 0xe9; /* rex jmp rel32 */
-    set_int64 (rel_insn + 2, off, 4);
-    _MIR_change_code (ctx, (uint8_t *) base + cr.pc - 2, (uint8_t *) rel_insn, 6);
+
+    if (gen_ctx->gen_object_file && cr.func_item == NULL && cr.symbol_name != NULL) {
+	  printf("reloc %s @ %zu\n", cr.symbol_name, cr.pc);
+      /* External call for object file: emit placeholder and record relocation */
+      uint8_t rel_insn[] = {0x40, 0xe8, 0, 0, 0, 0}; /* rex call rel32 0 */
+      _MIR_change_code (ctx, base + cr.pc - 2, rel_insn, 6);
+      MIR_code_reloc_t reloc = {
+        .offset = cr.pc,         /* Start of rel32 field */
+        .symbol = cr.symbol_name, /* e.g., "printf" */
+        .type = R_X86_64_PC32,   /* 32-bit PC-relative relocation */
+        .value = NULL
+      };
+      VARR_PUSH (MIR_code_reloc_t, relocs, reloc);
+    } else {
+      /* Internal call or JIT mode: try relative call */
+      if (cr.func_item != NULL)
+        store_call_ref (gen_ctx, cr.func_item, base + cr.pc - 2);
+      uint64_t v = VARR_GET (uint64_t, const_pool, cr.const_num);
+      int64_t off = (int64_t)v - (int64_t)(base + cr.next_insn_disp);
+      if (int32_p (off)) {
+        uint8_t rel_insn[] = {0x40, 0xe8, 0, 0, 0, 0}; /* rex call rel32 */
+        if (base[cr.pc - 1] == 0x25) rel_insn[1] = 0xe9; /* rex jmp rel32 */
+        set_int64 (rel_insn + 2, off, 4);
+        _MIR_change_code (ctx, base + cr.pc - 2, rel_insn, 6);
+      }
+    }
   }
 }
 
 static void target_rebase (gen_ctx_t gen_ctx, uint8_t *base) {
   MIR_code_reloc_t reloc;
+  //VARR (uint64_t) *abs_address_locs = gen_ctx->target_ctx->abs_address_locs;
+  //VARR (MIR_code_reloc_t) *relocs = gen_ctx->target_ctx->relocs;
 
   VARR_TRUNC (MIR_code_reloc_t, relocs, 0);
-  for (size_t i = 0; i < VARR_LENGTH (uint64_t, abs_address_locs); i++) {
-    reloc.offset = VARR_GET (uint64_t, abs_address_locs, i);
-    reloc.value = base + get_int64 (base + reloc.offset, 8);
-    VARR_PUSH (MIR_code_reloc_t, relocs, reloc);
+  if (!gen_ctx->gen_object_file) {
+    /* JIT mode: update absolute addresses */
+    for (size_t i = 0; i < VARR_LENGTH (uint64_t, abs_address_locs); i++) {
+      reloc.offset = VARR_GET (uint64_t, abs_address_locs, i);
+      reloc.value = base + get_int64 (base + reloc.offset, 8);
+      VARR_PUSH (MIR_code_reloc_t, relocs, reloc);
+    }
+    _MIR_update_code_arr (gen_ctx->ctx, base, VARR_LENGTH (MIR_code_reloc_t, relocs),
+                          VARR_ADDR (MIR_code_reloc_t, relocs));
   }
-  _MIR_update_code_arr (gen_ctx->ctx, base, VARR_LENGTH (MIR_code_reloc_t, relocs),
-                        VARR_ADDR (MIR_code_reloc_t, relocs));
+  /* For object files, keep relocations from change_calls */
   change_calls (gen_ctx, base);
   gen_setup_lrefs (gen_ctx, base);
 }

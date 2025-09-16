@@ -297,6 +297,21 @@ typedef struct MIR_var {
 
 DEF_VARR (MIR_var_t);
 
+// MIR_code_reloc.type
+#define R_X86_64_PC32 2  // 32-bit PC-relative relocation
+#define R_X86_64_64   1  // 64-bit absolute relocation
+
+struct MIR_code_reloc {
+  size_t offset;
+  const void *value;
+  const char *symbol; // object_file_gen
+  int type;
+};
+
+typedef struct MIR_code_reloc MIR_code_reloc_t;
+DEF_VARR (MIR_code_reloc_t);
+
+
 /* Function definition */
 typedef struct MIR_func {
   const char *name;
@@ -311,9 +326,11 @@ typedef struct MIR_func {
   VARR (MIR_var_t) * vars;        /* args and locals but temps */
   VARR (MIR_var_t) * global_vars; /* can be NULL */
   void *machine_code;             /* address of generated machine code or NULL */
+  size_t machine_code_len;		  /* Added for JIT -> obj */
   void *call_addr; /* address to call the function, it can be the same as machine_code */
   void *internal;  /* internal data structure */
   struct MIR_lref_data *first_lref; /* label addr data of the func: defined by module load */
+  VARR (MIR_code_reloc_t) * relocs; /* Relocations for object file */
 } *MIR_func_t;
 
 typedef struct MIR_proto {
@@ -684,12 +701,6 @@ extern uint8_t *_MIR_publish_code (MIR_context_t ctx, const uint8_t *code, size_
 extern uint8_t *_MIR_get_new_code_addr (MIR_context_t ctx, size_t size);
 extern uint8_t *_MIR_publish_code_by_addr (MIR_context_t ctx, void *addr, const uint8_t *code,
                                            size_t code_len);
-struct MIR_code_reloc {
-  size_t offset;
-  const void *value;
-};
-
-typedef struct MIR_code_reloc MIR_code_reloc_t;
 
 extern void _MIR_set_code (MIR_code_alloc_t alloc, size_t prot_start, size_t prot_len,
                            uint8_t *base, size_t nloc, const MIR_code_reloc_t *relocs,
