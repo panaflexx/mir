@@ -333,276 +333,855 @@ void *hybrid_import_resolver(const char *name) {
     return addr;  // Return real address for MIR_link
 }
 
-code_data_t generate_pic_machine_code(MIR_context_t ctx, MIR_item_t func) {
-    code_data_t result = {0};
-    symbols.entries = NULL;
-    symbols.n_entries = 0;
-    symbols.capacity = 0;
+/* ================================================================== */
+/*  Collected item types for ELF generation                           */
+/* ================================================================== */
 
-    // Set up MIR generator
-    MIR_gen_init(ctx);
-	MIR_gen_set_save_relocs(ctx, 1);
-    MIR_link(ctx, MIR_set_gen_interface, hybrid_import_resolver);
-    uint64_t (*fun_addr)(int, char **, char **) = MIR_gen(ctx, func);
+typedef struct {
+    const char *name;       /* symbol name (may be NULL for anonymous data) */
+    void       *code;       /* copy of machine code */
+    size_t      code_len;   /* length in bytes */
+    size_t      text_offset;/* offset within the concatenated .text section */
+    MIR_item_t  item;       /* original MIR item (for relocs VARR) */
+} func_entry_t;
 
-    unsigned char *code = (unsigned char *)func->addr;
-    for (size_t i = 0; i < 4096; i++) {
-        if (code[i] == 0xC3 && code[i + 1] == 0x0) {
-            result.code_size = i + 1; // Length up to and including ret
-            break;
+typedef struct {
+    const char *name;       /* symbol name (may be NULL) */
+    uint8_t    *bytes;      /* raw data bytes */
+    size_t      size;       /* data size in bytes */
+    size_t      data_offset;/* offset within .data section */
+    int         is_ref_data;/* 1 if this came from MIR_ref_data_item */
+    MIR_item_t  ref_item;   /* for ref_data: the referenced item */
+    int64_t     ref_disp;   /* for ref_data: displacement */
+    void       *item_addr;  /* MIR item->addr at load time (for reloc scanning) */
+} data_entry_t;
+
+typedef struct {
+    const char *name;
+    size_t      len;
+    size_t      bss_offset; /* offset within .bss section */
+    void       *item_addr;
+} bss_entry_t;
+
+/* A single relocation to emit */
+typedef struct {
+    size_t      offset;     /* offset within the target section (.text or .data) */
+    const char *symbol;     /* symbol name */
+    int         type;       /* ELF reloc type, e.g. R_X86_64_64 */
+    int64_t     addend;
+    int         in_data;    /* 0 = .text reloc, 1 = .data reloc */
+} elf_reloc_t;
+
+/* ================================================================== */
+/*  Helper: add a string to a dynamically-growing string table         */
+/* ================================================================== */
+static size_t strtab_add(char **buf, size_t *bufsize, size_t *bufcap, const char *str) {
+    size_t len = strlen(str) + 1;
+    while (*bufsize + len > *bufcap) {
+        *bufcap = *bufcap ? *bufcap * 2 : 256;
+        *buf = realloc(*buf, *bufcap);
+    }
+    size_t off = *bufsize;
+    memcpy(*buf + off, str, len);
+    *bufsize += len;
+    return off;
+}
+
+/* ================================================================== */
+/*  Helper: 8-byte-align a value                                       */
+/* ================================================================== */
+static size_t align8(size_t v) { return (v + 7) & ~(size_t)7; }
+
+/* ================================================================== */
+/*  Helper: write padding bytes                                        */
+/* ================================================================== */
+static void write_padding(int fd, size_t nbytes) {
+    static const char zeros[16] = {0};
+    while (nbytes > 0) {
+        size_t n = nbytes < sizeof(zeros) ? nbytes : sizeof(zeros);
+        write(fd, zeros, n);
+        nbytes -= n;
+    }
+}
+
+/* ================================================================== */
+/*  Helper: find or add a name in a simple dedup list, return index    */
+/* ================================================================== */
+typedef struct { char **names; size_t n; size_t cap; } name_set_t;
+static size_t name_set_find_or_add(name_set_t *s, const char *name) {
+    for (size_t i = 0; i < s->n; i++)
+        if (strcmp(s->names[i], name) == 0) return i;
+    if (s->n >= s->cap) {
+        s->cap = s->cap ? s->cap * 2 : 32;
+        s->names = realloc(s->names, s->cap * sizeof(char *));
+    }
+    s->names[s->n] = strdup(name);
+    return s->n++;
+}
+static int name_set_find(name_set_t *s, const char *name, size_t *idx) {
+    for (size_t i = 0; i < s->n; i++)
+        if (strcmp(s->names[i], name) == 0) { *idx = i; return 1; }
+    return 0;
+}
+
+/* ================================================================== */
+/*  create_object_file_from_module                                     */
+/*  Walks all items in all modules, generates code, collects data/bss, */
+/*  builds ELF sections, and writes a valid ELF64 relocatable object.  */
+/* ================================================================== */
+static void create_object_file_from_module(MIR_context_t ctx, const char *output_file) {
+    /* ----- Phase 0: arrays for collected items ----- */
+    func_entry_t *funcs = NULL;  size_t n_funcs = 0, cap_funcs = 0;
+    data_entry_t *datas = NULL;  size_t n_datas = 0, cap_datas = 0;
+    bss_entry_t  *bsses = NULL;  size_t n_bsses = 0, cap_bsses = 0;
+    elf_reloc_t  *relocs = NULL; size_t n_relocs = 0, cap_relocs = 0;
+    name_set_t exports = {0};
+    name_set_t imports = {0};
+
+    /* ----- Phase 1a: Generate machine code for all functions ----- */
+    for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
+         module != NULL;
+         module = DLIST_NEXT(MIR_module_t, module)) {
+        for (MIR_item_t item = DLIST_HEAD(MIR_item_t, module->items);
+             item != NULL;
+             item = DLIST_NEXT(MIR_item_t, item)) {
+            if (item->item_type == MIR_func_item) {
+                MIR_gen(ctx, item);
+            }
         }
     }
-    printf("code size=%zu bytes\n", result.code_size);
 
-    result.code = malloc(result.code_size);
-    memcpy(result.code, func->addr, result.code_size);
+    /* ----- Phase 1b: Collect all items (including those created by MIR_gen) ----- */
+    for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
+         module != NULL;
+         module = DLIST_NEXT(MIR_module_t, module)) {
+        for (MIR_item_t item = DLIST_HEAD(MIR_item_t, module->items);
+             item != NULL;
+             item = DLIST_NEXT(MIR_item_t, item)) {
 
-    result.relocs = NULL;
-    result.n_relocs = 0;
+            switch (item->item_type) {
 
-    // Precompute target addresses for faster comparison
-    uint64_t *targets = malloc(symbols.n_entries * sizeof(uint64_t));
-    for (size_t j = 0; j < symbols.n_entries; j++) {
-        targets[j] = (uint64_t)symbols.entries[j].addr;
-    }
+            case MIR_export_item:
+                name_set_find_or_add(&exports, item->u.export_id);
+                break;
 
-    // Scan code byte by byte for 8-byte address matches
-    for (size_t i = 0; i <= result.code_size - 8; i++) {
-        uint64_t val;
-        memcpy(&val, code + i, sizeof(uint64_t)); // Safe unaligned read
-        for (size_t j = 0; j < symbols.n_entries; j++) {
-            if (val == targets[j]) {
-                result.relocs = realloc(result.relocs, (result.n_relocs + 1) * sizeof(reloc_t));
-                result.relocs[result.n_relocs].offset = i;
-                result.relocs[result.n_relocs].symbol = symbols.entries[j].symbol;
-                result.relocs[result.n_relocs].type = R_X86_64_64;
-                result.n_relocs++;
-                printf("FOUND SYMBOL %s @ %zu\n", symbols.entries[j].symbol, i);
-                // Zero out the 8 bytes
-                for (size_t k = 0; k < 8; k++) {
-                    code[i + k] = 0;
+            case MIR_import_item:
+                name_set_find_or_add(&imports, item->u.import_id);
+                break;
+
+            case MIR_func_item: {
+                MIR_func_t f = item->u.func;
+                if (!f->machine_code || f->machine_code_len == 0) {
+                    fprintf(stderr, "warning: function '%s' produced no code\n", f->name);
+                    break;
                 }
+                if (n_funcs >= cap_funcs) {
+                    cap_funcs = cap_funcs ? cap_funcs * 2 : 16;
+                    funcs = realloc(funcs, cap_funcs * sizeof(func_entry_t));
+                }
+                func_entry_t *fe = &funcs[n_funcs++];
+                fe->name = f->name;
+                fe->code_len = f->machine_code_len;
+                fe->code = malloc(fe->code_len);
+                memcpy(fe->code, f->machine_code, fe->code_len);
+                fe->text_offset = 0;
+                fe->item = item;
+                printf("  func: %s  code_len=%zu\n", f->name, fe->code_len);
+                break;
+            }
+
+            case MIR_data_item: {
+                MIR_data_t d = item->u.data;
+                size_t sz = d->nel * _MIR_type_size(ctx, d->el_type);
+                if (sz == 0) break;
+                if (n_datas >= cap_datas) {
+                    cap_datas = cap_datas ? cap_datas * 2 : 32;
+                    datas = realloc(datas, cap_datas * sizeof(data_entry_t));
+                }
+                data_entry_t *de = &datas[n_datas++];
+                de->name = d->name;
+                de->size = sz;
+                de->bytes = malloc(sz);
+                memcpy(de->bytes, d->u.els, sz);
+                de->data_offset = 0;
+                de->is_ref_data = 0;
+                de->ref_item = NULL;
+                de->ref_disp = 0;
+                de->item_addr = item->addr;
+                printf("  data: %s  size=%zu  addr=%p\n", d->name ? d->name : "(anon)", sz, item->addr);
+                break;
+            }
+
+            case MIR_ref_data_item: {
+                MIR_ref_data_t rd = item->u.ref_data;
+                if (n_datas >= cap_datas) {
+                    cap_datas = cap_datas ? cap_datas * 2 : 32;
+                    datas = realloc(datas, cap_datas * sizeof(data_entry_t));
+                }
+                data_entry_t *de = &datas[n_datas++];
+                de->name = rd->name;
+                de->size = 8;
+                de->bytes = calloc(1, 8);
+                de->data_offset = 0;
+                de->is_ref_data = 1;
+                de->ref_item = rd->ref_item;
+                de->ref_disp = rd->disp;
+                de->item_addr = item->addr;
+                printf("  ref_data: %s -> %s + %ld\n",
+                       rd->name ? rd->name : "(anon)",
+                       MIR_item_name(ctx, rd->ref_item), (long)rd->disp);
+                break;
+            }
+
+            case MIR_bss_item: {
+                MIR_bss_t b = item->u.bss;
+                if (n_bsses >= cap_bsses) {
+                    cap_bsses = cap_bsses ? cap_bsses * 2 : 16;
+                    bsses = realloc(bsses, cap_bsses * sizeof(bss_entry_t));
+                }
+                bss_entry_t *be = &bsses[n_bsses++];
+                be->name = b->name;
+                be->len = b->len;
+                be->bss_offset = 0;
+                be->item_addr = item->addr;
+                if (b->name)
+                    printf("  bss: %s  len=%lu  addr=%p\n", b->name, (unsigned long)b->len, item->addr);
+                break;
+            }
+
+            case MIR_forward_item:
+            case MIR_proto_item:
+            case MIR_lref_data_item:
+            case MIR_expr_data_item:
+                break;
+
+            default:
                 break;
             }
         }
     }
 
-    free(targets);
-    MIR_gen_finish(ctx);
-    return result;
-}
+    /* ----- Phase 2: assign offsets within sections ----- */
 
-/**
- * Creates an ELF object file from the provided code and relocation data.
- * @param output_file Path to the output ELF file
- * @param code_data Structure containing machine code and relocations
- */
-void create_object_file(const char *output_file, const code_data_t *code_data) {
-    // Open the output file
+    /* .text: concatenate all function codes (16-byte aligned) */
+    size_t text_size = 0;
+    for (size_t i = 0; i < n_funcs; i++) {
+        if (i > 0) text_size = (text_size + 15) & ~(size_t)15;
+        funcs[i].text_offset = text_size;
+        text_size += funcs[i].code_len;
+    }
+
+    /* .data: concatenate all data items (8-byte aligned) */
+    size_t data_size = 0;
+    for (size_t i = 0; i < n_datas; i++) {
+        if (i > 0) data_size = align8(data_size);
+        datas[i].data_offset = data_size;
+        data_size += datas[i].size;
+    }
+
+    /* .bss: just total size (8-byte aligned per item) */
+    size_t bss_size = 0;
+    for (size_t i = 0; i < n_bsses; i++) {
+        if (i > 0) bss_size = align8(bss_size);
+        bsses[i].bss_offset = bss_size;
+        bss_size += bsses[i].len;
+    }
+
+    /* Build .text data buffer */
+    uint8_t *text_buf = calloc(1, text_size ? text_size : 1);
+    for (size_t i = 0; i < n_funcs; i++)
+        memcpy(text_buf + funcs[i].text_offset, funcs[i].code, funcs[i].code_len);
+
+    /* Build .data data buffer */
+    uint8_t *data_buf = calloc(1, data_size ? data_size : 1);
+    for (size_t i = 0; i < n_datas; i++)
+        memcpy(data_buf + datas[i].data_offset, datas[i].bytes, datas[i].size);
+
+    /* ----- Phase 2b: collect relocations by scanning for embedded addresses ----- */
+
+    /* Build address-to-symbol map from all MIR items */
+    typedef struct { uint64_t addr; const char *name; int in_text; /* 0=data/bss, 1=text */ } addr_sym_t;
+    addr_sym_t *addr_map = NULL;
+    size_t n_addr_map = 0, cap_addr_map = 0;
+
+    #define ADDR_MAP_ADD(a, n, sec) do { \
+        if (n_addr_map >= cap_addr_map) { \
+            cap_addr_map = cap_addr_map ? cap_addr_map * 2 : 128; \
+            addr_map = realloc(addr_map, cap_addr_map * sizeof(addr_sym_t)); \
+        } \
+        addr_map[n_addr_map].addr = (uint64_t)(uintptr_t)(a); \
+        addr_map[n_addr_map].name = (n); \
+        addr_map[n_addr_map].in_text = (sec); \
+        n_addr_map++; \
+    } while(0)
+
+    /* Add collected data/bss items' loaded addresses */
+    for (size_t i = 0; i < n_datas; i++) {
+        if (datas[i].item_addr && datas[i].name)
+            ADDR_MAP_ADD(datas[i].item_addr, datas[i].name, 0);
+    }
+    for (size_t i = 0; i < n_bsses; i++) {
+        if (bsses[i].item_addr && bsses[i].name)
+            ADDR_MAP_ADD(bsses[i].item_addr, bsses[i].name, 0);
+    }
+    /* Add function call_addr (thunks) for inter-function refs */
+    for (size_t i = 0; i < n_funcs; i++) {
+        if (funcs[i].item && funcs[i].item->addr)
+            ADDR_MAP_ADD(funcs[i].item->addr, funcs[i].name, 1);
+    }
+
+    /* Add imported symbol addresses (from hybrid_import_resolver records) */
+    for (size_t si = 0; si < symbols.n_entries; si++) {
+        if (symbols.entries[si].addr)
+            ADDR_MAP_ADD(symbols.entries[si].addr, symbols.entries[si].symbol, 0);
+    }
+
+    /* Scan each function's code for embedded absolute 8-byte addresses */
+    for (size_t fi = 0; fi < n_funcs; fi++) {
+        uint8_t *fc = text_buf + funcs[fi].text_offset;
+        size_t flen = funcs[fi].code_len;
+        for (size_t i = 0; i + 7 < flen; i++) {
+            uint64_t val;
+            memcpy(&val, fc + i, 8);
+            if (val < 0x10000) continue; /* skip small values */
+            for (size_t j = 0; j < n_addr_map; j++) {
+                if (val == addr_map[j].addr) {
+                    if (n_relocs >= cap_relocs) {
+                        cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
+                        relocs = realloc(relocs, cap_relocs * sizeof(elf_reloc_t));
+                    }
+                    elf_reloc_t *er = &relocs[n_relocs++];
+                    er->offset = funcs[fi].text_offset + i;
+                    er->symbol = addr_map[j].name;
+                    er->type = R_X86_64_64;
+                    er->addend = 0;
+                    er->in_data = 0;
+                    /* Zero out the 8 bytes in the text buffer */
+                    memset(fc + i, 0, 8);
+                    i += 7; /* skip past the matched bytes */
+                    break;
+                }
+            }
+        }
+    }
+    free(addr_map);
+    #undef ADDR_MAP_ADD
+
+    /* .data relocations from ref_data items */
+    for (size_t i = 0; i < n_datas; i++) {
+        if (!datas[i].is_ref_data) continue;
+        const char *target_name = MIR_item_name(ctx, datas[i].ref_item);
+        if (!target_name) continue;
+        if (n_relocs >= cap_relocs) {
+            cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
+            relocs = realloc(relocs, cap_relocs * sizeof(elf_reloc_t));
+        }
+        elf_reloc_t *er = &relocs[n_relocs++];
+        er->offset = datas[i].data_offset;
+        er->symbol = target_name;
+        er->type = R_X86_64_64;
+        er->addend = datas[i].ref_disp;
+        er->in_data = 1;
+        /* The 8 bytes in data_buf are already zero (calloc) */
+    }
+
+    /* ----- Phase 3: build string tables and symbol table ----- */
+
+    /*
+     * Section indices:
+     *   0  = null
+     *   1  = .text
+     *   2  = .data
+     *   3  = .bss
+     *   4  = .rela.text
+     *   5  = .rela.data
+     *   6  = .symtab
+     *   7  = .strtab
+     *   8  = .shstrtab
+     *   9  = .note.GNU-stack
+     */
+    enum {
+        SEC_NULL = 0,
+        SEC_TEXT,        /* 1 */
+        SEC_DATA,        /* 2 */
+        SEC_BSS,         /* 3 */
+        SEC_RELA_TEXT,   /* 4 */
+        SEC_RELA_DATA,   /* 5 */
+        SEC_SYMTAB,      /* 6 */
+        SEC_STRTAB,      /* 7 */
+        SEC_SHSTRTAB,    /* 8 */
+        SEC_NOTE_STACK,  /* 9 */
+        NUM_SECTIONS     /* 10 */
+    };
+
+    /* Build .shstrtab */
+    char  *shstrtab = NULL;
+    size_t shstrtab_size = 0, shstrtab_cap = 0;
+    strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ""); /* index 0 = null */
+    size_t nm_text       = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".text");
+    size_t nm_data       = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".data");
+    size_t nm_bss        = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".bss");
+    size_t nm_rela_text  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.text");
+    size_t nm_rela_data  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.data");
+    size_t nm_symtab     = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".symtab");
+    size_t nm_strtab     = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".strtab");
+    size_t nm_shstrtab   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".shstrtab");
+    size_t nm_note_stack = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".note.GNU-stack");
+
+    /* Build .strtab + symtab entries */
+    char  *strtab = NULL;
+    size_t strtab_size = 0, strtab_cap = 0;
+    strtab_add(&strtab, &strtab_size, &strtab_cap, ""); /* index 0 = null */
+
+    /* We need to build the symtab in two passes: locals first, then globals.
+     * Local symbols: section symbols for .text, .data, .bss
+     * Global symbols: exported funcs/data/bss, then imported/undefined
+     */
+
+    /* Collect all unique symbol names that appear in relocations or items */
+    /* Map: symbol_name -> symtab_index  (built during emission) */
+
+    /* We'll build the symtab dynamically */
+    Elf64_Sym *symtab = NULL;
+    size_t n_syms = 0, cap_syms = 0;
+
+    #define SYMTAB_PUSH(s) do { \
+        if (n_syms >= cap_syms) { \
+            cap_syms = cap_syms ? cap_syms * 2 : 64; \
+            symtab = realloc(symtab, cap_syms * sizeof(Elf64_Sym)); \
+        } \
+        symtab[n_syms++] = (s); \
+    } while(0)
+
+    /* Symbol 0: null */
+    { Elf64_Sym s = {0}; SYMTAB_PUSH(s); }
+
+    /* Section symbols (local) for .text, .data, .bss */
+    {
+        Elf64_Sym s = {0};
+        s.st_info = ELF64_ST_INFO(STB_LOCAL, STT_SECTION);
+
+        s.st_shndx = SEC_TEXT;
+        SYMTAB_PUSH(s);
+
+        s.st_shndx = SEC_DATA;
+        SYMTAB_PUSH(s);
+
+        s.st_shndx = SEC_BSS;
+        SYMTAB_PUSH(s);
+    }
+
+    size_t first_global = n_syms; /* for sh_info */
+
+    /* We need a mapping from symbol name -> symtab index for relocation emission.
+     * Build a simple name->index table. */
+    typedef struct { const char *name; size_t idx; } sym_map_entry_t;
+    sym_map_entry_t *sym_map = NULL;
+    size_t n_sym_map = 0, cap_sym_map = 0;
+
+    #define SYM_MAP_ADD(nm, ix) do { \
+        if (n_sym_map >= cap_sym_map) { \
+            cap_sym_map = cap_sym_map ? cap_sym_map * 2 : 64; \
+            sym_map = realloc(sym_map, cap_sym_map * sizeof(sym_map_entry_t)); \
+        } \
+        sym_map[n_sym_map].name = (nm); \
+        sym_map[n_sym_map].idx = (ix); \
+        n_sym_map++; \
+    } while(0)
+
+    /* Global symbols: functions */
+    for (size_t i = 0; i < n_funcs; i++) {
+        const char *fname = funcs[i].name;
+        /* Determine binding: global if exported, otherwise local */
+        size_t dummy;
+        int is_exported = name_set_find(&exports, fname, &dummy);
+        Elf64_Sym s = {0};
+        s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, fname);
+        s.st_info = ELF64_ST_INFO(is_exported ? STB_GLOBAL : STB_LOCAL, STT_FUNC);
+        s.st_shndx = SEC_TEXT;
+        s.st_value = funcs[i].text_offset;
+        s.st_size = funcs[i].code_len;
+        SYM_MAP_ADD(fname, n_syms);
+        SYMTAB_PUSH(s);
+    }
+
+    /* Global symbols: named data items */
+    for (size_t i = 0; i < n_datas; i++) {
+        if (!datas[i].name) continue;
+        /* Check if already in sym_map (shouldn't be, but guard) */
+        int found = 0;
+        for (size_t j = 0; j < n_sym_map; j++)
+            if (strcmp(sym_map[j].name, datas[i].name) == 0) { found = 1; break; }
+        if (found) continue;
+        size_t dummy;
+        int is_exported = name_set_find(&exports, datas[i].name, &dummy);
+        Elf64_Sym s = {0};
+        s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, datas[i].name);
+        s.st_info = ELF64_ST_INFO(is_exported ? STB_GLOBAL : STB_LOCAL, STT_OBJECT);
+        s.st_shndx = SEC_DATA;
+        s.st_value = datas[i].data_offset;
+        s.st_size = datas[i].size;
+        SYM_MAP_ADD(datas[i].name, n_syms);
+        SYMTAB_PUSH(s);
+    }
+
+    /* Global symbols: named BSS items */
+    for (size_t i = 0; i < n_bsses; i++) {
+        if (!bsses[i].name) continue;
+        int found = 0;
+        for (size_t j = 0; j < n_sym_map; j++)
+            if (strcmp(sym_map[j].name, bsses[i].name) == 0) { found = 1; break; }
+        if (found) continue;
+        size_t dummy;
+        int is_exported = name_set_find(&exports, bsses[i].name, &dummy);
+        Elf64_Sym s = {0};
+        s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, bsses[i].name);
+        s.st_info = ELF64_ST_INFO(is_exported ? STB_GLOBAL : STB_LOCAL, STT_OBJECT);
+        s.st_shndx = SEC_BSS;
+        s.st_value = bsses[i].bss_offset;
+        s.st_size = bsses[i].len;
+        SYM_MAP_ADD(bsses[i].name, n_syms);
+        SYMTAB_PUSH(s);
+    }
+
+    /* Imported / external undefined symbols.
+     * Also add any reloc symbol not yet in sym_map. */
+    for (size_t i = 0; i < imports.n; i++) {
+        int found = 0;
+        for (size_t j = 0; j < n_sym_map; j++)
+            if (strcmp(sym_map[j].name, imports.names[i]) == 0) { found = 1; break; }
+        if (found) continue;
+        Elf64_Sym s = {0};
+        s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, imports.names[i]);
+        s.st_info = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+        s.st_shndx = SHN_UNDEF;
+        SYM_MAP_ADD(imports.names[i], n_syms);
+        SYMTAB_PUSH(s);
+    }
+
+    /* Also ensure every reloc symbol that isn't yet in sym_map gets added as UNDEF */
+    for (size_t i = 0; i < n_relocs; i++) {
+        const char *rname = relocs[i].symbol;
+        int found = 0;
+        for (size_t j = 0; j < n_sym_map; j++)
+            if (strcmp(sym_map[j].name, rname) == 0) { found = 1; break; }
+        if (found) continue;
+        Elf64_Sym s = {0};
+        s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, rname);
+        s.st_info = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+        s.st_shndx = SHN_UNDEF;
+        SYM_MAP_ADD(rname, n_syms);
+        SYMTAB_PUSH(s);
+    }
+
+    /* Re-sort symtab so all locals come before globals (ELF requirement).
+     * We built it that way, but the func/data symbols that are not exported
+     * are LOCAL and were placed after the section symbols but before we knew
+     * about all globals.  Let's just do a stable partition. */
+    /* Actually, let's recount first_global properly. */
+    {
+        /* Partition: move all locals to the front, globals after */
+        Elf64_Sym *sorted = calloc(n_syms, sizeof(Elf64_Sym));
+        sym_map_entry_t *sorted_map = calloc(n_sym_map, sizeof(sym_map_entry_t));
+        size_t *old_to_new = calloc(n_syms, sizeof(size_t));
+        size_t out = 0;
+        /* Pass 1: locals */
+        for (size_t i = 0; i < n_syms; i++) {
+            if (ELF64_ST_BIND(symtab[i].st_info) == STB_LOCAL) {
+                old_to_new[i] = out;
+                sorted[out++] = symtab[i];
+            }
+        }
+        first_global = out;
+        /* Pass 2: globals */
+        for (size_t i = 0; i < n_syms; i++) {
+            if (ELF64_ST_BIND(symtab[i].st_info) != STB_LOCAL) {
+                old_to_new[i] = out;
+                sorted[out++] = symtab[i];
+            }
+        }
+        /* Update sym_map indices */
+        for (size_t i = 0; i < n_sym_map; i++) {
+            sym_map[i].idx = old_to_new[sym_map[i].idx];
+        }
+        memcpy(symtab, sorted, n_syms * sizeof(Elf64_Sym));
+        free(sorted);
+        free(sorted_map);
+        free(old_to_new);
+    }
+
+    /* ----- Build .rela.text and .rela.data ----- */
+    size_t n_rela_text = 0, n_rela_data = 0;
+    for (size_t i = 0; i < n_relocs; i++) {
+        if (relocs[i].in_data) n_rela_data++; else n_rela_text++;
+    }
+
+    Elf64_Rela *rela_text = calloc(n_rela_text ? n_rela_text : 1, sizeof(Elf64_Rela));
+    Elf64_Rela *rela_data = calloc(n_rela_data ? n_rela_data : 1, sizeof(Elf64_Rela));
+    size_t rt_idx = 0, rd_idx = 0;
+
+    for (size_t i = 0; i < n_relocs; i++) {
+        /* Find symbol index */
+        size_t sym_idx = 0;
+        for (size_t j = 0; j < n_sym_map; j++) {
+            if (strcmp(sym_map[j].name, relocs[i].symbol) == 0) {
+                sym_idx = sym_map[j].idx;
+                break;
+            }
+        }
+        Elf64_Rela r = {0};
+        r.r_offset = relocs[i].offset;
+        r.r_info = ELF64_R_INFO(sym_idx, relocs[i].type);
+        r.r_addend = relocs[i].addend;
+        if (relocs[i].in_data)
+            rela_data[rd_idx++] = r;
+        else
+            rela_text[rt_idx++] = r;
+    }
+
+    /* ----- Phase 4: compute file layout and write ELF ----- */
+
+    /* File layout:
+     *   ELF header
+     *   .text   (aligned to 16)
+     *   .data   (aligned to 8)
+     *   .rela.text (aligned to 8)
+     *   .rela.data (aligned to 8)
+     *   .symtab (aligned to 8)
+     *   .strtab (aligned to 1)
+     *   .shstrtab (aligned to 1)
+     *   section headers (aligned to 8)
+     */
+    size_t off = sizeof(Elf64_Ehdr);
+
+    /* .text */
+    off = (off + 15) & ~(size_t)15;
+    size_t text_off = off;
+    off += text_size;
+
+    /* .data */
+    off = align8(off);
+    size_t data_off = off;
+    off += data_size;
+
+    /* .rela.text */
+    off = align8(off);
+    size_t rela_text_off = off;
+    size_t rela_text_size = n_rela_text * sizeof(Elf64_Rela);
+    off += rela_text_size;
+
+    /* .rela.data */
+    off = align8(off);
+    size_t rela_data_off = off;
+    size_t rela_data_size = n_rela_data * sizeof(Elf64_Rela);
+    off += rela_data_size;
+
+    /* .symtab */
+    off = align8(off);
+    size_t symtab_off = off;
+    size_t symtab_size = n_syms * sizeof(Elf64_Sym);
+    off += symtab_size;
+
+    /* .strtab */
+    size_t strtab_off = off;
+    off += strtab_size;
+
+    /* .shstrtab */
+    size_t shstrtab_off = off;
+    off += shstrtab_size;
+
+    /* section headers */
+    off = align8(off);
+    size_t sh_off = off;
+
+    /* ----- Build section headers ----- */
+    Elf64_Shdr shdrs[NUM_SECTIONS];
+    memset(shdrs, 0, sizeof(shdrs));
+
+    /* 0: null */
+    /* already zeroed */
+
+    /* 1: .text */
+    shdrs[SEC_TEXT].sh_name      = nm_text;
+    shdrs[SEC_TEXT].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_TEXT].sh_flags     = SHF_ALLOC | SHF_EXECINSTR;
+    shdrs[SEC_TEXT].sh_offset    = text_off;
+    shdrs[SEC_TEXT].sh_size      = text_size;
+    shdrs[SEC_TEXT].sh_addralign = 16;
+
+    /* 2: .data */
+    shdrs[SEC_DATA].sh_name      = nm_data;
+    shdrs[SEC_DATA].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_DATA].sh_flags     = SHF_ALLOC | SHF_WRITE;
+    shdrs[SEC_DATA].sh_offset    = data_off;
+    shdrs[SEC_DATA].sh_size      = data_size;
+    shdrs[SEC_DATA].sh_addralign = 8;
+
+    /* 3: .bss */
+    shdrs[SEC_BSS].sh_name      = nm_bss;
+    shdrs[SEC_BSS].sh_type      = SHT_NOBITS;
+    shdrs[SEC_BSS].sh_flags     = SHF_ALLOC | SHF_WRITE;
+    shdrs[SEC_BSS].sh_offset    = data_off + data_size; /* no file space */
+    shdrs[SEC_BSS].sh_size      = bss_size;
+    shdrs[SEC_BSS].sh_addralign = 8;
+
+    /* 4: .rela.text */
+    shdrs[SEC_RELA_TEXT].sh_name      = nm_rela_text;
+    shdrs[SEC_RELA_TEXT].sh_type      = SHT_RELA;
+    shdrs[SEC_RELA_TEXT].sh_offset    = rela_text_off;
+    shdrs[SEC_RELA_TEXT].sh_size      = rela_text_size;
+    shdrs[SEC_RELA_TEXT].sh_link      = SEC_SYMTAB;
+    shdrs[SEC_RELA_TEXT].sh_info      = SEC_TEXT;
+    shdrs[SEC_RELA_TEXT].sh_addralign = 8;
+    shdrs[SEC_RELA_TEXT].sh_entsize   = sizeof(Elf64_Rela);
+
+    /* 5: .rela.data */
+    shdrs[SEC_RELA_DATA].sh_name      = nm_rela_data;
+    shdrs[SEC_RELA_DATA].sh_type      = SHT_RELA;
+    shdrs[SEC_RELA_DATA].sh_offset    = rela_data_off;
+    shdrs[SEC_RELA_DATA].sh_size      = rela_data_size;
+    shdrs[SEC_RELA_DATA].sh_link      = SEC_SYMTAB;
+    shdrs[SEC_RELA_DATA].sh_info      = SEC_DATA;
+    shdrs[SEC_RELA_DATA].sh_addralign = 8;
+    shdrs[SEC_RELA_DATA].sh_entsize   = sizeof(Elf64_Rela);
+
+    /* 6: .symtab */
+    shdrs[SEC_SYMTAB].sh_name      = nm_symtab;
+    shdrs[SEC_SYMTAB].sh_type      = SHT_SYMTAB;
+    shdrs[SEC_SYMTAB].sh_offset    = symtab_off;
+    shdrs[SEC_SYMTAB].sh_size      = symtab_size;
+    shdrs[SEC_SYMTAB].sh_link      = SEC_STRTAB;
+    shdrs[SEC_SYMTAB].sh_info      = first_global;
+    shdrs[SEC_SYMTAB].sh_addralign = 8;
+    shdrs[SEC_SYMTAB].sh_entsize   = sizeof(Elf64_Sym);
+
+    /* 7: .strtab */
+    shdrs[SEC_STRTAB].sh_name      = nm_strtab;
+    shdrs[SEC_STRTAB].sh_type      = SHT_STRTAB;
+    shdrs[SEC_STRTAB].sh_offset    = strtab_off;
+    shdrs[SEC_STRTAB].sh_size      = strtab_size;
+    shdrs[SEC_STRTAB].sh_addralign = 1;
+
+    /* 8: .shstrtab */
+    shdrs[SEC_SHSTRTAB].sh_name      = nm_shstrtab;
+    shdrs[SEC_SHSTRTAB].sh_type      = SHT_STRTAB;
+    shdrs[SEC_SHSTRTAB].sh_offset    = shstrtab_off;
+    shdrs[SEC_SHSTRTAB].sh_size      = shstrtab_size;
+    shdrs[SEC_SHSTRTAB].sh_addralign = 1;
+
+    /* 9: .note.GNU-stack (empty, non-executable) */
+    shdrs[SEC_NOTE_STACK].sh_name      = nm_note_stack;
+    shdrs[SEC_NOTE_STACK].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_NOTE_STACK].sh_flags     = 0;  /* no SHF_EXECINSTR */
+    shdrs[SEC_NOTE_STACK].sh_offset    = 0;
+    shdrs[SEC_NOTE_STACK].sh_size      = 0;
+    shdrs[SEC_NOTE_STACK].sh_addralign = 1;
+
+    /* ----- ELF header ----- */
+    Elf64_Ehdr ehdr;
+    memset(&ehdr, 0, sizeof(ehdr));
+    memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
+    ehdr.e_ident[EI_CLASS]   = ELFCLASS64;
+    ehdr.e_ident[EI_DATA]    = ELFDATA2LSB;
+    ehdr.e_ident[EI_VERSION] = EV_CURRENT;
+    ehdr.e_ident[EI_OSABI]   = ELFOSABI_NONE;
+    ehdr.e_type      = ET_REL;
+    ehdr.e_machine   = EM_X86_64;
+    ehdr.e_version   = EV_CURRENT;
+    ehdr.e_ehsize    = sizeof(Elf64_Ehdr);
+    ehdr.e_shentsize = sizeof(Elf64_Shdr);
+    ehdr.e_shnum     = NUM_SECTIONS;
+    ehdr.e_shoff     = sh_off;
+    ehdr.e_shstrndx  = SEC_SHSTRTAB;
+
+    /* ----- Write to file ----- */
     int fd = open(output_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         perror("Failed to open output file");
         exit(EXIT_FAILURE);
     }
 
-    // Define section names
-    const char *section_names[] = {".text", ".symtab", ".strtab", ".rel.text", ".shstrtab"};
-    int n_sections = sizeof(section_names) / sizeof(section_names[0]);
+    write(fd, &ehdr, sizeof(ehdr));
 
-    // Build .shstrtab (section header string table)
-    size_t shstrtab_size = 1;  // Start with null byte
-    for (int i = 0; i < n_sections; i++) {
-        shstrtab_size += strlen(section_names[i]) + 1;
-    }
-    char *shstrtab_data = malloc(shstrtab_size);
-    char *p = shstrtab_data;
-    *p++ = '\0';  // Initial null byte
-    for (int i = 0; i < n_sections; i++) {
-        strcpy(p, section_names[i]);
-        p += strlen(section_names[i]) + 1;
-    }
+    /* padding to text_off */
+    write_padding(fd, text_off - sizeof(Elf64_Ehdr));
 
-    // Collect unique external symbols from relocations
-    char **extern_symbols = NULL;
-    size_t n_extern_symbols = 0;
-    for (size_t i = 0; i < code_data->n_relocs; i++) {
-        const char *sym = code_data->relocs[i].symbol;
-        int found = 0;
-        for (size_t j = 0; j < n_extern_symbols; j++) {
-            if (strcmp(extern_symbols[j], sym) == 0) {
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            extern_symbols = realloc(extern_symbols, (n_extern_symbols + 1) * sizeof(char *));
-            extern_symbols[n_extern_symbols] = strdup(sym);
-            n_extern_symbols++;
-			printf("external %s\n", sym);
-        }
-    }
+    /* .text */
+    if (text_size) write(fd, text_buf, text_size);
 
-    // Build .strtab (symbol string table)
-    size_t strtab_size = 1;  // Start with null byte
-    size_t main_name_offset = 1;
-    strtab_size += strlen("main") + 1;
-    size_t *extern_name_offsets = malloc(n_extern_symbols * sizeof(size_t));
-    for (size_t i = 0; i < n_extern_symbols; i++) {
-        extern_name_offsets[i] = strtab_size;
-        strtab_size += strlen(extern_symbols[i]) + 1;
-    }
-    char *strtab_data = malloc(strtab_size);
-    p = strtab_data;
-    *p++ = '\0';  // Initial null byte
-    strcpy(p, "main");
-    p += strlen("main") + 1;
-    for (size_t i = 0; i < n_extern_symbols; i++) {
-        strcpy(p, extern_symbols[i]);
-        p += strlen(extern_symbols[i]) + 1;
-    }
+    /* padding to data_off */
+    { size_t cur = text_off + text_size;
+      if (data_off > cur) write_padding(fd, data_off - cur); }
 
-    // Build .symtab (symbol table)
-    size_t n_symbols = 1 + 1 + n_extern_symbols;  // null + main + externals
-    Elf64_Sym *symtab = calloc(n_symbols, sizeof(Elf64_Sym));
-    // Index 0: Null symbol
-    symtab[0] = (Elf64_Sym){0};
-    // Index 1: "main" symbol (defined in .text)
-    symtab[1].st_name = main_name_offset;
-    symtab[1].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
-    symtab[1].st_shndx = 1;  // .text section index
-    symtab[1].st_value = 0;
-    symtab[1].st_size = code_data->code_size;
-    // Indices 2+: External symbols (undefined)
-    for (size_t i = 0; i < n_extern_symbols; i++) {
-        symtab[2 + i].st_name = extern_name_offsets[i];
-        symtab[2 + i].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
-        symtab[2 + i].st_shndx = SHN_UNDEF;
-    }
+    /* .data */
+    if (data_size) write(fd, data_buf, data_size);
 
-    // Build .rel.text (relocation entries)
-    Elf64_Rela *rel_text = calloc(code_data->n_relocs, sizeof(Elf64_Rela));
-    for (size_t i = 0; i < code_data->n_relocs; i++) {
-        const char *sym = code_data->relocs[i].symbol;
-        size_t sym_index = 0;
-        for (size_t j = 0; j < n_extern_symbols; j++) {
-            if (strcmp(extern_symbols[j], sym) == 0) {
-                sym_index = 2 + j;  // null + main + j
-                break;
-            }
-        }
-        rel_text[i].r_offset = code_data->relocs[i].offset;
-        rel_text[i].r_info = ELF64_R_INFO(sym_index, code_data->relocs[i].type);
-        rel_text[i].r_addend = 0;
-    }
+    /* padding to rela_text_off */
+    { size_t cur = data_off + data_size;
+      if (rela_text_off > cur) write_padding(fd, rela_text_off - cur); }
 
-    // Prepare .text (machine code with relocation targets zeroed)
-    void *text_data = malloc(code_data->code_size);
-    memcpy(text_data, code_data->code, code_data->code_size);
-    for (size_t i = 0; i < code_data->n_relocs; i++) {
-        size_t offset = code_data->relocs[i].offset;
-        // Zero out bytes based on relocation type
-        if (code_data->relocs[i].type == R_X86_64_PC32) {
-            memset((char *)text_data + offset, 0, 4);
-        } else if (code_data->relocs[i].type == R_X86_64_64) {
-            memset((char *)text_data + offset, 0, 8);
-        }
-        // Add handling for other relocation types as needed
-    }
+    /* .rela.text */
+    if (rela_text_size) write(fd, rela_text, rela_text_size);
 
-    // Calculate section offsets
-    off_t offset = sizeof(Elf64_Ehdr);
-    off_t text_offset = offset;
-    offset += code_data->code_size;
-    off_t symtab_offset = offset;
-    offset += n_symbols * sizeof(Elf64_Sym);
-    off_t strtab_offset = offset;
-    offset += strtab_size;
-    off_t rel_text_offset = offset;
-    offset += code_data->n_relocs * sizeof(Elf64_Rela);
-    off_t shstrtab_offset = offset;
-    offset += shstrtab_size;
-    off_t sh_offset = offset;
+    /* padding to rela_data_off */
+    { size_t cur = rela_text_off + rela_text_size;
+      if (rela_data_off > cur) write_padding(fd, rela_data_off - cur); }
 
-    // Create ELF header
-    Elf64_Ehdr ehdr = {0};
-    memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
-    ehdr.e_ident[EI_CLASS] = ELFCLASS64;
-    ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
-    ehdr.e_ident[EI_VERSION] = EV_CURRENT;
-    ehdr.e_type = ET_REL;        // Relocatable file
-    ehdr.e_machine = EM_X86_64;
-    ehdr.e_version = EV_CURRENT;
-    ehdr.e_ehsize = sizeof(Elf64_Ehdr);
-    ehdr.e_shentsize = sizeof(Elf64_Shdr);
-    ehdr.e_shnum = n_sections + 1;  // Including null section
-    ehdr.e_shoff = sh_offset;
-    ehdr.e_shstrndx = 5;  // .shstrtab section index
+    /* .rela.data */
+    if (rela_data_size) write(fd, rela_data, rela_data_size);
 
-    // Create section headers
-    Elf64_Shdr shdrs[6] = {0};  // 0: null, 1: .text, 2: .symtab, 3: .strtab, 4: .rel.text, 5: .shstrtab
-    // Index 0: Null section
-    shdrs[0] = (Elf64_Shdr){0};
-    // Index 1: .text
-    shdrs[1].sh_name = 1;  // Offset of ".text" in .shstrtab
-    shdrs[1].sh_type = SHT_PROGBITS;
-    shdrs[1].sh_flags = SHF_ALLOC | SHF_EXECINSTR;
-    shdrs[1].sh_offset = text_offset;
-    shdrs[1].sh_size = code_data->code_size;
-    shdrs[1].sh_addralign = 16;
-    // Index 2: .symtab
-    shdrs[2].sh_name = 7;  // ".symtab"
-    shdrs[2].sh_type = SHT_SYMTAB;
-    shdrs[2].sh_offset = symtab_offset;
-    shdrs[2].sh_size = n_symbols * sizeof(Elf64_Sym);
-    shdrs[2].sh_link = 3;  // Links to .strtab
-    shdrs[2].sh_info = 1;  // Index after last local symbol (all global here)
-    shdrs[2].sh_addralign = 8;
-    shdrs[2].sh_entsize = sizeof(Elf64_Sym);
-    // Index 3: .strtab
-    shdrs[3].sh_name = 15;  // ".strtab"
-    shdrs[3].sh_type = SHT_STRTAB;
-    shdrs[3].sh_offset = strtab_offset;
-    shdrs[3].sh_size = strtab_size;
-    shdrs[3].sh_addralign = 1;
-    // Index 4: .rel.text
-    shdrs[4].sh_name = 23;  // ".rel.text"
-    shdrs[4].sh_type = SHT_RELA;
-    shdrs[4].sh_offset = rel_text_offset;
-    shdrs[4].sh_size = code_data->n_relocs * sizeof(Elf64_Rela);
-    shdrs[4].sh_link = 2;  // Links to .symtab
-    shdrs[4].sh_info = 1;  // Applies to .text
-    shdrs[4].sh_addralign = 8;
-    shdrs[4].sh_entsize = sizeof(Elf64_Rela);
-    // Index 5: .shstrtab
-    shdrs[5].sh_name = 32;  // ".shstrtab"
-    shdrs[5].sh_type = SHT_STRTAB;
-    shdrs[5].sh_offset = shstrtab_offset;
-    shdrs[5].sh_size = shstrtab_size;
-    shdrs[5].sh_addralign = 1;
+    /* padding to symtab_off */
+    { size_t cur = rela_data_off + rela_data_size;
+      if (symtab_off > cur) write_padding(fd, symtab_off - cur); }
 
-    // Write all data to the file
-    write(fd, &ehdr, sizeof(Elf64_Ehdr));                    // ELF header
-    write(fd, text_data, code_data->code_size);             // .text
-    write(fd, symtab, n_symbols * sizeof(Elf64_Sym));       // .symtab
-    write(fd, strtab_data, strtab_size);                    // .strtab
-    write(fd, rel_text, code_data->n_relocs * sizeof(Elf64_Rela)); // .rel.text
-    write(fd, shstrtab_data, shstrtab_size);                // .shstrtab
-    write(fd, shdrs, (n_sections + 1) * sizeof(Elf64_Shdr)); // Section headers
+    /* .symtab */
+    write(fd, symtab, symtab_size);
 
-    // Close the file
+    /* .strtab */
+    write(fd, strtab, strtab_size);
+
+    /* .shstrtab */
+    write(fd, shstrtab, shstrtab_size);
+
+    /* padding to sh_off */
+    { size_t cur = shstrtab_off + shstrtab_size;
+      if (sh_off > cur) write_padding(fd, sh_off - cur); }
+
+    /* section headers */
+    write(fd, shdrs, sizeof(shdrs));
+
     close(fd);
 
-    // Free allocated memory
-    free(text_data);
+    printf("Wrote ELF object: %s\n", output_file);
+    printf("  .text:  %zu bytes, %zu functions\n", text_size, n_funcs);
+    printf("  .data:  %zu bytes, %zu items\n", data_size, n_datas);
+    printf("  .bss:   %zu bytes, %zu items\n", bss_size, n_bsses);
+    printf("  .rela.text: %zu entries\n", n_rela_text);
+    printf("  .rela.data: %zu entries\n", n_rela_data);
+    printf("  symtab: %zu symbols (first_global=%zu)\n", n_syms, first_global);
+
+    /* ----- Cleanup ----- */
+    free(text_buf);
+    free(data_buf);
+    free(rela_text);
+    free(rela_data);
     free(symtab);
-    free(rel_text);
-    free(extern_name_offsets);
-    for (size_t i = 0; i < n_extern_symbols; i++) {
-        free(extern_symbols[i]);
-    }
-    free(extern_symbols);
-    free(shstrtab_data);
-    free(strtab_data);
+    free(strtab);
+    free(shstrtab);
+    free(sym_map);
+    for (size_t i = 0; i < n_funcs; i++) free(funcs[i].code);
+    free(funcs);
+    for (size_t i = 0; i < n_datas; i++) free(datas[i].bytes);
+    free(datas);
+    free(bsses);
+    free(relocs);
+    for (size_t i = 0; i < exports.n; i++) free(exports.names[i]);
+    free(exports.names);
+    for (size_t i = 0; i < imports.n; i++) free(imports.names[i]);
+    free(imports.names);
+
+    #undef SYMTAB_PUSH
+    #undef SYM_MAP_ADD
 }
 
 int main(int argc, char **argv) {
@@ -616,7 +1195,7 @@ int main(int argc, char **argv) {
     VARR_CREATE(char, temp_string, alloc, 0);
     VARR_CREATE(lib_t, extra_libs, alloc, 16);
     VARR_CREATE(char_ptr_t, lib_dirs, alloc, 16);
-    for (int i = 0; i < sizeof(std_lib_dirs) / sizeof(char_ptr_t); i++)
+    for (int i = 0; i < (int)(sizeof(std_lib_dirs) / sizeof(char_ptr_t)); i++)
         VARR_PUSH(char_ptr_t, lib_dirs, std_lib_dirs[i]);
     lib_dirs_from_env_var("LD_LIBRARY_PATH");
     lib_dirs_from_env_var(MIR_ENV_VAR_LIB_DIRS);
@@ -625,44 +1204,47 @@ int main(int argc, char **argv) {
     const char *output_file = argv[2];
 
     MIR_context_t ctx = MIR_init();
-    
+
     FILE *fp = fopen(mir_input_file, "r");
     if (!fp) {
         perror("Failed to open MIR input file");
         return EXIT_FAILURE;
     }
 
-    MIR_item_t main_func = NULL;
-    
     MIR_read(ctx, fp);
     fclose(fp);
 
-    for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx)); module != NULL;
+    /* Load all modules */
+    for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
+         module != NULL;
          module = DLIST_NEXT(MIR_module_t, module)) {
-        for (MIR_item_t func = DLIST_HEAD(MIR_item_t, module->items); func != NULL;
-             func = DLIST_NEXT(MIR_item_t, func)) {
-            if (func->item_type != MIR_func_item) continue;
-            if (strcmp(func->u.func->name, "main") == 0) {
-                main_func = func;
-            }
-            printf("MIR_load_module function %s\n", func->u.func->name);
+        printf("Loading module: %s\n", module->name);
+        for (MIR_item_t item = DLIST_HEAD(MIR_item_t, module->items);
+             item != NULL;
+             item = DLIST_NEXT(MIR_item_t, item)) {
+            if (item->item_type == MIR_func_item)
+                printf("  found function: %s\n", item->u.func->name);
         }
         MIR_load_module(ctx, module);
-    }
-    
-    if (!main_func) {
-        fprintf(stderr, "No main found in input.\n");
-        return EXIT_FAILURE;
     }
 
     open_std_libs();
     open_extra_libs();
 
-    code_data_t code_data = generate_pic_machine_code(ctx, main_func);
-    create_object_file(output_file, &code_data);
+    /* Initialize code generator and link */
+    MIR_gen_init(ctx);
+    MIR_gen_set_save_relocs(ctx, 1);
+    MIR_link(ctx, MIR_set_gen_interface, hybrid_import_resolver);
 
-    printf("Object file '%s' created successfully with PIC.\n", output_file);
+    /* Generate code for all functions and write the ELF object */
+    create_object_file_from_module(ctx, output_file);
 
+    MIR_gen_finish(ctx);
+
+    printf("Object file '%s' created successfully.\n", output_file);
+
+    close_extra_libs();
+    close_std_libs();
     MIR_finish(ctx);
 
     return EXIT_SUCCESS;
