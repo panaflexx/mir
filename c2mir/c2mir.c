@@ -9691,6 +9691,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         if (r->code == N_FIELD && t1->mode == TM_PTR && t1->u.ptr_type
             && t1->u.ptr_type->mode == TM_CLASS) {
           t1 = t1->u.ptr_type;
+          r->code = N_DEREF_FIELD; // rewrite so gen takes the pointer-deref path
         }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union or class",
@@ -11366,7 +11367,8 @@ static void get_type_alias_name (c2m_ctx_t c2m_ctx, struct type *type, VARR (cha
     break;
   case TM_STRUCT:
   case TM_UNION:
-    VARR_PUSH (char, name, type->mode == TM_STRUCT ? 'S' : 'U');
+  case TM_CLASS:
+    VARR_PUSH (char, name, type->mode == TM_STRUCT ? 'S' : type->mode == TM_CLASS ? 'C' : 'U');
     for (i = 0; i < VARR_LENGTH (node_t, node_stack); i++)
       if (VARR_GET (node_t, node_stack, i) == type->u.tag_type) break;
     if (i < VARR_LENGTH (node_t, node_stack)) {
@@ -11424,6 +11426,7 @@ static MIR_alias_t get_type_alias (c2m_ctx_t c2m_ctx, struct type *type) {
     /* fall through */
   case TM_UNDEF:
   case TM_STRUCT:
+  case TM_CLASS:
   case TM_ARR:
   case TM_FUNC: return 0;
   default: break;
