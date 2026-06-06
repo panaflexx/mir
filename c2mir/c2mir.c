@@ -4810,13 +4810,20 @@ D (class_member_declaration) {
       return new_pos_node4(c2m_ctx, N_FUNC_DEF, POS(decl), 
                            spec, decl, new_node(c2m_ctx, N_LIST), r);
     } else {
-      // This is a data member - expect semicolon
+      // This is a data member - check for optional initializer
+      node_t member_init;
+      if (M('=')) {
+        P(initializer);
+        member_init = r;
+      } else {
+        member_init = new_node(c2m_ctx, N_IGNORE);
+      }
       PT(';');
       return new_pos_node5(c2m_ctx, N_MEMBER, POS(decl), 
                            new_node1(c2m_ctx, N_SHARE, spec), decl, 
                            new_node(c2m_ctx, N_IGNORE), 
                            new_node(c2m_ctx, N_IGNORE), 
-                           new_node(c2m_ctx, N_IGNORE));
+                           member_init);
     }
   }
   
@@ -14005,7 +14012,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         node_t slist = NL_HEAD (share->u.ops);
         if (slist != NULL && slist->code == N_LIST) {
           for (node_t spec = NL_HEAD (slist->u.ops); spec != NULL; spec = NL_NEXT (spec)) {
-            if (spec->code == N_CLASS || spec->code == N_STRUCT || spec->code == N_UNION) {
+            if (spec->code == N_CLASS) {
               gen (c2m_ctx, spec, NULL, NULL, FALSE, NULL, NULL);
             }
           }
@@ -14052,6 +14059,50 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             }
             if (i >= VARR_LENGTH (node_t, sym.defs)) /* No item yet or no decl with intializer: */
               decl->u.item = MIR_new_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
+          }
+          /* Emit default member initializers for local class-typed variables */
+          if (decl->scope != top_scope && !decl->decl_spec.static_p
+              && decl->decl_spec.type->mode == TM_CLASS
+              && decl->decl_spec.type->u.tag_type != NULL) {
+            node_t tag = decl->decl_spec.type->u.tag_type;
+            node_t member_list = NL_EL(tag->u.ops, 1);
+            if (member_list && member_list->code != N_IGNORE) {
+              /* Ensure the id node has been checked so gen can resolve it */
+              if (id->attr == NULL) {
+                node_t saved_scope = curr_scope;
+                curr_scope = decl->scope;
+                check(c2m_ctx, id, NULL);
+                curr_scope = saved_scope;
+              }
+              /* Get the variable's address (fp + offset) */
+              var = gen(c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+              for (node_t m = NL_HEAD(member_list->u.ops); m != NULL; m = NL_NEXT(m)) {
+                if (m->code != N_MEMBER) continue;
+                node_t m_init = NL_EL(m->u.ops, 4); /* 5th child = initializer */
+                if (!m_init || m_init->code == N_IGNORE) continue;
+                decl_t m_decl = m->attr;
+                if (!m_decl) continue;
+                struct type *m_type = m_decl->decl_spec.type;
+                struct expr *init_expr = m_init->attr;
+                if (!init_expr || !m_type) continue;
+                /* Emit store: *(var_base + member_offset) = init_value */
+                MIR_type_t mt = get_mir_type(c2m_ctx, m_type);
+                op_t init_val;
+                if (init_expr->const_p && integer_type_p(m_type)) {
+                  /* Constant integer: emit directly without gen */
+                  init_val = new_op(NULL, MIR_new_int_op(ctx, init_expr->c.i_val));
+                } else {
+                  init_val = gen(c2m_ctx, m_init, NULL, NULL, TRUE, NULL, NULL);
+                }
+                init_val = promote(c2m_ctx, init_val, mt, FALSE);
+                assert(var.mir_op.mode == MIR_OP_MEM);
+                MIR_op_t dst = MIR_new_alias_mem_op(ctx, mt,
+                    var.mir_op.u.mem.disp + (MIR_disp_t)m_decl->offset,
+                    var.mir_op.u.mem.base, 0, 1,
+                    get_type_alias(c2m_ctx, m_type), 0);
+                emit2(c2m_ctx, tp_mov(mt), dst, init_val.mir_op);
+              }
+            }
           }
         } else if (initializer->code != N_IGNORE) {  // ??? general code
           init_start = VARR_LENGTH (init_el_t, init_els);
