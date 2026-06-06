@@ -9393,6 +9393,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       (const char *[]) { "__builtin_va_arg", NULL }
 #define ALLOCA \
       (const char *[]) { "alloca", "__builtin_alloca", NULL }
+#define BUILTIN_JSON "json"
 
     static int str_eq_p (const char *str, const char *v[]) {
       for (int i = 0; v[i] != NULL; i++)
@@ -9856,49 +9857,69 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         create_node_scope (c2m_ctx, r);
         check (c2m_ctx, collection, r);
         e1 = collection->attr;
-        if (e1 && e1->type->mode != TM_DICT)
-          error (c2m_ctx, POS (r), "for-in collection must be a dict");
-        /* Declare auto loop variables in the symbol table so the body
-           can reference them.  We create minimal N_SPEC_DECL + decl nodes. */
-        {
-          node_t key_id_copy = copy_node(c2m_ctx, key_id);
-          node_t ksd = build_spec_decl(c2m_ctx, POS(key_id),
-              new_node(c2m_ctx, N_IGNORE),
-              new_pos_node2(c2m_ctx, N_DECL, POS(key_id), key_id_copy, new_node(c2m_ctx, N_LIST)),
-              NULL, NULL, NULL);
-          decl_t kd = reg_malloc(c2m_ctx, sizeof(struct decl));
-          init_decl(c2m_ctx, kd);
-          kd->scope = curr_scope;
-          init_decl_spec(&kd->decl_spec);
-          /* Use TM_DICT so the MIR register type (I64) matches
-             the one the FORIN gen writes to.  At runtime the
-             value is a char* but both are 64-bit pointers. */
-          kd->decl_spec.type = create_type(c2m_ctx, NULL);
-          kd->decl_spec.type->mode = TM_DICT;
-          kd->decl_spec.type->pos_node = key_id;
-          set_type_layout(c2m_ctx, kd->decl_spec.type);
-          kd->reg_p = TRUE;
-          ksd->attr = kd;
-          symbol_insert(c2m_ctx, S_REGULAR, key_id_copy, curr_scope, ksd, NULL);
+        int forin_arr_p = (e1 && (e1->type->mode == TM_ARR
+                                 || (e1->type->mode == TM_PTR && e1->type->arr_type != NULL)));
+        if (e1 && e1->type->mode != TM_DICT && !forin_arr_p)
+          error (c2m_ctx, POS (r), "for-in collection must be a dict or array");
+
+        /* Determine element type for arrays (needed for loop var type) */
+        struct type *forin_el_type = NULL;
+        if (forin_arr_p) {
+          struct type *orig = (e1->type->mode == TM_ARR ? e1->type : e1->type->arr_type);
+          forin_el_type = orig->u.arr_type->el_type;
         }
-        if (val_id->code == N_ID) {
-          node_t val_id_copy = copy_node(c2m_ctx, val_id);
-          node_t vsd = build_spec_decl(c2m_ctx, POS(val_id),
-              new_node(c2m_ctx, N_IGNORE),
-              new_pos_node2(c2m_ctx, N_DECL, POS(val_id), val_id_copy, new_node(c2m_ctx, N_LIST)),
-              NULL, NULL, NULL);
-          decl_t vd = reg_malloc(c2m_ctx, sizeof(struct decl));
-          init_decl(c2m_ctx, vd);
-          vd->scope = curr_scope;
-          init_decl_spec(&vd->decl_spec);
-          vd->decl_spec.type = create_type(c2m_ctx, NULL);
-          vd->decl_spec.type->mode = TM_DICT;
-          vd->decl_spec.type->pos_node = val_id;
-          set_type_layout(c2m_ctx, vd->decl_spec.type);
-          vd->reg_p = TRUE;
-          vsd->attr = vd;
-          symbol_insert(c2m_ctx, S_REGULAR, val_id_copy, curr_scope, vsd, NULL);
+
+        /* ----- declare auto loop variable(s) in the symbol table ----- */
+        /* Helper macro to declare one forin loop variable */
+        #define FORIN_DECL_VAR(id_node, var_type) do { \
+          node_t _copy = copy_node(c2m_ctx, id_node); \
+          node_t _sd = build_spec_decl(c2m_ctx, POS(id_node), \
+              new_node(c2m_ctx, N_IGNORE), \
+              new_pos_node2(c2m_ctx, N_DECL, POS(id_node), _copy, \
+                            new_node(c2m_ctx, N_LIST)), \
+              NULL, NULL, NULL); \
+          decl_t _d = reg_malloc(c2m_ctx, sizeof(struct decl)); \
+          init_decl(c2m_ctx, _d); \
+          _d->scope = curr_scope; \
+          init_decl_spec(&_d->decl_spec); \
+          _d->decl_spec.type = (var_type); \
+          set_type_layout(c2m_ctx, _d->decl_spec.type); \
+          _d->reg_p = scalar_type_p(_d->decl_spec.type); \
+          _sd->attr = _d; \
+          symbol_insert(c2m_ctx, S_REGULAR, _copy, curr_scope, _sd, NULL); \
+        } while(0)
+
+        if (forin_arr_p) {
+          /* for (auto x in array) — single var gets element type.
+             for (auto i, x in array) — i=index(int), x=element. */
+          if (val_id->code == N_ID) {
+            /* Two-variable form: key_id = index, val_id = element */
+            struct type *idx_type = create_type(c2m_ctx, NULL);
+            init_type(idx_type); idx_type->mode = TM_BASIC;
+            idx_type->u.basic_type = TP_INT; idx_type->pos_node = key_id;
+            FORIN_DECL_VAR(key_id, idx_type);
+            struct type *el_copy = create_type(c2m_ctx, NULL);
+            *el_copy = *forin_el_type; el_copy->pos_node = val_id;
+            FORIN_DECL_VAR(val_id, el_copy);
+          } else {
+            /* Single-variable form: key_id = element */
+            struct type *el_copy = create_type(c2m_ctx, NULL);
+            *el_copy = *forin_el_type; el_copy->pos_node = key_id;
+            FORIN_DECL_VAR(key_id, el_copy);
+          }
+        } else {
+          /* Dict: key_id = char* (TM_DICT for register matching) */
+          struct type *kt = create_type(c2m_ctx, NULL);
+          kt->mode = TM_DICT; kt->pos_node = key_id;
+          FORIN_DECL_VAR(key_id, kt);
+          if (val_id->code == N_ID) {
+            struct type *vt = create_type(c2m_ctx, NULL);
+            vt->mode = TM_DICT; vt->pos_node = val_id;
+            FORIN_DECL_VAR(val_id, vt);
+          }
         }
+        #undef FORIN_DECL_VAR
+
         curr_loop = curr_loop_switch = r;
         check (c2m_ctx, body, r);
         finish_scope (c2m_ctx);
@@ -10019,9 +10040,20 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                   op2->u.s.s);
          } 
          if (t1->mode == TM_DICT) {
-           /* dict member access: key = op2 (N_ID), treat as runtime lookup */
            e = create_expr(c2m_ctx, r);
-           e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
+           if (strcmp(op2->u.s.s, "json") == 0) {
+             /* d.json — serialize dict to JSON string (char*) */
+             e->type->mode = TM_PTR;
+             e->type->u.ptr_type = create_type(c2m_ctx, NULL);
+             init_type(e->type->u.ptr_type);
+             e->type->u.ptr_type->mode = TM_BASIC;
+             e->type->u.ptr_type->u.basic_type = TP_CHAR;
+             set_type_layout(c2m_ctx, e->type->u.ptr_type);
+             set_type_layout(c2m_ctx, e->type);
+           } else {
+             /* dict member access: key = op2 (N_ID), treat as runtime lookup */
+             e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
+           }
            e->u.lvalue_node = r; /* allow assignment */
            r->attr = e;
            break;
@@ -10280,6 +10312,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         int add_overflow_p = FALSE, sub_overflow_p = FALSE, mul_overflow_p = FALSE, expect_p = FALSE;
         int jcall_p = FALSE, jret_p = FALSE, prop_set_p = FALSE, prop_eq_p = FALSE, prop_ne_p = FALSE;
         int method_call_p = FALSE;
+        int json_p = FALSE;
 
         op1 = NL_HEAD(r->u.ops);
         if (op1->code == N_ID) {
@@ -10293,11 +10326,12 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           prop_set_p = strcmp(op1->u.s.s, PROP_SET) == 0;
           prop_eq_p = strcmp(op1->u.s.s, PROP_EQ) == 0;
           prop_ne_p = strcmp(op1->u.s.s, PROP_NE) == 0;
+          json_p = strcmp(op1->u.s.s, BUILTIN_JSON) == 0;
         }
         if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
           va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
-          if (!va_arg_p && !va_start_p && !alloca_p) {
+          if (!va_arg_p && !va_start_p && !alloca_p && !json_p) {
             spec_list = new_node1 (c2m_ctx, N_LIST, new_node (c2m_ctx, N_INT));
             list = new_node1 (c2m_ctx, N_LIST,
                               new_node1 (c2m_ctx, N_FUNC, new_node (c2m_ctx, N_LIST)));
@@ -10316,7 +10350,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         }
         builtin_call_p = alloca_p || va_arg_p || va_start_p || add_overflow_p || sub_overflow_p
                          || mul_overflow_p || expect_p || jcall_p || jret_p || prop_set_p || prop_eq_p
-                         || prop_ne_p;
+                         || prop_ne_p || json_p;
         if (!builtin_call_p || jcall_p) {
             VARR_PUSH(node_t, call_nodes, r);
             //printf("XXXXX call_nodes add uid=%d N_ID = %s \n", r->uid, op1->u.s.s);
@@ -10348,7 +10382,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                   || (jret_p && NL_LENGTH(arg_list->u.ops) != 1)
                   || (va_arg_p && NL_LENGTH(arg_list->u.ops) != 2)
                   || (prop_set_p && NL_LENGTH(arg_list->u.ops) != 2)
-                  || ((prop_eq_p || prop_ne_p) && NL_LENGTH(arg_list->u.ops) != 2))) {
+                  || ((prop_eq_p || prop_ne_p) && NL_LENGTH(arg_list->u.ops) != 2)
+                  || (json_p && NL_LENGTH(arg_list->u.ops) != 1))) {
             error(c2m_ctx, POS(op1), "wrong number of arguments in %s call", op1->u.s.s);
           } else {
             if (va_arg_p) {
@@ -10413,6 +10448,29 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                 error(c2m_ctx, POS(arg),
                       "property value in 2nd arg of %s call should be an integer constant",
                       op1->u.s.s);
+            } else if (json_p) {
+              /* json(dict) → String (serialize),  json(string) → dict (parse) */
+              arg = NL_HEAD(arg_list->u.ops);
+              e2 = arg->attr;
+              t2 = e2->type;
+              if (t2->mode == TM_DICT) {
+                /* json(dict) → char* (serialized JSON string) */
+                res_type.mode = TM_PTR;
+                res_type.u.ptr_type = create_type(c2m_ctx, NULL);
+                init_type(res_type.u.ptr_type);
+                res_type.u.ptr_type->mode = TM_BASIC;
+                res_type.u.ptr_type->u.basic_type = TP_CHAR;
+                set_type_layout(c2m_ctx, res_type.u.ptr_type);
+                set_type_layout(c2m_ctx, &res_type);
+              } else if (t2->mode == TM_PTR || t2->mode == TM_ARR
+                         || string_type_p(t2)) {
+                /* json(string) → dict (parsed JSON) */
+                res_type.mode = TM_DICT;
+              } else {
+                error(c2m_ctx, POS(arg),
+                      "json() argument must be a dict or string, got unsupported type");
+              }
+              ret_type = &res_type;
             }
           }
         } else {
@@ -11456,6 +11514,8 @@ struct gen_ctx {
   MIR_item_t dict_object_count_proto, dict_object_count_item;
   MIR_item_t dict_object_key_at_proto, dict_object_key_at_item;
   MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
+  MIR_item_t dict_serialize_json_proto, dict_serialize_json_item;
+  MIR_item_t dict_deserialize_json_proto, dict_deserialize_json_item;
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
@@ -11499,6 +11559,10 @@ struct gen_ctx {
 #define dict_object_key_at_item gen_ctx->dict_object_key_at_item
 #define dict_object_value_at_proto gen_ctx->dict_object_value_at_proto
 #define dict_object_value_at_item gen_ctx->dict_object_value_at_item
+#define dict_serialize_json_proto gen_ctx->dict_serialize_json_proto
+#define dict_serialize_json_item gen_ctx->dict_serialize_json_item
+#define dict_deserialize_json_proto gen_ctx->dict_deserialize_json_proto
+#define dict_deserialize_json_item gen_ctx->dict_deserialize_json_item
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
@@ -13149,6 +13213,24 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   dict_object_value_at_item = MIR_new_import (ctx, "dict_object_value_at");
   move_item_to_module_start (module, dict_object_value_at_proto);
   move_item_to_module_start (module, dict_object_value_at_item);
+
+  /* dict_deserialize_json(const char *json) -> DictValue* */
+  vars[0].name = "json"; vars[0].type = MIR_T_I64;
+  dict_deserialize_json_proto = MIR_new_proto_arr (ctx, "__dict_deserialize_json_p", 1, &ptr_t, 1, vars);
+  dict_deserialize_json_item = MIR_new_import (ctx, "dict_deserialize_json");
+  move_item_to_module_start (module, dict_deserialize_json_proto);
+  move_item_to_module_start (module, dict_deserialize_json_item);
+
+  /* dict_serialize_json(const DictValue *val, char *buf, size_t len, int pretty) -> char* */
+  MIR_var_t svars[4];
+  svars[0].name = "val";  svars[0].type = MIR_T_I64;
+  svars[1].name = "buf";  svars[1].type = MIR_T_I64;
+  svars[2].name = "len";  svars[2].type = MIR_T_I64;
+  svars[3].name = "pretty"; svars[3].type = MIR_T_I64;
+  dict_serialize_json_proto = MIR_new_proto_arr (ctx, "__dict_serialize_json_p", 1, &ptr_t, 4, svars);
+  dict_serialize_json_item = MIR_new_import (ctx, "dict_serialize_json");
+  move_item_to_module_start (module, dict_serialize_json_proto);
+  move_item_to_module_start (module, dict_serialize_json_item);
 }
 
 /* Emit: res = dict_create_object() */
@@ -14253,14 +14335,38 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_alias_t alias;
 
     e = r->attr;
+    {
+      node_t obj_node = NL_HEAD (r->u.ops);
+      node_t key_node = NL_NEXT (obj_node);
+      struct expr *obj_e = obj_node->attr;
+      if (obj_e && obj_e->type->mode == TM_DICT && key_node->code == N_ID
+          && strcmp(key_node->u.s.s, "json") == 0) {
+        /* d.json — serialize dict to JSON string */
+        op1 = val_gen (c2m_ctx, obj_node);
+        dict_ensure_imports (c2m_ctx);
+        MIR_op_t call_args[7];
+        op_t buf_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+        MIR_append_insn (ctx, curr_func,
+                         MIR_new_insn (ctx, MIR_ALLOCA, buf_reg.mir_op,
+                                       MIR_new_int_op (ctx, 4096)));
+        res = get_new_temp (c2m_ctx, MIR_T_I64);
+        call_args[0] = MIR_new_ref_op (ctx, dict_serialize_json_proto);
+        call_args[1] = MIR_new_ref_op (ctx, dict_serialize_json_item);
+        call_args[2] = res.mir_op;
+        call_args[3] = op1.mir_op;
+        call_args[4] = buf_reg.mir_op;
+        call_args[5] = MIR_new_int_op (ctx, 4096);
+        call_args[6] = MIR_new_int_op (ctx, 0);
+        emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 7, call_args));
+        break;
+      }
+    }
     if (e->type->mode == TM_DICT) {
       /* Dict member access: cfg.key -> dict_object_get(cfg, "key") */
       node_t obj_node = NL_HEAD (r->u.ops);
       node_t key_node = NL_NEXT (obj_node);
       assert (key_node->code == N_ID);
-      /* Generate code for the object (the left side) */
       op1 = val_gen (c2m_ctx, obj_node);
-      /* Create string data for the key */
       const char *key_str = key_node->u.s.s;
       MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
                                 (MIR_str_t){strlen (key_str) + 1, key_str});
@@ -14430,6 +14536,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     int prop_set_p = call_expr->builtin_call_p && strcmp (func->u.s.s, PROP_SET) == 0;
     int prop_eq_p = call_expr->builtin_call_p && strcmp (func->u.s.s, PROP_EQ) == 0;
     int prop_ne_p = call_expr->builtin_call_p && strcmp (func->u.s.s, PROP_NE) == 0;
+    int json_p = call_expr->builtin_call_p && strcmp (func->u.s.s, BUILTIN_JSON) == 0;
     int builtin_call_p = alloca_p || va_arg_p || va_start_p, inline_p = FALSE;
     node_t block = FUNC_DEF_BLOCK (curr_func_def);
     struct node_scope *ns = block->attr;
@@ -14514,6 +14621,42 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if (make_val_p) make_cond_val (c2m_ctx, r, t_label, f_label, &res);
       true_label = false_label = NULL;
       val_p = FALSE;
+      break;
+    }
+    if (json_p) {
+      /* json(expr) builtin:
+         - json(dict)   → dict_serialize_json(d, alloca(4096), 4096, 0)  returns char*
+         - json(string) → dict_deserialize_json(s)                     returns dict */
+      node_t arg_node = NL_HEAD (args->u.ops);
+      struct expr *arg_e = arg_node->attr;
+      op1 = val_gen (c2m_ctx, arg_node);
+      dict_ensure_imports (c2m_ctx);
+      if (arg_e->type->mode == TM_DICT) {
+        /* Serialize: alloca a buffer, call dict_serialize_json */
+        MIR_op_t call_args[7];
+        op_t buf_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+        MIR_append_insn (ctx, curr_func,
+                         MIR_new_insn (ctx, MIR_ALLOCA, buf_reg.mir_op,
+                                       MIR_new_int_op (ctx, 4096)));
+        res = get_new_temp (c2m_ctx, MIR_T_I64);
+        call_args[0] = MIR_new_ref_op (ctx, dict_serialize_json_proto);
+        call_args[1] = MIR_new_ref_op (ctx, dict_serialize_json_item);
+        call_args[2] = res.mir_op;                       /* result: char* */
+        call_args[3] = op1.mir_op;                       /* val */
+        call_args[4] = buf_reg.mir_op;                   /* buf */
+        call_args[5] = MIR_new_int_op (ctx, 4096);       /* buflen */
+        call_args[6] = MIR_new_int_op (ctx, 0);          /* pretty=0 */
+        emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 7, call_args));
+      } else {
+        /* Deserialize: call dict_deserialize_json */
+        MIR_op_t call_args[4];
+        res = get_new_temp (c2m_ctx, MIR_T_I64);
+        call_args[0] = MIR_new_ref_op (ctx, dict_deserialize_json_proto);
+        call_args[1] = MIR_new_ref_op (ctx, dict_deserialize_json_item);
+        call_args[2] = res.mir_op;  /* result: dict */
+        call_args[3] = op1.mir_op;  /* json string */
+        emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, call_args));
+      }
       break;
     }
     first_arg = NL_HEAD (args->u.ops);
@@ -15385,7 +15528,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     break;
   }
   case N_FORIN: {
-    /* for (auto key[, val] in collection) body
+    /* for (auto var[, var2] in collection) body
        children: labels(0), key_id(1), val_id_or_ignore(2), collection(3), body(4) */
     node_t labels  = NL_HEAD (r->u.ops);
     node_t key_id  = NL_NEXT (labels);
@@ -15399,43 +15542,105 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_label_t saved_break_label = break_label;
     continue_label = MIR_new_label (ctx);
     break_label = MIR_new_label (ctx);
+    unsigned fsn = r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0;
 
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
 
-    /* coll_reg = val_gen(collection) */
-    op_t coll_val = val_gen (c2m_ctx, coll);
-    op_t coll_reg = get_new_temp (c2m_ctx, MIR_T_I64);
-    emit2 (c2m_ctx, MIR_MOV, coll_reg.mir_op, coll_val.mir_op);
-    /* n_reg = dict_object_count(coll_reg) */
-    op_t n_reg = gen_dict_object_count (c2m_ctx, coll_reg.mir_op);
-    op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
-    emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_reg.mir_op);
-    /* i_reg = 0 */
-    op_t i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
-    emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
-    /* loop_label: if i_reg >= n_save goto break_label */
-    emit_label_insn_opt (c2m_ctx, loop_label);
-    emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, break_label), i_reg.mir_op, n_save.mir_op);
-    emit_label_insn_opt (c2m_ctx, body_label);
-    /* key_reg = dict_object_key_at(coll_reg, i_reg) */
-    op_t key_reg = gen_dict_object_key_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
-    /* Store key into the auto variable using the same mangled name
-       that the N_ID gen path will look up later. */
-    {
-      unsigned fsn = r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0;
-      const char *kname = get_reg_var_name (c2m_ctx, MIR_T_I64, key_id->u.s.s, fsn);
-      reg_var_t kvar = get_reg_var (c2m_ctx, MIR_T_I64, kname, NULL);
-      emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), key_reg.mir_op);
+    struct expr *coll_e = coll->attr;
+    struct type *coll_type = coll_e ? coll_e->type : NULL;
+    int arr_forin = (coll_type && (coll_type->mode == TM_ARR
+                     || (coll_type->mode == TM_PTR && coll_type->arr_type != NULL)));
+    op_t i_reg = {0}; /* loop counter — shared by both branches */
+
+    if (arr_forin) {
+      /* ---- Array for-in ---- */
+      struct type *orig_arr = (coll_type->mode == TM_ARR ? coll_type : coll_type->arr_type);
+      struct type *el_type = orig_arr->u.arr_type->el_type;
+      mir_llong arr_len = get_arr_type_size (orig_arr);
+      MIR_type_t el_mir_t = get_mir_type (c2m_ctx, el_type);
+      mir_size_t el_size = type_size (c2m_ctx, el_type);
+
+      /* base = address of array */
+      op_t arr_op = gen (c2m_ctx, coll, NULL, NULL, FALSE, NULL, NULL);
+      op_t base_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      if (arr_op.mir_op.mode == MIR_OP_MEM)
+        base_reg = mem_to_address (c2m_ctx, arr_op, TRUE);
+      else
+        emit2 (c2m_ctx, MIR_MOV, base_reg.mir_op, arr_op.mir_op);
+
+      /* n = array length */
+      op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, MIR_new_int_op (ctx, arr_len));
+
+      /* i = 0 */
+      i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
+
+      /* loop_label: if i >= n goto break */
+      emit_label_insn_opt (c2m_ctx, loop_label);
+      emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, break_label),
+             i_reg.mir_op, n_save.mir_op);
+      emit_label_insn_opt (c2m_ctx, body_label);
+
+      /* Compute element address: base + i * el_size */
+      op_t offset_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_MUL, offset_reg.mir_op, i_reg.mir_op,
+             MIR_new_int_op (ctx, (long) el_size));
+      op_t addr_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_ADD, addr_reg.mir_op, base_reg.mir_op, offset_reg.mir_op);
+
+      if (val_id->code == N_ID) {
+        /* Two-var form: key_id = i (index), val_id = arr[i] (element) */
+        MIR_type_t idx_mir_t = promote_mir_int_type (MIR_T_I32);
+        const char *iname = get_reg_var_name (c2m_ctx, idx_mir_t, key_id->u.s.s, fsn);
+        reg_var_t ivar = get_reg_var (c2m_ctx, idx_mir_t, iname, NULL);
+        emit2 (c2m_ctx, tp_mov (idx_mir_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
+
+        MIR_type_t val_t = promote_mir_int_type (el_mir_t);
+        const char *vname = get_reg_var_name (c2m_ctx, val_t, val_id->u.s.s, fsn);
+        reg_var_t vvar = get_reg_var (c2m_ctx, val_t, vname, NULL);
+        emit2 (c2m_ctx, tp_mov (val_t),
+               MIR_new_reg_op (ctx, vvar.reg),
+               MIR_new_mem_op (ctx, el_mir_t, 0, addr_reg.mir_op.u.reg, 0, 1));
+      } else {
+        /* Single-var form: key_id = arr[i] (element) */
+        MIR_type_t var_t = promote_mir_int_type (el_mir_t);
+        const char *kname = get_reg_var_name (c2m_ctx, var_t, key_id->u.s.s, fsn);
+        reg_var_t kvar = get_reg_var (c2m_ctx, var_t, kname, NULL);
+        emit2 (c2m_ctx, tp_mov (var_t),
+               MIR_new_reg_op (ctx, kvar.reg),
+               MIR_new_mem_op (ctx, el_mir_t, 0, addr_reg.mir_op.u.reg, 0, 1));
+      }
+    } else {
+      /* ---- Dict for-in ---- */
+      op_t coll_val = val_gen (c2m_ctx, coll);
+      op_t coll_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, coll_reg.mir_op, coll_val.mir_op);
+      op_t n_reg = gen_dict_object_count (c2m_ctx, coll_reg.mir_op);
+      op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_reg.mir_op);
+      i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
+      emit_label_insn_opt (c2m_ctx, loop_label);
+      emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, break_label),
+             i_reg.mir_op, n_save.mir_op);
+      emit_label_insn_opt (c2m_ctx, body_label);
+
+      op_t key_reg = gen_dict_object_key_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+      {
+        const char *kname = get_reg_var_name (c2m_ctx, MIR_T_I64, key_id->u.s.s, fsn);
+        reg_var_t kvar = get_reg_var (c2m_ctx, MIR_T_I64, kname, NULL);
+        emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), key_reg.mir_op);
+      }
+      if (val_id->code == N_ID) {
+        op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+        const char *vname = get_reg_var_name (c2m_ctx, MIR_T_I64, val_id->u.s.s, fsn);
+        reg_var_t vvar = get_reg_var (c2m_ctx, MIR_T_I64, vname, NULL);
+        emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), val_reg.mir_op);
+      }
     }
-    /* If two-variable form, store val */
-    if (val_id->code == N_ID) {
-      op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
-      const char *vname = get_reg_var_name (c2m_ctx, MIR_T_I64, val_id->u.s.s,
-                              r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0);
-      reg_var_t vvar = get_reg_var (c2m_ctx, MIR_T_I64, vname, NULL);
-      emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), val_reg.mir_op);
-    }
+
     /* gen body */
     gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
     /* continue_label: i_reg++ */
@@ -15574,12 +15779,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     // Calculate total length for the concatenated string, including null terminator
     size_t total_len = len1 + len2;
     
-    // Allocate stack space for the concatenated string
-    //op_t stack_ptr_op = get_new_temp(c2m_ctx, MIR_T_I64);
-    //emit_alloca(c2m_ctx, stack_ptr_op, MIR_new_int_op(ctx, total_len));
-
-    // Allocate stack space and get a register to hold the pointer
-    MIR_reg_t stack_ptr_reg = MIR_new_func_reg(ctx, curr_func->u.func, MIR_T_I64, "concat_ptr");
+    // Allocate stack space and get a unique temp register for the pointer
+    op_t stack_ptr_op = get_new_temp(c2m_ctx, MIR_T_I64);
+    MIR_reg_t stack_ptr_reg = stack_ptr_op.mir_op.u.reg;
     MIR_append_insn(ctx, curr_func,
                     MIR_new_insn(ctx, MIR_ALLOCA,
                                  MIR_new_reg_op(ctx, stack_ptr_reg),

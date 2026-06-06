@@ -7,6 +7,9 @@
 #include <limits.h>
 #include <stdint.h>
 
+/* Include dict.h to make dict runtime functions available to the import resolver */
+#include "../inc/dict.h"
+
 #ifndef _WIN32
 #include <dlfcn.h>
 #if defined(__unix__) || defined(__APPLE__)
@@ -455,6 +458,26 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "_MIR_set_code") == 0) return _MIR_set_code;
 #endif
 #endif
+    /* Dict runtime functions (from dict.h, compiled statically) */
+    if (strcmp (name, "dict_create_object") == 0) return (void *) dict_create_object;
+    if (strcmp (name, "dict_create_null") == 0) return (void *) dict_create_null;
+    if (strcmp (name, "dict_create_bool") == 0) return (void *) dict_create_bool;
+    if (strcmp (name, "dict_create_number") == 0) return (void *) dict_create_number;
+    if (strcmp (name, "dict_create_int64") == 0) return (void *) dict_create_int64;
+    if (strcmp (name, "dict_create_string") == 0) return (void *) dict_create_string;
+    if (strcmp (name, "dict_create_array") == 0) return (void *) dict_create_array;
+    if (strcmp (name, "dict_object_set") == 0) return (void *) dict_object_set;
+    if (strcmp (name, "dict_object_get") == 0) return (void *) dict_object_get;
+    if (strcmp (name, "dict_object_remove") == 0) return (void *) dict_object_remove;
+    if (strcmp (name, "dict_serialize_json") == 0) return (void *) dict_serialize_json;
+    if (strcmp (name, "dict_deserialize_json") == 0) return (void *) dict_deserialize_json;
+    if (strcmp (name, "dict_destroy") == 0) return (void *) dict_destroy;
+    if (strcmp (name, "dict_find_path") == 0) return (void *) dict_find_path;
+    if (strcmp (name, "dict_value_free") == 0) return (void *) dict_value_free;
+    if (strcmp (name, "dict_array_append") == 0) return (void *) dict_array_append;
+    if (strcmp (name, "dict_object_count") == 0) return (void *) dict_object_count;
+    if (strcmp (name, "dict_object_key_at") == 0) return (void *) dict_object_key_at;
+    if (strcmp (name, "dict_object_value_at") == 0) return (void *) dict_object_value_at;
     fprintf (stderr, "can not load symbol %s\n", name);
     close_std_libs ();
     exit (1);

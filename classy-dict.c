@@ -22,6 +22,16 @@
  *  19. Multiple local dicts in one function
  *  20. Local dict in a helper function (non-main)
  *  21. Three-level deep nesting
+ *  22-25. Bracket subscript
+ *  26-27. "key" in dict operator
+ *  28-31. for (auto k in dict) loops
+ *  32-37. for (auto x in array) loops
+ *  38. json(string) -> dict  (parse)
+ *  39. json(dict) -> string  (serialize)
+ *  40. d.json property shorthand
+ *  41. Round-trip json(json(d)) fidelity
+ *  42. Mutate parsed dict then re-serialize
+ *  43. for-in on parsed dict
  */
 
 /* ---- Global dict declarations ---- */
@@ -47,7 +57,6 @@ dict meta = {
 
 /* ---- helpers (declared as extern, resolved by import_resolver) ---- */
 
-char *dict_serialize_json(dict val, char *buf, long buflen, int pretty);
 dict  dict_object_get(dict obj, char *key);
 int   dict_object_set(dict obj, char *key, dict val);
 dict  dict_create_int64(long n);
@@ -87,8 +96,6 @@ int dict_has_key(dict obj, char *key) {
 /* ---- main ---- */
 
 int main() {
-    char buf[1024];
-
     printf("=== dict test suite ===\n\n");
     passed = 0;
     failed = 0;
@@ -274,6 +281,76 @@ int main() {
         check(1, "31a for-in keys printed (visual check above)");
     }
 
+    /* ========== ARRAY FOR-IN TESTS ========== */
+
+    printf("\n-- array for-in --\n");
+
+    /* 32. for (auto x in int_array) — single variable */
+    {
+        int nums[] = {10, 20, 30, 40, 50};
+        int sum = 0;
+        for (auto x in nums)
+            sum = sum + x;
+        check(sum == 150, "32a for-in int array sum");
+    }
+
+    /* 33. for (auto i, v in array) — index + element */
+    {
+        int vals[] = {100, 200, 300};
+        int last_i = -1;
+        int last_v = -1;
+        for (auto i, v in vals) {
+            last_i = i;
+            last_v = v;
+        }
+        check(last_i == 2,   "33a array for-in last index == 2");
+        check(last_v == 300, "33b array for-in last value == 300");
+    }
+
+    /* 34. for-in over char array */
+    {
+        char word[] = "ABC";
+        int count = 0;
+        for (auto c in word)
+            count = count + 1;
+        /* includes null terminator */
+        check(count == 4, "34a char array for-in count (incl null)");
+    }
+
+    /* 35. for-in array in same function as dict for-in */
+    {
+        int arr[] = {1, 2, 3};
+        int arr_sum = 0;
+        for (auto x in arr)
+            arr_sum = arr_sum + x;
+
+        dict dd = { "a": 1 };
+        int dict_keys = 0;
+        for (auto k in dd)
+            dict_keys = dict_keys + 1;
+
+        check(arr_sum == 6,    "35a array + dict for-in coexist (arr sum)");
+        check(dict_keys == 1,  "35b array + dict for-in coexist (dict count)");
+    }
+
+    /* 36. for-in over String array */
+    {
+        String animals[3] = {"cats", "dogs", "fish"};
+        int count = 0;
+        for (auto s in animals)
+            count = count + 1;
+        check(count == 3, "36a String array for-in count");
+    }
+
+    /* 37. for-in over String array with index */
+    {
+        String fruits[2] = {"apple", "pear"};
+        int last_i = -1;
+        for (auto i, name in fruits)
+            last_i = i;
+        check(last_i == 1, "37a String array indexed for-in last index");
+    }
+
     /* 21. Three-level deep nesting */
     dict deep = {
         "l1": {
@@ -287,30 +364,67 @@ int main() {
     check(deep.l1.l2 != 0,            "21c deep.l1.l2 is non-null");
     check(deep.l1.l2.l3 != 0,         "21d deep.l1.l2.l3 is non-null");
 
+    /* ========== JSON BUILTIN TESTS ========== */
+
+    printf("\n-- json() builtin --\n");
+
+    /* 38. json(string) -> dict  (parse JSON) */
+    dict parsed = json("{\"x\":10,\"y\":20,\"label\":\"hi\"}");
+    check(parsed != 0,            "38a json(string) returns non-null");
+    check("x" in parsed,          "38b parsed dict has key x");
+    check("y" in parsed,          "38c parsed dict has key y");
+    check("label" in parsed,      "38d parsed dict has key label");
+    check(!("nope" in parsed),    "38e parsed dict lacks missing key");
+
+    /* 39. json(dict) -> string  (serialize) */
+    dict ser = { "a": 1, "b": 2 };
+    char *j1 = json(ser);
+    check(j1 != 0,                "39a json(dict) returns non-null string");
+    check((int)strlen(j1) > 5,    "39b serialized string has content");
+    printf("    json(ser) = %s\n", j1);
+
+    /* 40. d.json property shorthand */
+    char *j2 = ser.json;
+    check(j2 != 0,                "40a d.json returns non-null string");
+    check((int)strlen(j2) > 5,    "40b d.json has content");
+    printf("    ser.json  = %s\n", j2);
+
+    /* 41. Round-trip: parse then serialize preserves content */
+    dict rt = json("{\"name\":\"bob\",\"age\":42}");
+    char *rt_json = json(rt);
+    printf("    round-trip = %s\n", rt_json);
+    /* re-parse the serialized string */
+    dict rt2 = json(rt_json);
+    check("name" in rt2,          "41a round-trip preserved key name");
+    check("age" in rt2,           "41b round-trip preserved key age");
+
+    /* 42. Mutate a parsed dict then re-serialize */
+    dict md = json("{\"color\":\"red\"}");
+    md.size = 42;
+    md.color = "blue";
+    printf("    mutated = %s\n", md.json);
+    check("size" in md,           "42a mutated parsed dict has new key");
+
+    /* 43. for-in over a parsed dict */
+    {
+        dict fd = json("{\"p\":1,\"q\":2,\"r\":3}");
+        int count = 0;
+        for (auto k in fd)
+            count = count + 1;
+        check(count == 3,          "43a for-in over parsed dict count == 3");
+    }
+
     /* ========== SERIALISE FOR VISUAL INSPECTION ========== */
 
     printf("\n--- serialised state ---\n");
 
-    dict_serialize_json(flat, buf, 1024, 1);
-    printf("flat   = %s\n\n", buf);
-
-    dict_serialize_json(cfg, buf, 1024, 1);
-    printf("cfg    = %s\n\n", buf);
-
-    dict_serialize_json(meta, buf, 1024, 1);
-    printf("meta   = %s\n\n", buf);
-
-    dict_serialize_json(local1, buf, 1024, 1);
-    printf("local1 = %s\n\n", buf);
-
-    dict_serialize_json(nested, buf, 1024, 1);
-    printf("nested = %s\n\n", buf);
-
-    dict_serialize_json(pt, buf, 1024, 1);
-    printf("pt     = %s\n\n", buf);
-
-    dict_serialize_json(deep, buf, 1024, 1);
-    printf("deep   = %s\n\n", buf);
+    printf("flat   = %s\n\n", flat.json);
+    printf("cfg    = %s\n\n", cfg.json);
+    printf("meta   = %s\n\n", meta.json);
+    printf("local1 = %s\n\n", local1.json);
+    printf("nested = %s\n\n", nested.json);
+    printf("pt     = %s\n\n", json(pt));
+    printf("deep   = %s\n\n", deep.json);
 
     /* ========== SUMMARY ========== */
 

@@ -43,11 +43,13 @@ include(CTest)
 
 add_library(mir OBJECT mir.c mir-gen.c c2mir/c2mir.c mir.h mir-gen.h c2mir/c2mir.h)
 target_include_directories(mir PRIVATE ${PROJECT_SOURCE_DIR})
+# Report unused functions to help keep c2mir.c clean of dead code:
+set_source_files_properties(c2mir/c2mir.c PROPERTIES COMPILE_FLAGS "-Wunused-function")
 if(Threads_FOUND)
   target_compile_definitions(mir PUBLIC "MIR_PARALLEL_GEN")
 endif()
 if(UNIX)
-	target_link_libraries(mir m)
+  target_link_libraries(mir m)
 endif()
 
 # ------------------ LIBMIR -----------------------
@@ -247,4 +249,3 @@ add_test(mir2c-test mir2c_test)
 # ------------------ c2m tests --------------------------
 
 add_test(c2mir-simple-test c2m -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
-
