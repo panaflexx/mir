@@ -547,6 +547,20 @@ static DictValue *dict_find_path(const DictValue *root, const char *path) {
 }
 
 /* Destroy entire DictValue */
+/* Iteration helpers for for-in loops */
+static size_t dict_object_count(const DictValue *obj) {
+    if (!obj || obj->type != DICT_OBJECT) return 0;
+    return obj->object_value.count;
+}
+static const char *dict_object_key_at(const DictValue *obj, size_t index) {
+    if (!obj || obj->type != DICT_OBJECT || index >= obj->object_value.count) return NULL;
+    return obj->object_value.pairs[index].key;
+}
+static DictValue *dict_object_value_at(const DictValue *obj, size_t index) {
+    if (!obj || obj->type != DICT_OBJECT || index >= obj->object_value.count) return NULL;
+    return obj->object_value.pairs[index].value;
+}
+
 static void dict_destroy(DictValue *val) {
     if (!val) return;
     dict_value_free(val);

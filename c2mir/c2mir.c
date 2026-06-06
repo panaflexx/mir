@@ -634,6 +634,7 @@ typedef enum {
   REP8 (T_EL, IF, INLINE, INT, LONG, REGISTER, RESTRICT, RETURN, SHORT),
   REP8 (T_EL, SIGNED, SIZEOF, STATIC, STRUCT, CLASS, SWITCH, TYPEDEF, TYPEOF),
   REP8 (T_EL, DICT, STRING, UNION, UNSIGNED, VOID, VOLATILE, WHILE, EOFILE),
+  T_IN, /* 'in' keyword for dict key-check and for-in loops */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -647,7 +648,7 @@ typedef enum {
   T_EOU, /* end of translation unit */
 } token_code_t;
 
-static token_code_t FIRST_KW = T_BOOL, LAST_KW = T_WHILE;
+static token_code_t FIRST_KW = T_BOOL, LAST_KW = T_IN;
 
 #define NODE_EL(n) N_##n
 
@@ -668,7 +669,9 @@ typedef enum {
   REP8 (NODE_EL, SIGNED, UNSIGNED, BOOL, STRUCT, UNION, ENUM, ENUM_CONST, MEMBER),
   REP8 (NODE_EL, CONST, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC),
   REP8 (NODE_EL, STAR, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT),
-  REP7 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR, CLASS, STRING, CONCAT),
+  REP8 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT),
+  N_IN,     /* "key" in dict — existence check */
+  N_FORIN,  /* for (auto var in dict) loop */
 } node_code_t;
 
 #undef REP_SEP
@@ -4596,7 +4599,29 @@ static node_t right_op (c2m_ctx_t c2m_ctx, int no_err_p, int token, int token2, 
 D (mul_expr) { return left_op (c2m_ctx, no_err_p, T_DIVOP, '*', unary_expr); }
 D (add_expr) { return left_op (c2m_ctx, no_err_p, T_ADDOP, -1, mul_expr); }
 D (sh_expr) { return left_op (c2m_ctx, no_err_p, T_SH, -1, add_expr); }
-D (rel_expr) { return left_op (c2m_ctx, no_err_p, T_CMP, -1, sh_expr); }
+D (rel_expr) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t r, n;
+  pos_t pos;
+  P (sh_expr);
+  for (;;) {
+    node_code_t code;
+    if (MC (T_CMP, pos, code)) {
+      n = new_pos_node1 (c2m_ctx, code, pos, r);
+      P (sh_expr);
+      op_append (c2m_ctx, n, r);
+      r = n;
+    } else if (MP (T_IN, pos)) {
+      /* "key" in dict  —  dict key-existence check */
+      n = new_pos_node1 (c2m_ctx, N_IN, pos, r);
+      P (sh_expr);
+      op_append (c2m_ctx, n, r);
+      r = n;
+    } else
+      break;
+  }
+  return r;
+}
 D (eq_expr) { return left_op (c2m_ctx, no_err_p, T_EQNE, -1, rel_expr); }
 D (and_expr) { return left_op (c2m_ctx, no_err_p, '&', -1, eq_expr); }
 D (xor_expr) { return left_op (c2m_ctx, no_err_p, '^', -1, and_expr); }
@@ -4958,6 +4983,9 @@ DA (type_spec) {
     r = new_pos_node (c2m_ctx, N_CHAR, pos);
   } else if (MP (T_STRING, pos)) {
     r = new_pos_node (c2m_ctx, N_STRING, pos);
+  } else if (MP (T_DICT, pos)) {
+    r = new_pos_node (c2m_ctx, N_DICT, pos);
+    // dict type will be set to TM_DICT in check_decl_spec / create_type path
   } else if (MP (T_SHORT, pos)) {
     r = new_pos_node (c2m_ctx, N_SHORT, pos);
   } else if (MP (T_INT, pos)) {
@@ -5625,12 +5653,25 @@ D (initializer_list) {
       } else if (M ('.')) {
         PTN (T_ID);
         r = new_node1 (c2m_ctx, N_FIELD_ID, r);
+      } else if (C (T_STR)) {
+        /* Only accept a bare string as a dict key when followed by ':'.
+           This keeps backward-compatibility with positional initializers
+           that contain string constants (e.g. compound literals). */
+        size_t mark = record_start (c2m_ctx);
+        MN (T_STR, r);
+        if (C (':')) {
+          r = new_node1 (c2m_ctx, N_FIELD_ID, r);
+        } else {
+          /* Not a dict key – rewind so the string is treated as a value. */
+          record_stop (c2m_ctx, mark, TRUE);
+          break;
+        }
       } else
         break;
       op_append (c2m_ctx, list2, r);
     }
     if (!first_p) {
-      PT ('=');
+      if (!M (':')) PT ('=');
     }
     P (initializer);
     op_append (c2m_ctx, list, new_node2 (c2m_ctx, N_INIT, list2, r));
@@ -5751,6 +5792,39 @@ D (stmt) {
     r = new_pos_node3 (c2m_ctx, N_DO, pos, l, r, op1);
   } else if (MP (T_FOR, pos)) { /* iteration-statement */
     PT ('(');
+    /* Check for  for (auto var in expr)  or  for (auto key, val in expr) */
+    if (C (T_AUTO)) {
+      size_t forin_mark = record_start (c2m_ctx);
+      M (T_AUTO);
+      node_t var_id = NULL, val_id = NULL;
+      int is_forin = FALSE;
+      if (C (T_ID)) {
+        MN (T_ID, r); var_id = r;
+        if (M (',')) {
+          /* for (auto key, val in expr) */
+          if (C (T_ID)) { MN (T_ID, r); val_id = r; }
+        }
+        if (M (T_IN)) { is_forin = TRUE; }
+      }
+      if (is_forin) {
+        /* Commit — parse as for-in */
+        record_stop (c2m_ctx, forin_mark, FALSE);
+        P (expr);
+        op1 = r; /* collection expression */
+        PT (')');
+        P (stmt);
+        /* N_FORIN(labels, var_id, val_id_or_ignore, collection, body) */
+        n = new_pos_node5 (c2m_ctx, N_FORIN, pos, l, var_id,
+                           val_id ? val_id : new_node (c2m_ctx, N_IGNORE),
+                           op1, r);
+        r = n;
+      } else {
+        /* Not a for-in — rewind and fall through to normal for */
+        record_stop (c2m_ctx, forin_mark, TRUE);
+        goto normal_for;
+      }
+    } else {
+    normal_for:;
     n = new_pos_node (c2m_ctx, N_FOR, pos);
     n->attr = curr_scope;
     curr_scope = n;
@@ -5788,6 +5862,7 @@ D (stmt) {
     op_append (c2m_ctx, n, op3);
     op_append (c2m_ctx, n, r);
     r = n;
+    } /* end normal_for else */
   } else if (MP (T_GOTO, pos)) { /* jump-statement */
     int indirect_p = FALSE;
     if (!M ('*')) {
@@ -5978,6 +6053,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   kw_add (c2m_ctx, "else", T_ELSE, 0);
   kw_add (c2m_ctx, "enum", T_ENUM, 0);
   kw_add (c2m_ctx, "dict", T_DICT, 0);
+  kw_add (c2m_ctx, "in", T_IN, 0);
   kw_add (c2m_ctx, "extern", T_EXTERN, 0);
   kw_add (c2m_ctx, "float", T_FLOAT, 0);
   kw_add (c2m_ctx, "for", T_FOR, 0);
@@ -6316,7 +6392,7 @@ static int string_type_p (const struct type *type) {
 
 static int scalar_type_p (const struct type *type) {
   // RSD: Added string_type_p
-  return arithmetic_type_p (type) || string_type_p (type) || type->mode == TM_PTR;
+  return arithmetic_type_p (type) || string_type_p (type) || type->mode == TM_PTR || type->mode == TM_DICT;
 }
 
 static struct type get_ptr_int_type (int signed_p) {
@@ -6662,8 +6738,10 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
     align = type_align (type->u.arr_type->el_type);
   } else if (type->mode == TM_UNDEF) {
     align = 0; /* error type */
+  } else if (type->mode == TM_DICT) {
+    align = sizeof(void*);
   } else {
-    assert (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS);
+    assert (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS || type->mode == TM_DICT);
     if (incomplete_type_p (c2m_ctx, type)) {
       align = -1;
     } else {
@@ -6799,11 +6877,13 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
     overall_size = type_size (c2m_ctx, arr_type->el_type) * nel;
   } else if (type->mode == TM_UNDEF) {
     overall_size = sizeof (int); /* error type */
+  } else if (type->mode == TM_DICT) {
+    overall_size = sizeof (void*); /* DictValue* */
   } else {
     int bf_p = FALSE, bits = -1, bound_bit = 0;
     mir_size_t offset = 0, prev_size = 0;
 
-    assert (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS);
+    assert (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS || type->mode == TM_DICT);
     if (incomplete_type_p (c2m_ctx, type)) {
       overall_size = MIR_SIZE_MAX;
       if (c2m_options->debug_p) printf("set_type_layout: using MIR_SIZE_MAX storage type!?!\n");
@@ -7181,8 +7261,8 @@ static void def_symbol (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
   if (id->code == N_IGNORE) return;
   assert (id->code == N_ID && scope != NULL);
   assert (scope->code == N_MODULE || scope->code == N_BLOCK || scope->code == N_STRUCT
-          || scope->code == N_UNION || scope->code == N_FUNC || scope->code == N_FOR ||
-          scope->code == N_CLASS);
+          || scope->code == N_UNION || scope->code == N_FUNC || scope->code == N_FOR
+          || scope->code == N_FORIN || scope->code == N_CLASS);
   decl_spec = ((decl_t) def_node->attr)->decl_spec;
   if (decl_spec.thread_local_p && !decl_spec.static_p && !decl_spec.extern_p)
     error (c2m_ctx, POS (id), "auto %s is declared as thread local", id->u.s.s);
@@ -7529,6 +7609,11 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
                 }
                 curr_unnamed_anon_struct_union_member = saved_unnamed_anon_struct_union_member;
                 set_class_layout(c2m_ctx, n, type);
+                break;
+            }
+            case N_DICT: {
+                set_type_pos_node(type, n);
+                type->mode = TM_DICT;
                 break;
             }
     case N_STRUCT:
@@ -8123,6 +8208,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                                     : "assignment discards a type qualifier from a pointer");
           (c2m_options->pedantic_p ? error : warning) (c2m_ctx, POS (assign_node), "%s", msg);
         }
+      } else if (left->mode == TM_DICT) {
+        /* allow assignment to dict field; runtime will handle coercion */
       } else {
         msg = (code == N_CALL     ? "passing assign incompatible value"
                : code == N_RETURN ? "returning assign incompatible value"
@@ -8540,7 +8627,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       assert (init->code == N_INIT);
       des_list = NL_HEAD (init->u.ops);
       assert (des_list->code == N_LIST);
-      if (type->mode != TM_ARR && type->mode != TM_STRUCT && type->mode != TM_UNION && type->mode != TM_CLASS) {
+      if (type->mode != TM_ARR && type->mode != TM_STRUCT && type->mode != TM_UNION && type->mode != TM_CLASS && type->mode != TM_DICT) {
         if ((temp = NL_NEXT (init)) != NULL) {
           error (c2m_ctx, POS (temp), "excess elements in scalar initializer");
           return;
@@ -8573,7 +8660,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         des_list = NL_HEAD (init->u.ops);
         value = NL_NEXT (des_list);
         if ((value->code == N_LIST || value->code == N_COMPOUND_LITERAL) && type->mode != TM_ARR
-            && type->mode != TM_STRUCT && type->mode != TM_UNION && type->mode != TM_CLASS) {
+            && type->mode != TM_STRUCT && type->mode != TM_UNION && type->mode != TM_CLASS && type->mode != TM_DICT) {
           error (c2m_ctx, POS (init),
                  value->code == N_LIST ? "braces around scalar initializer"
                                        : "compound literal for scalar initializer");
@@ -8606,8 +8693,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             if (curr_des->code == N_FIELD_ID) {
               node_t id = NL_HEAD (curr_des->u.ops);
 
-              if (curr_type->mode != TM_STRUCT && curr_type->mode != TM_UNION && curr_type->mode != TM_CLASS) {
-                error (c2m_ctx, POS (curr_des), "field name not in struct, union, or class initializer");
+              if (curr_type->mode == TM_DICT) {
+                /* dict key handled later in check_dict_initializer */
+              } else if (curr_type->mode != TM_STRUCT && curr_type->mode != TM_UNION && curr_type->mode != TM_CLASS) {
+                error (c2m_ctx, POS (curr_des), "field name not in struct, union or class initializer");
               } else if (!symbol_find (c2m_ctx, S_REGULAR, id, curr_type->u.tag_type, &sym)) {
                 error (c2m_ctx, POS (curr_des), "unknown field %s in initializer", id->u.s.s);
               } else {
@@ -9149,10 +9238,12 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         REP8 (NODE_CASE, DIV, DIV_ASSIGN, MOD, MOD_ASSIGN, IND, FIELD, ADDR, DEREF)
         REP8 (NODE_CASE, DEREF_FIELD, COND, INC, DEC, POST_INC, POST_DEC, ALIGNOF, SIZEOF)
         REP6 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC)
+        NODE_CASE (IN)
         *expr_attr_p = TRUE;
         break;
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
         REP5 (NODE_CASE, BREAK, RETURN, EXPR, BLOCK, SPEC_DECL) /* SPEC DECL may have an initializer */
+        NODE_CASE (FORIN)
         *stmt_p = TRUE;
         break;
         REP8 (NODE_CASE, IGNORE, CASE, DEFAULT, LABEL, LIST, SHARE, TYPEDEF, EXTERN)
@@ -9160,7 +9251,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         REP8 (NODE_CASE, INT, LONG, FLOAT, DOUBLE, SIGNED, UNSIGNED, BOOL, STRUCT)
         REP8 (NODE_CASE, UNION, ENUM, ENUM_CONST, MEMBER, CONST, RESTRICT, VOLATILE, ATOMIC)
         REP8 (NODE_CASE, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR, POINTER, DOTS, ARR)
-        REP6 (NODE_CASE, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF, MODULE)
+        REP7 (NODE_CASE, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF, MODULE, DICT)
         break;
       default: assert (FALSE);
       }
@@ -9547,6 +9638,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         } else if ((t1->mode == TM_PTR && integer_type_p (t2))
                    || (t2->mode == TM_PTR && integer_type_p (t1))) {
           warning (c2m_ctx, POS (r), "comparison of integer with a pointer");
+        } else if ((t1->mode == TM_DICT && (integer_type_p (t2) || t2->mode == TM_DICT))
+                   || (t2->mode == TM_DICT && integer_type_p (t1))) {
+          /* dict is a pointer — allow comparison with integers and other dicts */
         } else {
           error (c2m_ctx, POS (r), "invalid types of comparison operands");
         }
@@ -9697,7 +9791,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         break;
       case N_IND:
         process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
-        if (t1->mode != TM_PTR && t1->mode != TM_ARR && (t2->mode == TM_PTR || t2->mode == TM_ARR)) {
+        if (t1->mode != TM_PTR && t1->mode != TM_ARR && t1->mode != TM_DICT
+            && (t2->mode == TM_PTR || t2->mode == TM_ARR)) {
           struct type *temp;
           node_t op;
 
@@ -9711,7 +9806,13 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         e->u.lvalue_node = r;
         e->type->mode = TM_BASIC;
         e->type->u.basic_type = TP_INT;
-        if (t1->mode != TM_PTR && t1->mode != TM_ARR) {
+        if (t1->mode == TM_DICT) {
+          /* d["key"] — dict bracket subscript */
+          e->type->mode = TM_DICT;
+          if (!t2 || (t2->mode != TM_PTR && t2->mode != TM_ARR && !integer_type_p(t2))) {
+            error (c2m_ctx, POS (r), "dict subscript must be a string or integer");
+          }
+        } else if (t1->mode != TM_PTR && t1->mode != TM_ARR) {
           error (c2m_ctx, POS (r), "subscripted value is neither array nor pointer");
         } else if (t1->mode == TM_PTR) {
           *e->type = *t1->u.ptr_type;
@@ -9725,10 +9826,86 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             error (c2m_ctx, POS (r), "array type has incomplete element type");
           }
         }
-        if (!integer_type_p (t2)) {
+        if (t1->mode != TM_DICT && !integer_type_p (t2)) {
           error (c2m_ctx, POS (r), "array subscript is not an integer");
         }
         break;
+      case N_IN: {
+        /* "key" in dict  —  existence check, result is int */
+        process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
+        e = create_expr (c2m_ctx, r);
+        e->type->mode = TM_BASIC;
+        e->type->u.basic_type = TP_INT;
+        if (t2->mode != TM_DICT) {
+          error (c2m_ctx, POS (r), "right operand of 'in' must be a dict");
+        }
+        break;
+      }
+      case N_FORIN: {
+        /* for (auto key[, val] in collection) body
+           children: labels(0), key_id(1), val_id_or_ignore(2), collection(3), body(4) */
+        node_t labels = NL_HEAD (r->u.ops);
+        node_t key_id = NL_NEXT (labels);
+        node_t val_id = NL_NEXT (key_id);
+        node_t collection = NL_NEXT (val_id);
+        node_t body = NL_NEXT (collection);
+        node_t saved_loop = curr_loop;
+        node_t saved_loop_switch = curr_loop_switch;
+
+        check_labels (c2m_ctx, labels, r);
+        create_node_scope (c2m_ctx, r);
+        check (c2m_ctx, collection, r);
+        e1 = collection->attr;
+        if (e1 && e1->type->mode != TM_DICT)
+          error (c2m_ctx, POS (r), "for-in collection must be a dict");
+        /* Declare auto loop variables in the symbol table so the body
+           can reference them.  We create minimal N_SPEC_DECL + decl nodes. */
+        {
+          node_t key_id_copy = copy_node(c2m_ctx, key_id);
+          node_t ksd = build_spec_decl(c2m_ctx, POS(key_id),
+              new_node(c2m_ctx, N_IGNORE),
+              new_pos_node2(c2m_ctx, N_DECL, POS(key_id), key_id_copy, new_node(c2m_ctx, N_LIST)),
+              NULL, NULL, NULL);
+          decl_t kd = reg_malloc(c2m_ctx, sizeof(struct decl));
+          init_decl(c2m_ctx, kd);
+          kd->scope = curr_scope;
+          init_decl_spec(&kd->decl_spec);
+          /* Use TM_DICT so the MIR register type (I64) matches
+             the one the FORIN gen writes to.  At runtime the
+             value is a char* but both are 64-bit pointers. */
+          kd->decl_spec.type = create_type(c2m_ctx, NULL);
+          kd->decl_spec.type->mode = TM_DICT;
+          kd->decl_spec.type->pos_node = key_id;
+          set_type_layout(c2m_ctx, kd->decl_spec.type);
+          kd->reg_p = TRUE;
+          ksd->attr = kd;
+          symbol_insert(c2m_ctx, S_REGULAR, key_id_copy, curr_scope, ksd, NULL);
+        }
+        if (val_id->code == N_ID) {
+          node_t val_id_copy = copy_node(c2m_ctx, val_id);
+          node_t vsd = build_spec_decl(c2m_ctx, POS(val_id),
+              new_node(c2m_ctx, N_IGNORE),
+              new_pos_node2(c2m_ctx, N_DECL, POS(val_id), val_id_copy, new_node(c2m_ctx, N_LIST)),
+              NULL, NULL, NULL);
+          decl_t vd = reg_malloc(c2m_ctx, sizeof(struct decl));
+          init_decl(c2m_ctx, vd);
+          vd->scope = curr_scope;
+          init_decl_spec(&vd->decl_spec);
+          vd->decl_spec.type = create_type(c2m_ctx, NULL);
+          vd->decl_spec.type->mode = TM_DICT;
+          vd->decl_spec.type->pos_node = val_id;
+          set_type_layout(c2m_ctx, vd->decl_spec.type);
+          vd->reg_p = TRUE;
+          vsd->attr = vd;
+          symbol_insert(c2m_ctx, S_REGULAR, val_id_copy, curr_scope, vsd, NULL);
+        }
+        curr_loop = curr_loop_switch = r;
+        check (c2m_ctx, body, r);
+        finish_scope (c2m_ctx);
+        curr_loop_switch = saved_loop_switch;
+        curr_loop = saved_loop;
+        break;
+      }
       case N_LABEL_ADDR:
         e = create_expr (c2m_ctx, r);
         e->type->mode = TM_PTR;
@@ -9830,16 +10007,25 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           t1 = t1->u.ptr_type;
           r->code = N_DEREF_FIELD; // rewrite so gen takes the pointer-deref path
         }
-        if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS) {
-          error (c2m_ctx, POS (r), "request for member %s in something not a structure, union or class",
+        if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
+          error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
           break;
-        } else if (!symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
-          !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
+        } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
+            !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
             // FIXME: Needs to be able to find clsss cuntions
-              error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
-                 op2->u.s.s);
-        } 
+             if (t1->mode != TM_DICT)
+               error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
+                  op2->u.s.s);
+         } 
+         if (t1->mode == TM_DICT) {
+           /* dict member access: key = op2 (N_ID), treat as runtime lookup */
+           e = create_expr(c2m_ctx, r);
+           e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
+           e->u.lvalue_node = r; /* allow assignment */
+           r->attr = e;
+           break;
+         }
         if (func) {
           assert (func->code == N_FUNC_DEF);
           printf("Found class method call\n");
@@ -11258,6 +11444,18 @@ struct gen_ctx {
   VARR (init_el_t) * init_els;
   MIR_item_t memset_proto, memset_item;
   MIR_item_t memcpy_proto, memcpy_item;
+  /* dict runtime helpers */
+  MIR_item_t dict_init_funcs[64]; /* generated __dict_init_* funcs */
+  int dict_init_func_count;
+  MIR_item_t dict_create_object_proto, dict_create_object_item;
+  MIR_item_t dict_create_int64_proto, dict_create_int64_item;
+  MIR_item_t dict_create_number_proto, dict_create_number_item;
+  MIR_item_t dict_create_string_proto, dict_create_string_item;
+  MIR_item_t dict_object_set_proto, dict_object_set_item;
+  MIR_item_t dict_object_get_proto, dict_object_get_item;
+  MIR_item_t dict_object_count_proto, dict_object_count_item;
+  MIR_item_t dict_object_key_at_proto, dict_object_key_at_item;
+  MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
@@ -11281,6 +11479,26 @@ struct gen_ctx {
 #define memset_item gen_ctx->memset_item
 #define memcpy_proto gen_ctx->memcpy_proto
 #define memcpy_item gen_ctx->memcpy_item
+#define dict_init_funcs gen_ctx->dict_init_funcs
+#define dict_init_func_count gen_ctx->dict_init_func_count
+#define dict_create_object_proto gen_ctx->dict_create_object_proto
+#define dict_create_object_item gen_ctx->dict_create_object_item
+#define dict_create_int64_proto gen_ctx->dict_create_int64_proto
+#define dict_create_int64_item gen_ctx->dict_create_int64_item
+#define dict_create_number_proto gen_ctx->dict_create_number_proto
+#define dict_create_number_item gen_ctx->dict_create_number_item
+#define dict_create_string_proto gen_ctx->dict_create_string_proto
+#define dict_create_string_item gen_ctx->dict_create_string_item
+#define dict_object_set_proto gen_ctx->dict_object_set_proto
+#define dict_object_set_item gen_ctx->dict_object_set_item
+#define dict_object_get_proto gen_ctx->dict_object_get_proto
+#define dict_object_get_item gen_ctx->dict_object_get_item
+#define dict_object_count_proto gen_ctx->dict_object_count_proto
+#define dict_object_count_item gen_ctx->dict_object_count_item
+#define dict_object_key_at_proto gen_ctx->dict_object_key_at_proto
+#define dict_object_key_at_item gen_ctx->dict_object_key_at_item
+#define dict_object_value_at_proto gen_ctx->dict_object_value_at_proto
+#define dict_object_value_at_item gen_ctx->dict_object_value_at_item
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
@@ -11410,6 +11628,7 @@ static int MIR_UNUSED get_int_mir_type_size (MIR_type_t t) {
 
 static MIR_type_t get_mir_type (c2m_ctx_t c2m_ctx, struct type *type) {
   size_t size = raw_type_size (c2m_ctx, type);
+  if (type->mode == TM_DICT) return MIR_T_I64; /* dict is a DictValue* pointer */
   int int_p = !floating_type_p (type), signed_p = signed_integer_type_p (type);
 
   //RSD: New 
@@ -11535,6 +11754,10 @@ static void get_type_alias_name (c2m_ctx_t c2m_ctx, struct type *type, VARR (cha
       get_type_alias_name (c2m_ctx, ds->type, name);
     }
     VARR_PUSH (char, name, type->u.func_type->dots_p ? 'E' : 'e');
+    break;
+  case TM_DICT:
+    VARR_PUSH (char, name, 'p'); /* dict is a pointer alias */
+    VARR_PUSH (char, name, 'v'); /* to void (opaque) */
     break;
   default: assert (FALSE);
   }
@@ -12847,6 +13070,279 @@ static void gen_memcpy (c2m_ctx_t c2m_ctx, MIR_disp_t disp, MIR_reg_t base, op_t
   emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6 /* args + proto + func + res */, args));
 }
 
+/* ========== Dict runtime call helpers ========== */
+
+static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t module = curr_func->module;
+  MIR_type_t ptr_t = MIR_T_I64; /* DictValue* is a pointer */
+  MIR_var_t vars[3];
+
+  if (dict_create_object_item != NULL) return; /* already imported */
+
+  /* dict_create_object() -> DictValue*   (no args) */
+  dict_create_object_proto = MIR_new_proto_arr (ctx, "__dict_create_object_p", 1, &ptr_t, 0, NULL);
+  dict_create_object_item = MIR_new_import (ctx, "dict_create_object");
+  move_item_to_module_start (module, dict_create_object_proto);
+  move_item_to_module_start (module, dict_create_object_item);
+
+  /* dict_create_int64(int64_t n) -> DictValue* */
+  vars[0].name = "n"; vars[0].type = MIR_T_I64;
+  dict_create_int64_proto = MIR_new_proto_arr (ctx, "__dict_create_int64_p", 1, &ptr_t, 1, vars);
+  dict_create_int64_item = MIR_new_import (ctx, "dict_create_int64");
+  move_item_to_module_start (module, dict_create_int64_proto);
+  move_item_to_module_start (module, dict_create_int64_item);
+
+  /* dict_create_number(double n) -> DictValue* */
+  vars[0].name = "n"; vars[0].type = MIR_T_D;
+  dict_create_number_proto = MIR_new_proto_arr (ctx, "__dict_create_number_p", 1, &ptr_t, 1, vars);
+  dict_create_number_item = MIR_new_import (ctx, "dict_create_number");
+  move_item_to_module_start (module, dict_create_number_proto);
+  move_item_to_module_start (module, dict_create_number_item);
+
+  /* dict_create_string(const char *s) -> DictValue* */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  dict_create_string_proto = MIR_new_proto_arr (ctx, "__dict_create_string_p", 1, &ptr_t, 1, vars);
+  dict_create_string_item = MIR_new_import (ctx, "dict_create_string");
+  move_item_to_module_start (module, dict_create_string_proto);
+  move_item_to_module_start (module, dict_create_string_item);
+
+  /* dict_object_set(DictValue *obj, const char *key, DictValue *val) -> int */
+  MIR_type_t int_t = MIR_T_I64;
+  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
+  vars[1].name = "key"; vars[1].type = MIR_T_I64;
+  vars[2].name = "val"; vars[2].type = MIR_T_I64;
+  dict_object_set_proto = MIR_new_proto_arr (ctx, "__dict_object_set_p", 1, &int_t, 3, vars);
+  dict_object_set_item = MIR_new_import (ctx, "dict_object_set");
+  move_item_to_module_start (module, dict_object_set_proto);
+  move_item_to_module_start (module, dict_object_set_item);
+
+  /* dict_object_get(const DictValue *obj, const char *key) -> DictValue* */
+  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
+  vars[1].name = "key"; vars[1].type = MIR_T_I64;
+  dict_object_get_proto = MIR_new_proto_arr (ctx, "__dict_object_get_p", 1, &ptr_t, 2, vars);
+  dict_object_get_item = MIR_new_import (ctx, "dict_object_get");
+  move_item_to_module_start (module, dict_object_get_proto);
+  move_item_to_module_start (module, dict_object_get_item);
+
+  /* dict_object_count(const DictValue *obj) -> size_t */
+  MIR_type_t sz_t = MIR_T_I64;
+  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
+  dict_object_count_proto = MIR_new_proto_arr (ctx, "__dict_object_count_p", 1, &sz_t, 1, vars);
+  dict_object_count_item = MIR_new_import (ctx, "dict_object_count");
+  move_item_to_module_start (module, dict_object_count_proto);
+  move_item_to_module_start (module, dict_object_count_item);
+
+  /* dict_object_key_at(const DictValue *obj, size_t index) -> const char* */
+  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
+  vars[1].name = "idx"; vars[1].type = MIR_T_I64;
+  dict_object_key_at_proto = MIR_new_proto_arr (ctx, "__dict_object_key_at_p", 1, &ptr_t, 2, vars);
+  dict_object_key_at_item = MIR_new_import (ctx, "dict_object_key_at");
+  move_item_to_module_start (module, dict_object_key_at_proto);
+  move_item_to_module_start (module, dict_object_key_at_item);
+
+  /* dict_object_value_at(const DictValue *obj, size_t index) -> DictValue* */
+  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
+  vars[1].name = "idx"; vars[1].type = MIR_T_I64;
+  dict_object_value_at_proto = MIR_new_proto_arr (ctx, "__dict_object_value_at_p", 1, &ptr_t, 2, vars);
+  dict_object_value_at_item = MIR_new_import (ctx, "dict_object_value_at");
+  move_item_to_module_start (module, dict_object_value_at_proto);
+  move_item_to_module_start (module, dict_object_value_at_item);
+}
+
+/* Emit: res = dict_create_object() */
+static op_t gen_dict_create_object (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_create_object_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_create_object_item);
+  args[2] = res.mir_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  return res;
+}
+
+/* Emit: res = dict_create_int64(val) */
+static op_t gen_dict_create_int64 (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_create_int64_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_create_int64_item);
+  args[2] = res.mir_op;
+  args[3] = val_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
+/* Emit: res = dict_create_number(val) */
+static op_t gen_dict_create_number (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_create_number_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_create_number_item);
+  args[2] = res.mir_op;
+  args[3] = val_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
+/* Emit: res = dict_create_string(str_op) */
+static op_t gen_dict_create_string (c2m_ctx_t c2m_ctx, MIR_op_t str_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_create_string_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_create_string_item);
+  args[2] = res.mir_op;
+  args[3] = str_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
+/* Emit: dict_object_set(obj_op, key_str_op, val_op) */
+static void gen_dict_object_set (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t key_op,
+                                 MIR_op_t val_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[6];
+
+  dict_ensure_imports (c2m_ctx);
+  args[0] = MIR_new_ref_op (ctx, dict_object_set_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_object_set_item);
+  args[2] = get_new_temp (c2m_ctx, MIR_T_I64).mir_op; /* return value (int), discarded */
+  args[3] = obj_op;
+  args[4] = key_op;
+  args[5] = val_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6, args));
+}
+
+/* Emit: res = dict_object_get(obj_op, key_str_op) */
+static op_t gen_dict_object_get (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t key_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[5];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_object_get_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_object_get_item);
+  args[2] = res.mir_op;
+  args[3] = obj_op;
+  args[4] = key_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
+  return res;
+}
+
+/* Emit: res = dict_object_count(obj_op) */
+static op_t gen_dict_object_count (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_object_count_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_object_count_item);
+  args[2] = res.mir_op;
+  args[3] = obj_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
+/* Emit: res = dict_object_key_at(obj_op, idx_op) */
+static op_t gen_dict_object_key_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t idx_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[5];
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_object_key_at_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_object_key_at_item);
+  args[2] = res.mir_op;
+  args[3] = obj_op;
+  args[4] = idx_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
+  return res;
+}
+
+/* Emit: res = dict_object_value_at(obj_op, idx_op) */
+static op_t gen_dict_object_value_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t idx_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[5];
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_object_value_at_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_object_value_at_item);
+  args[2] = res.mir_op;
+  args[3] = obj_op;
+  args[4] = idx_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
+  return res;
+}
+
+/* Recursively generate dict initializer code.
+   obj_op is the MIR register holding the parent dict object pointer.
+   initializer is the N_LIST node containing N_INIT children. */
+static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initializer) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+
+  if (initializer->code != N_LIST) return;
+  for (node_t init = NL_HEAD (initializer->u.ops); init != NULL; init = NL_NEXT (init)) {
+    if (init->code != N_INIT) continue;
+    node_t des_list = NL_HEAD (init->u.ops);
+    node_t value = NL_NEXT (des_list);
+    node_t des = NL_HEAD (des_list->u.ops);
+    if (des == NULL || des->code != N_FIELD_ID) continue;
+    node_t key_node = NL_HEAD (des->u.ops);
+    /* key_node is N_STR (string key like "timeout") or N_ID (.field style) */
+    const char *key_str = key_node->u.s.s;
+    MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
+                              (MIR_str_t){strlen (key_str) + 1, key_str});
+    MIR_op_t key_op = MIR_new_ref_op (ctx, str_item);
+
+    if (value->code == N_LIST) {
+      /* nested object: { "key": { ... } } */
+      op_t child = gen_dict_create_object (c2m_ctx);
+      gen_dict_init_list (c2m_ctx, child.mir_op, value);
+      gen_dict_object_set (c2m_ctx, obj_op, key_op, child.mir_op);
+    } else {
+      /* scalar value */
+      struct expr *ve = value->attr;
+      op_t wrapped;
+      if (ve != NULL && ve->const_p && integer_type_p (ve->type)) {
+        wrapped = gen_dict_create_int64 (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
+      } else if (ve != NULL && ve->const_p && floating_type_p (ve->type)) {
+        wrapped = gen_dict_create_number (c2m_ctx, MIR_new_double_op (ctx, ve->c.d_val));
+      } else if (value->code == N_STR) {
+        MIR_item_t si = MIR_new_string_data (ctx, NULL,
+                           (MIR_str_t){value->u.s.len, value->u.s.s});
+        wrapped = gen_dict_create_string (c2m_ctx, MIR_new_ref_op (ctx, si));
+      } else {
+        /* runtime expression: evaluate then wrap as int64 */
+        op_t v = val_gen (c2m_ctx, value);
+        wrapped = gen_dict_create_int64 (c2m_ctx, v.mir_op);
+      }
+      gen_dict_object_set (c2m_ctx, obj_op, key_op, wrapped.mir_op);
+    }
+  }
+}
+
 static void emit_scalar_assign (c2m_ctx_t c2m_ctx, op_t var, op_t *val, MIR_type_t t,
                                 int ignore_others_p) {
   if (var.decl == NULL || var.decl->bit_offset < 0) {
@@ -13475,10 +13971,55 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     res = get_new_temp (c2m_ctx, t);
     goto assign;
     break;
-  case N_ASSIGN:
-    var = gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL);
+  case N_ASSIGN: {
+    node_t lhs = NL_HEAD (r->u.ops);
+    node_t rhs_node = NL_EL (r->u.ops, 1);
+    /* Dict assignment: d.key = val  OR  d["key"] = val */
+    if (((struct expr *) r->attr)->type->mode == TM_DICT
+        && (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
+            || (lhs->code == N_IND
+                && ((struct expr *) NL_HEAD(lhs->u.ops)->attr)->type->mode == TM_DICT))) {
+      MIR_op_t key_op;
+      if (lhs->code == N_IND) {
+        /* d["key"] = val  or  d[var] = val */
+        node_t dict_node = NL_HEAD (lhs->u.ops);
+        node_t key_node = NL_EL (lhs->u.ops, 1);
+        op1 = val_gen (c2m_ctx, dict_node);
+        op_t key_val = val_gen (c2m_ctx, key_node);
+        key_op = key_val.mir_op;
+      } else {
+        /* d.key = val */
+        node_t parent_node = NL_HEAD (lhs->u.ops);
+        node_t key_id = NL_NEXT (parent_node);
+        assert (key_id->code == N_ID);
+        op1 = val_gen (c2m_ctx, parent_node);
+        const char *key_str = key_id->u.s.s;
+        MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
+                                  (MIR_str_t){strlen (key_str) + 1, key_str});
+        key_op = MIR_new_ref_op (ctx, str_item);
+      }
+      op2 = val_gen (c2m_ctx, rhs_node);
+      struct expr *rhs_expr = rhs_node->attr;
+      op_t wrapped;
+      if (rhs_expr != NULL && rhs_expr->type->mode == TM_DICT) {
+        /* Already a DictValue*, no wrapping needed */
+        wrapped = op2;
+      } else if (rhs_node->code == N_STR || (rhs_expr != NULL && rhs_expr->type->mode == TM_PTR)) {
+        /* String literal or char* — wrap as dict string */
+        wrapped = gen_dict_create_string (c2m_ctx, op2.mir_op);
+      } else if (rhs_expr != NULL && rhs_expr->const_p && floating_type_p (rhs_expr->type)) {
+        wrapped = gen_dict_create_number (c2m_ctx, op2.mir_op);
+      } else {
+        /* Integer or fallback — wrap as int64 */
+        wrapped = gen_dict_create_int64 (c2m_ctx, op2.mir_op);
+      }
+      gen_dict_object_set (c2m_ctx, op1.mir_op, key_op, wrapped.mir_op);
+      res = wrapped; /* result of assignment expression */
+      break;
+    }
+    var = gen (c2m_ctx, lhs, NULL, NULL, FALSE, NULL, NULL);
     t = get_op_type (c2m_ctx, var);
-    op2 = gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, t != MIR_T_UNDEF,
+    op2 = gen (c2m_ctx, rhs_node, NULL, NULL, t != MIR_T_UNDEF,
                t != MIR_T_UNDEF ? NULL : &var, NULL);
     if ((!val_p && true_label == NULL) || t == MIR_T_UNDEF) {
       res = var;
@@ -13488,6 +14029,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       val = promote (c2m_ctx, op2, t, TRUE);
       res = get_new_temp (c2m_ctx, t);
     }
+  }
   assign: /* t/val is promoted type/new value of assign expression */
     if (scalar_type_p (((struct expr *) r->attr)->type)) {
       assert (t != MIR_T_UNDEF);
@@ -13576,6 +14118,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct type *arr_type = ((struct expr *) arr->attr)->type;
     mir_size_t size = type_size (c2m_ctx, el_type);
 
+    if (arr_type->mode == TM_DICT) {
+      /* d["key"] or d[var] — dict bracket subscript read */
+      op1 = val_gen (c2m_ctx, arr);
+      op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
+      res = gen_dict_object_get (c2m_ctx, op1.mir_op, op2.mir_op);
+      break;
+    }
     t = get_mir_type (c2m_ctx, el_type);
     op1 = val_gen (c2m_ctx, arr);
     op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
@@ -13704,6 +14253,21 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_alias_t alias;
 
     e = r->attr;
+    if (e->type->mode == TM_DICT) {
+      /* Dict member access: cfg.key -> dict_object_get(cfg, "key") */
+      node_t obj_node = NL_HEAD (r->u.ops);
+      node_t key_node = NL_NEXT (obj_node);
+      assert (key_node->code == N_ID);
+      /* Generate code for the object (the left side) */
+      op1 = val_gen (c2m_ctx, obj_node);
+      /* Create string data for the key */
+      const char *key_str = key_node->u.s.s;
+      MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
+                                (MIR_str_t){strlen (key_str) + 1, key_str});
+      MIR_op_t key_op = MIR_new_ref_op (ctx, str_item);
+      res = gen_dict_object_get (c2m_ctx, op1.mir_op, key_op);
+      break;
+    }
     if (e->def_node && e->def_node->code == N_FUNC_DEF) {
       // method access: produce MIR ref to the function item (with mangled name)
       decl_t mdecl = (decl_t) e->def_node->attr;
@@ -14234,6 +14798,70 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
               }
             }
           }
+        } else if (initializer->code != N_IGNORE && decl->decl_spec.type->mode == TM_DICT
+                   && decl->scope == top_scope) {
+          /* Global dict initializer: generate a module-init function that builds the
+             dict at runtime and stores the pointer into the global BSS slot. */
+          decl->u.item = MIR_new_bss (ctx, name, sizeof (void *));
+          {
+            /* Save current function context and register state */
+            MIR_item_t saved_func = curr_func;
+            int saved_reg_free_mark = reg_free_mark;
+            char init_name[256];
+            snprintf (init_name, sizeof init_name, "__dict_init_%s", name);
+            reg_free_mark = 0;
+            curr_func = MIR_new_func (ctx, init_name, 0, NULL, 0);
+            dict_init_funcs[dict_init_func_count++] = curr_func; /* remember for main to call */
+
+            /* obj = dict_create_object() */
+            op_t obj = gen_dict_create_object (c2m_ctx);
+            /* populate from initializer AST */
+            gen_dict_init_list (c2m_ctx, obj.mir_op, initializer);
+            /* Store obj pointer into the global BSS variable */
+            {
+              MIR_item_t bss_item = decl->u.item;
+              op_t addr_temp = get_new_temp (c2m_ctx, MIR_T_I64);
+              emit2 (c2m_ctx, MIR_MOV, addr_temp.mir_op, MIR_new_ref_op (ctx, bss_item));
+              emit2 (c2m_ctx, MIR_MOV,
+                     MIR_new_mem_op (ctx, MIR_T_I64, 0, addr_temp.mir_op.u.reg, 0, 1),
+                     obj.mir_op);
+            }
+            emit_insn (c2m_ctx, MIR_new_ret_insn (ctx, 0));
+            MIR_finish_func (ctx);
+            /* Restore gen state: clear reg vars from init func */
+            HTAB_CLEAR (reg_var_t, reg_var_tab);
+            curr_func = saved_func;
+            reg_free_mark = saved_reg_free_mark;
+          }
+        } else if (initializer->code != N_IGNORE && decl->decl_spec.type->mode == TM_DICT
+                   && decl->scope != top_scope && initializer->code == N_LIST) {
+          /* Local dict brace initializer: dict d = { "k": v, ... };
+             Emit dict creation calls inline in the current function. */
+          if (id->attr == NULL) {
+            node_t saved_scope = curr_scope;
+            curr_scope = decl->scope;
+            check (c2m_ctx, id, NULL);
+            curr_scope = saved_scope;
+          }
+          var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+          op_t obj = gen_dict_create_object (c2m_ctx);
+          gen_dict_init_list (c2m_ctx, obj.mir_op, initializer);
+          /* Store obj pointer into the local variable */
+          emit2 (c2m_ctx, MIR_MOV, var.mir_op.mode == MIR_OP_REG ? var.mir_op
+                 : var.mir_op, obj.mir_op);
+        } else if (initializer->code != N_IGNORE && decl->decl_spec.type->mode == TM_DICT
+                   && decl->scope != top_scope) {
+          /* Local dict scalar initializer: dict d = expr;
+             Evaluate the expression and store the pointer. */
+          if (id->attr == NULL) {
+            node_t saved_scope = curr_scope;
+            curr_scope = decl->scope;
+            check (c2m_ctx, id, NULL);
+            curr_scope = saved_scope;
+          }
+          var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+          op_t val_op = val_gen (c2m_ctx, initializer);
+          emit2 (c2m_ctx, MIR_MOV, var.mir_op, val_op.mir_op);
         } else if (initializer->code != N_IGNORE) {  // ??? general code
           init_start = VARR_LENGTH (init_el_t, init_els);
           collect_init_els (c2m_ctx, NULL, &decl->decl_spec.type, initializer,
@@ -14442,6 +15070,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                  MIR_new_reg_op (ctx, get_reg_var (c2m_ctx, MIR_T_UNDEF, param_name, NULL).reg));
         }
       }
+    }
+    /* Inject dict module init calls at the start of main() */
+    if (dict_init_func_count > 0 && strcmp (name, "main") == 0) {
+      MIR_item_t init_proto = MIR_new_proto_arr (ctx, "__dict_init_p", 0, NULL, 0, NULL);
+      move_item_to_module_start (curr_func->module, init_proto);
+      for (int di = 0; di < dict_init_func_count; di++) {
+        MIR_op_t init_args[2];
+        init_args[0] = MIR_new_ref_op (ctx, init_proto);
+        init_args[1] = MIR_new_ref_op (ctx, dict_init_funcs[di]);
+        emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 2, init_args));
+      }
+      dict_init_func_count = 0; /* consumed */
     }
     gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
     if ((insn = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns)) == NULL
@@ -14723,6 +15363,87 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       top_gen (c2m_ctx, cond, stmt_label, break_label, NULL);
     }
     emit_label_insn_opt (c2m_ctx, break_label);
+    continue_label = saved_continue_label;
+    break_label = saved_break_label;
+    break;
+  }
+  case N_IN: {
+    /* "key" in dict  →  dict_object_get(dict, key) != 0 */
+    node_t key_node = NL_HEAD (r->u.ops);
+    node_t dict_node = NL_EL (r->u.ops, 1);
+    op1 = val_gen (c2m_ctx, key_node);  /* key (string) */
+    op2 = val_gen (c2m_ctx, dict_node); /* dict */
+    op_t got = gen_dict_object_get (c2m_ctx, op2.mir_op, op1.mir_op);
+    if (true_label != NULL) {
+      emit2 (c2m_ctx, MIR_BT, MIR_new_label_op (ctx, true_label), got.mir_op);
+      emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, false_label));
+      true_label = false_label = NULL;
+    } else {
+      res = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_NE, res.mir_op, got.mir_op, MIR_new_int_op (ctx, 0));
+    }
+    break;
+  }
+  case N_FORIN: {
+    /* for (auto key[, val] in collection) body
+       children: labels(0), key_id(1), val_id_or_ignore(2), collection(3), body(4) */
+    node_t labels  = NL_HEAD (r->u.ops);
+    node_t key_id  = NL_NEXT (labels);
+    node_t val_id  = NL_NEXT (key_id);
+    node_t coll    = val_id ? NL_NEXT (val_id) : NULL;
+    node_t body    = coll ? NL_NEXT (coll) : NULL;
+    if (!coll || !body) break; /* malformed FORIN node */
+    MIR_label_t loop_label = MIR_new_label (ctx);
+    MIR_label_t body_label = MIR_new_label (ctx);
+    MIR_label_t saved_continue_label = continue_label;
+    MIR_label_t saved_break_label = break_label;
+    continue_label = MIR_new_label (ctx);
+    break_label = MIR_new_label (ctx);
+
+    assert (false_label == NULL && true_label == NULL);
+    emit_label (c2m_ctx, r);
+
+    /* coll_reg = val_gen(collection) */
+    op_t coll_val = val_gen (c2m_ctx, coll);
+    op_t coll_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit2 (c2m_ctx, MIR_MOV, coll_reg.mir_op, coll_val.mir_op);
+    /* n_reg = dict_object_count(coll_reg) */
+    op_t n_reg = gen_dict_object_count (c2m_ctx, coll_reg.mir_op);
+    op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_reg.mir_op);
+    /* i_reg = 0 */
+    op_t i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
+    /* loop_label: if i_reg >= n_save goto break_label */
+    emit_label_insn_opt (c2m_ctx, loop_label);
+    emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, break_label), i_reg.mir_op, n_save.mir_op);
+    emit_label_insn_opt (c2m_ctx, body_label);
+    /* key_reg = dict_object_key_at(coll_reg, i_reg) */
+    op_t key_reg = gen_dict_object_key_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+    /* Store key into the auto variable using the same mangled name
+       that the N_ID gen path will look up later. */
+    {
+      unsigned fsn = r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0;
+      const char *kname = get_reg_var_name (c2m_ctx, MIR_T_I64, key_id->u.s.s, fsn);
+      reg_var_t kvar = get_reg_var (c2m_ctx, MIR_T_I64, kname, NULL);
+      emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), key_reg.mir_op);
+    }
+    /* If two-variable form, store val */
+    if (val_id->code == N_ID) {
+      op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+      const char *vname = get_reg_var_name (c2m_ctx, MIR_T_I64, val_id->u.s.s,
+                              r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0);
+      reg_var_t vvar = get_reg_var (c2m_ctx, MIR_T_I64, vname, NULL);
+      emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), val_reg.mir_op);
+    }
+    /* gen body */
+    gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
+    /* continue_label: i_reg++ */
+    emit_label_insn_opt (c2m_ctx, continue_label);
+    emit3 (c2m_ctx, MIR_ADD, i_reg.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, 1));
+    emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, loop_label));
+    emit_label_insn_opt (c2m_ctx, break_label);
+
     continue_label = saved_continue_label;
     break_label = saved_break_label;
     break;
@@ -15062,7 +15783,8 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, UNSIGNED, BOOL, STRUCT, UNION, ENUM, ENUM_CONST, MEMBER, CONST);
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
-    REP6 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT);
+    REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
+    C (IN); C (FORIN);
   default: abort ();
   }
 #undef C
@@ -15164,6 +15886,7 @@ static void print_type (c2m_ctx_t c2m_ctx, FILE *f, struct type *type) {
     fprintf (f, "(params node %u", type->u.func_type->param_list->uid);
     fprintf (f, type->u.func_type->dots_p ? ", ...)" : ")");
     break;
+  case TM_DICT: fprintf (f, "dict"); break;
   default: assert (FALSE);
   }
   print_qual (f, type->type_qual);
@@ -15320,6 +16043,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_GENERIC:
   case N_STMTEXPR:
   case N_LABEL_ADDR:
+  case N_IN:
     if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
     fprintf (f, "\n");
     print_ops (c2m_ctx, f, n, indent, attr_p);
@@ -15328,6 +16052,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_IF:
   case N_WHILE:
   case N_DO:
+  case N_FORIN:
   case N_CONTINUE:
   case N_BREAK:
   case N_RETURN:
@@ -15371,6 +16096,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_CONCAT:
   case N_ST_ASSERT:
   case N_ASM:
+  case N_DICT:
     fprintf (f, "\n");
     print_ops (c2m_ctx, f, n, indent, attr_p);
     break;
