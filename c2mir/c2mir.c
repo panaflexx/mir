@@ -673,6 +673,8 @@ typedef enum {
   N_IN,     /* "key" in dict — existence check */
   N_FORIN,  /* for (auto var in dict) loop */
   N_NEW,    /* new ClassName(args) — heap allocation + constructor call */
+  N_DEFER,  /* defer <stmt> — run statement at enclosing scope exit (LIFO) */
+  N_DELETE, /* delete <ptr> — run destructor (if any) then free the heap object */
 } node_code_t;
 
 #undef REP_SEP
@@ -5007,6 +5009,43 @@ D (class_member_declaration) {
   
   if (c2m_options->debug_p) printf("class_member_declaration\n");
 
+  /* Destructor:  ~ClassName ( ) { body }   (no return type, no params).
+     Detected when a '~' is followed by the enclosing class name and '('.
+     Lowered to a method named "__dtor_<ClassName>" returning void; the implicit
+     'this' parameter is prepended later like any other method.  Invoked by
+     `delete obj` (and may be invoked automatically via `defer delete obj`). */
+  if (parse_ctx->curr_class != NULL && C (T_UNOP)
+      && curr_token->node_code == N_BITWISE_NOT) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t cpos = curr_token->pos;
+    M (T_UNOP); /* consume '~' */
+    if (C (T_ID) && curr_token->repr != NULL
+        && strcmp (curr_token->repr, parse_ctx->curr_class->u.s.s) == 0) {
+      M (T_ID); /* consume the class name */
+      if (C ('(')) {
+        node_t plist, func_node, decl_list, dtor_id, declr, dspec, block;
+        pos_t ppos;
+        char dtor_name[300];
+        record_stop (c2m_ctx, mark, FALSE); /* commit: this is a destructor */
+        MP ('(', ppos);
+        PT (')'); /* destructors take no parameters */
+        plist = new_node (c2m_ctx, N_LIST);
+        func_node = new_pos_node1 (c2m_ctx, N_FUNC, ppos, plist);
+        decl_list = new_node1 (c2m_ctx, N_LIST, func_node);
+        snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s",
+                  parse_ctx->curr_class->u.s.s);
+        dtor_id = build_id (c2m_ctx, dtor_name, cpos);
+        declr = new_pos_node2 (c2m_ctx, N_DECL, cpos, dtor_id, decl_list);
+        dspec = new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_VOID, cpos));
+        P (compound_stmt);
+        block = r;
+        return build_func_def (c2m_ctx, cpos, dspec, declr,
+                               new_node (c2m_ctx, N_LIST), block);
+      }
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a destructor: rewind */
+  }
+
   /* Constructor:  ClassName ( params? ) { body }   (no return type).
      Detected when an identifier matching the enclosing class name is followed
      by '('.  Lowered to a method named "__ctor_<ClassName>" returning void; the
@@ -5150,7 +5189,11 @@ DA (type_spec) {
     r = new_pos_node (c2m_ctx, N_SIGNED, pos);
   } else if (MP (T_UNSIGNED, pos)) {
     r = new_pos_node (c2m_ctx, N_UNSIGNED, pos);
-  } else if (MP (T_BOOL, pos)) {
+  } else if (MP (T_BOOL, pos) || (arg == NULL && MP_SOFT ("bool", pos))) {
+    /* `bool` is a soft keyword: matched as a type specifier only when it is the
+       sole type specifier (arg == NULL), so it stays usable as a normal
+       identifier elsewhere (e.g. `int bool = 1;`) and is compatible with
+       <stdbool.h>. */
     r = new_pos_node (c2m_ctx, N_BOOL, pos);
   } else if (MP (T_COMPLEX, pos)) {
     if (record_level == 0) error (c2m_ctx, pos, "complex numbers are not supported");
@@ -5901,6 +5944,34 @@ D (stmt) {
   while ((op1 = TRY (label)) != err_node) {
     op_append (c2m_ctx, l, op1);
   }
+  /* defer <statement> : record a statement to be executed (in LIFO order) when
+     the enclosing block exits.  `defer` is a soft keyword, so it stays usable as
+     an ordinary identifier; it is only treated specially when it begins a real
+     statement (the token right after it does not look like an operator/`;`). */
+  if (C_SOFT ("defer")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t dpos = curr_token->pos;
+    M_SOFT ("defer");
+    if (!C ('=') && !C (';') && !C ('(') && !C ('[') && !C ('.')
+        && (op1 = TRY (stmt)) != err_node) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit: this is a defer statement */
+      return new_pos_node2 (c2m_ctx, N_DEFER, dpos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a defer statement: rewind */
+  }
+  /* delete <ptr> ; : run the object's destructor (if any) and free it.  Also a
+     soft keyword, committed only when followed by an lvalue expression + ';'. */
+  if (C_SOFT ("delete")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t dpos = curr_token->pos;
+    M_SOFT ("delete");
+    if (!C ('=') && !C (';') && (op1 = TRY (unary_expr)) != err_node && C (';')) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit: this is a delete statement */
+      PT (';');
+      return new_pos_node2 (c2m_ctx, N_DELETE, dpos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a delete statement: rewind */
+  }
   if (C ('{')) {
     P (compound_stmt);
     if (NL_HEAD (l->u.ops) != NULL) { /* replace empty label list */
@@ -6186,6 +6257,9 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (token_t, buffered_tokens, alloc, 32);
   pre_init (c2m_ctx);
   kw_add (c2m_ctx, "_Bool", T_BOOL, 0);
+  /* `bool` is a soft (context-sensitive) keyword recognized only as a type
+     specifier (see type_spec), so it stays usable as an ordinary C identifier
+     everywhere else and remains compatible with <stdbool.h>. */
   kw_add (c2m_ctx, "_Complex", T_COMPLEX, 0);
   kw_add (c2m_ctx, "_Alignas", T_ALIGNAS, 0);
   kw_add (c2m_ctx, "_Alignof", T_ALIGNOF, 0);
@@ -6550,6 +6624,20 @@ static int string_type_p (const struct type *type) {
    pointers.  Used to recognize `String`-typed receivers of method calls. */
 static int builtin_string_type_p (const struct type *type) {
   return type != NULL && type->mode == TM_BASIC && type->u.basic_type == TP_STRING;
+}
+
+/* For the String `+` concatenation extension: true when an operand contributes a
+   string value to a concatenation.  That is a built-in `String` value, a bare
+   narrow string literal, or a char-array type that came from a string literal.
+   Ordinary `char *` pointers are deliberately excluded so that normal C11
+   pointer arithmetic on pointers is preserved. */
+static int str_concat_string_operand_p (const struct type *type, node_t op) {
+  if (builtin_string_type_p (type)) return 1;
+  if (op != NULL && op->code == N_STR) return 1;
+  if (type != NULL && type->mode == TM_ARR && type->pos_node != NULL
+      && type->pos_node->code == N_STR)
+    return 1;
+  return 0;
 }
 
 /* Built-in String methods recognized as `s.method(...)` call syntax. */
@@ -9454,6 +9542,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
         REP5 (NODE_CASE, BREAK, RETURN, EXPR, BLOCK, SPEC_DECL) /* SPEC DECL may have an initializer */
         NODE_CASE (FORIN)
+        NODE_CASE (DEFER)
+        NODE_CASE (DELETE)
         *stmt_p = TRUE;
         break;
         REP8 (NODE_CASE, IGNORE, CASE, DEFAULT, LABEL, LIST, SHARE, TYPEDEF, EXTERN)
@@ -9981,19 +10071,32 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       case N_DIV:
       case N_MOD:
         process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
-        // FIXME: Perform N_ADD overload **HERE**
-        //if(t1 && t2)
-        //    printf("N_ADD %d == %d\n", t1->u.basic_type, t2->u.basic_type);
-        if(r->code == N_ADD && t1 && t2 && t1->pos_node && t2->pos_node &&
-            t1->u.basic_type == TP_STRING &&
-            t2->u.basic_type == TP_STRING ) {
+        /* String `+` concatenation (with basic-type auto-cast).  This only
+           triggers when at least one operand is a string value (a built-in
+           `String` or a string literal); the other operand may be another
+           string value or an arithmetic (basic) value that is auto-cast to its
+           textual form.  Because a plain `String`/string-literal is never a C11
+           arithmetic/pointer expression here, ordinary C11 code is unaffected. */
+        if (r->code == N_ADD) {
+          int s1 = str_concat_string_operand_p (t1, op1);
+          int s2 = str_concat_string_operand_p (t2, op2);
 
-          debug(c2m_ctx, POS (r), "Check for N_ADD to N_CONCAT");
-          if(t1->pos_node->u.ops.head->code == N_STRING ||
-             t2->pos_node->u.ops.head->code == N_STRING) {
-                // Overload N_ADD to N_CONCAT
-                debug(c2m_ctx, POS (r), "Overload N_ADD to N_CONCAT");
-                r->code = N_CONCAT;
+          if (s1 || s2) {
+            int ok1 = s1 || arithmetic_type_p (t1);
+            int ok2 = s2 || arithmetic_type_p (t2);
+
+            if (ok1 && ok2) {
+              debug (c2m_ctx, POS (r), "Overload N_ADD to N_CONCAT (String concat)");
+              r->code = N_CONCAT;
+              e = create_expr (c2m_ctx, r);
+              e->type->mode = TM_BASIC;
+              e->type->u.basic_type = TP_STRING;
+              e->type->type_qual.const_p = 1;
+              e->type->raw_size = 8;
+              e->type->align = 8;
+              e->type->pos_node = r;
+              break;
+            }
           }
         }
         e = check_assign_op (c2m_ctx, r, e1, e2, t1, t2);
@@ -11871,6 +11974,47 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     check (c2m_ctx, expr, r);
     break;
   }
+  case N_DEFER: {
+    /* defer <stmt>: the statement is checked here (in the current scope) but its
+       code is emitted at every exit of the enclosing block (see gen). */
+    node_t labels = NL_HEAD (r->u.ops);
+    node_t stmt = NL_NEXT (labels);
+
+    check_labels (c2m_ctx, labels, r);
+    check (c2m_ctx, stmt, r);
+    break;
+  }
+  case N_DELETE: {
+    /* delete <ptr>: run the pointed-to object's destructor (if its class defines
+       one) and free the heap storage.  r->attr caches the resolved destructor
+       N_FUNC_DEF (or NULL) for gen. */
+    node_t labels = NL_HEAD (r->u.ops);
+    node_t expr = NL_NEXT (labels);
+
+    check_labels (c2m_ctx, labels, r);
+    check (c2m_ctx, expr, r);
+    e1 = expr->attr;
+    t1 = e1->type;
+    r->attr = NULL; /* destructor def_node, NULL = none */
+    if (t1->mode != TM_PTR) {
+      error (c2m_ctx, POS (r), "delete requires a pointer operand");
+    } else {
+      struct type *pt = t1->u.ptr_type;
+      if (pt != NULL && pt->mode == TM_CLASS && pt->u.tag_type != NULL) {
+        node_t class_def = pt->u.tag_type;
+        node_t cid = NL_HEAD (class_def->u.ops);
+        if (cid != NULL && cid->code == N_ID) {
+          char dtor_name[300];
+          node_t dtor_id, dtor_def;
+          snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
+          dtor_id = build_id (c2m_ctx, dtor_name, POS (r));
+          dtor_def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+          if (dtor_def != NULL && dtor_def->code == N_FUNC_DEF) r->attr = dtor_def;
+        }
+      }
+    }
+    break;
+  }
   case N_CLASS: {
     node_t id = NL_HEAD (r->u.ops);
     node_t decl_list = NL_NEXT (id);
@@ -12057,7 +12201,12 @@ struct gen_ctx {
   MIR_item_t memcpy_proto, memcpy_item;
   /* heap allocation for `new ClassName(...)` */
   MIR_item_t malloc_proto, malloc_item;
+  MIR_item_t free_proto, free_item; /* heap release for `delete obj` */
   int new_proto_count; /* makes per-new constructor-call protos unique */
+  /* `defer <stmt>` support: LIFO stack of pending statements for the current
+     function, plus the stack depths to unwind to at `break`/`continue`. */
+  VARR (node_t) * defer_stmts;
+  size_t defer_break_mark, defer_continue_mark;
   /* dict runtime helpers */
   MIR_item_t dict_init_funcs[64]; /* generated __dict_init_* funcs */
   int dict_init_func_count;
@@ -12081,6 +12230,12 @@ struct gen_ctx {
   MIR_item_t str_checkpoint_proto, str_checkpoint_item;
   MIR_item_t str_release_to_proto, str_release_to_item;
   MIR_item_t str_release_keeping_proto, str_release_keeping_item;
+  /* String `+` concatenation / basic-type auto-cast helpers */
+  MIR_item_t str_concat_proto, str_concat_item;
+  MIR_item_t str_from_i64_proto;  /* shared char*(int64) proto */
+  MIR_item_t str_from_double_proto;
+  MIR_item_t str_from_int_item, str_from_uint_item;
+  MIR_item_t str_from_bool_item, str_from_char_item, str_from_double_item;
   /* automatic String scope reclamation state for the current function */
   op_t str_scope_mark;
   int str_scope_active;
@@ -12109,6 +12264,11 @@ struct gen_ctx {
 #define memcpy_item gen_ctx->memcpy_item
 #define malloc_proto gen_ctx->malloc_proto
 #define malloc_item gen_ctx->malloc_item
+#define free_proto gen_ctx->free_proto
+#define free_item gen_ctx->free_item
+#define defer_stmts gen_ctx->defer_stmts
+#define defer_break_mark gen_ctx->defer_break_mark
+#define defer_continue_mark gen_ctx->defer_continue_mark
 #define new_proto_count gen_ctx->new_proto_count
 #define dict_init_funcs gen_ctx->dict_init_funcs
 #define dict_init_func_count gen_ctx->dict_init_func_count
@@ -12150,6 +12310,15 @@ struct gen_ctx {
 #define str_release_to_item gen_ctx->str_release_to_item
 #define str_release_keeping_proto gen_ctx->str_release_keeping_proto
 #define str_release_keeping_item gen_ctx->str_release_keeping_item
+#define str_concat_proto gen_ctx->str_concat_proto
+#define str_concat_item gen_ctx->str_concat_item
+#define str_from_i64_proto gen_ctx->str_from_i64_proto
+#define str_from_double_proto gen_ctx->str_from_double_proto
+#define str_from_int_item gen_ctx->str_from_int_item
+#define str_from_uint_item gen_ctx->str_from_uint_item
+#define str_from_bool_item gen_ctx->str_from_bool_item
+#define str_from_char_item gen_ctx->str_from_char_item
+#define str_from_double_item gen_ctx->str_from_double_item
 #define str_scope_mark gen_ctx->str_scope_mark
 #define str_scope_active gen_ctx->str_scope_active
 #define call_ops gen_ctx->call_ops
@@ -13751,6 +13920,40 @@ static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
   return res;
 }
 
+/* free (ptr) : release a `new`-allocated object (used by `delete`). */
+static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  if (free_item == NULL) {
+    MIR_var_t var;
+    MIR_module_t module = curr_func->module;
+    var.name = "ptr";
+    var.type = get_int_mir_type (sizeof (mir_size_t));
+    free_proto = MIR_new_proto_arr (ctx, "__delete_free_p", 0, NULL, 1, &var);
+    free_item = MIR_new_import (ctx, "free");
+    move_item_to_module_start (module, free_proto);
+    move_item_to_module_start (module, free_item);
+  }
+  args[0] = MIR_new_ref_op (ctx, free_proto);
+  args[1] = MIR_new_ref_op (ctx, free_item);
+  args[2] = ptr;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+}
+
+/* Emit the deferred statements registered above stack depth `from`, in LIFO
+   order, without popping them (the caller decides when to truncate the stack). */
+static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  size_t i = VARR_LENGTH (node_t, defer_stmts);
+
+  while (i > from) {
+    i--;
+    gen (c2m_ctx, VARR_GET (node_t, defer_stmts, i), NULL, NULL, FALSE, NULL, NULL);
+  }
+}
+
 /* ========== Dict runtime call helpers ========== */
 
 static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
@@ -14196,6 +14399,108 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   str_release_keeping_item = MIR_new_import (ctx, "c2m_str_release_keeping");
   move_item_to_module_start (module, str_release_keeping_proto);
   move_item_to_module_start (module, str_release_keeping_item);
+
+  /* char *c2m_str_concat(const char *a, const char *b) */
+  vars[0].name = "a"; vars[0].type = MIR_T_I64;
+  vars[1].name = "b"; vars[1].type = MIR_T_I64;
+  str_concat_proto = MIR_new_proto_arr (ctx, "__c2m_str_concat_p", 1, &ptr_t, 2, vars);
+  str_concat_item = MIR_new_import (ctx, "c2m_str_concat");
+  move_item_to_module_start (module, str_concat_proto);
+  move_item_to_module_start (module, str_concat_item);
+
+  /* char *c2m_str_from_int/uint/bool/char(int64_t v) — one shared proto. */
+  vars[0].name = "v"; vars[0].type = MIR_T_I64;
+  str_from_i64_proto = MIR_new_proto_arr (ctx, "__c2m_str_from_i64_p", 1, &ptr_t, 1, vars);
+  move_item_to_module_start (module, str_from_i64_proto);
+  str_from_int_item = MIR_new_import (ctx, "c2m_str_from_int");
+  move_item_to_module_start (module, str_from_int_item);
+  str_from_uint_item = MIR_new_import (ctx, "c2m_str_from_uint");
+  move_item_to_module_start (module, str_from_uint_item);
+  str_from_bool_item = MIR_new_import (ctx, "c2m_str_from_bool");
+  move_item_to_module_start (module, str_from_bool_item);
+  str_from_char_item = MIR_new_import (ctx, "c2m_str_from_char");
+  move_item_to_module_start (module, str_from_char_item);
+
+  /* char *c2m_str_from_double(double v) */
+  {
+    MIR_var_t dvars[1];
+    dvars[0].name = "v"; dvars[0].type = MIR_T_D;
+    str_from_double_proto = MIR_new_proto_arr (ctx, "__c2m_str_from_double_p", 1, &ptr_t, 1, dvars);
+    move_item_to_module_start (module, str_from_double_proto);
+    str_from_double_item = MIR_new_import (ctx, "c2m_str_from_double");
+    move_item_to_module_start (module, str_from_double_item);
+  }
+}
+
+/* Emit: res = c2m_str_concat(a, b).  Both operands are char* (I64). */
+static op_t gen_str_concat_call (c2m_ctx_t c2m_ctx, MIR_op_t a, MIR_op_t b) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[5];
+
+  string_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, str_concat_proto);
+  args[1] = MIR_new_ref_op (ctx, str_concat_item);
+  args[2] = res.mir_op;
+  args[3] = a;
+  args[4] = b;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
+  return res;
+}
+
+/* Emit: res = <one-arg String conversion helper>(val).  `proto`/`item` select
+   the helper (all int-family helpers share str_from_i64_proto; the double
+   helper uses str_from_double_proto). */
+static op_t gen_str_from_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item,
+                               MIR_op_t val) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, proto);
+  args[1] = MIR_new_ref_op (ctx, item);
+  args[2] = res.mir_op;
+  args[3] = val;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
+/* Generate a single operand of a String `+` concatenation as a char* (I64).
+   String-valued operands are produced directly; arithmetic (basic) operands are
+   auto-cast to their textual representation via the c2m_str_from_* runtime. */
+static op_t gen_string_concat_operand (c2m_ctx_t c2m_ctx, node_t op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  struct expr *e = op->attr;
+  struct type *t = e == NULL ? NULL : e->type;
+  op_t v;
+
+  string_ensure_imports (c2m_ctx);
+  if (str_concat_string_operand_p (t, op) || (t != NULL && t->mode == TM_PTR)
+      || (t != NULL && t->mode == TM_ARR)) {
+    /* Already a string/char* value.  val_gen yields the pointer value for a
+       String/char* variable, the data address for a string literal, and the
+       decayed address for an array; force_reg lands it in a register. */
+    return force_reg (c2m_ctx, val_gen (c2m_ctx, op), MIR_T_I64);
+  }
+  /* Arithmetic basic type — auto-cast to a String. */
+  if (floating_type_p (t)) {
+    v = promote (c2m_ctx, val_gen (c2m_ctx, op), MIR_T_D, FALSE);
+    return gen_str_from_call (c2m_ctx, str_from_double_proto, str_from_double_item, v.mir_op);
+  }
+  if (t != NULL && t->mode == TM_BASIC && t->u.basic_type == TP_BOOL) {
+    v = promote (c2m_ctx, val_gen (c2m_ctx, op), MIR_T_I64, FALSE);
+    return gen_str_from_call (c2m_ctx, str_from_i64_proto, str_from_bool_item, v.mir_op);
+  }
+  if (char_type_p (t)) {
+    v = promote (c2m_ctx, val_gen (c2m_ctx, op), MIR_T_I64, FALSE);
+    return gen_str_from_call (c2m_ctx, str_from_i64_proto, str_from_char_item, v.mir_op);
+  }
+  v = promote (c2m_ctx, val_gen (c2m_ctx, op), MIR_T_I64, FALSE);
+  if (t != NULL && integer_type_p (t) && !signed_integer_type_p (t))
+    return gen_str_from_call (c2m_ctx, str_from_i64_proto, str_from_uint_item, v.mir_op);
+  return gen_str_from_call (c2m_ctx, str_from_i64_proto, str_from_int_item, v.mir_op);
 }
 
 /* Emit a call to the String runtime helper for method `sm` with `n` value
@@ -15937,47 +16242,68 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             if (i >= VARR_LENGTH (node_t, sym.defs)) /* No item yet or no decl with intializer: */
               decl->u.item = MIR_new_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
           }
-          /* Emit default member initializers for local class-typed variables */
-          if (decl->scope != top_scope && !decl->decl_spec.static_p
-              && decl->decl_spec.type->mode == TM_CLASS
-              && decl->decl_spec.type->u.tag_type != NULL) {
-            node_t tag = decl->decl_spec.type->u.tag_type;
-            node_t member_list = TAG_MEMBER_LIST (tag);
-            if (member_list && member_list->code != N_IGNORE) {
-              /* Ensure the id node has been checked so gen can resolve it */
-              if (id->attr == NULL) {
-                node_t saved_scope = curr_scope;
-                curr_scope = decl->scope;
-                check(c2m_ctx, id, NULL);
-                curr_scope = saved_scope;
-              }
-              /* Get the variable's address (fp + offset) */
-              var = gen(c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
-              for (node_t m = NL_HEAD(member_list->u.ops); m != NULL; m = NL_NEXT(m)) {
-                if (m->code != N_MEMBER) continue;
-                node_t m_init = MEMBER_INIT (m);
-                if (!m_init || m_init->code == N_IGNORE) continue;
-                decl_t m_decl = m->attr;
-                if (!m_decl) continue;
-                struct type *m_type = m_decl->decl_spec.type;
-                struct expr *init_expr = m_init->attr;
-                if (!init_expr || !m_type) continue;
-                /* Emit store: *(var_base + member_offset) = init_value */
-                MIR_type_t mt = get_mir_type(c2m_ctx, m_type);
-                op_t init_val;
-                if (init_expr->const_p && integer_type_p(m_type)) {
-                  /* Constant integer: emit directly without gen */
-                  init_val = new_op(NULL, MIR_new_int_op(ctx, init_expr->c.i_val));
-                } else {
-                  init_val = gen(c2m_ctx, m_init, NULL, NULL, TRUE, NULL, NULL);
+          /* Emit default member initializers for local class-typed variables.
+             Also handles arrays of class objects (e.g. `Mixed m[15];`): each
+             element is initialized in turn.  Without this, array elements keep
+             garbage in their members (notably String members, which then crash
+             at runtime when dereferenced). */
+          if (decl->scope != top_scope && !decl->decl_spec.static_p) {
+            struct type *var_type = decl->decl_spec.type;
+            struct type *elem_type = var_type;
+            while (elem_type->mode == TM_ARR) elem_type = elem_type->u.arr_type->el_type;
+            if (elem_type->mode == TM_CLASS && elem_type->u.tag_type != NULL) {
+              node_t tag = elem_type->u.tag_type;
+              node_t member_list = TAG_MEMBER_LIST (tag);
+              if (member_list && member_list->code != N_IGNORE) {
+                mir_size_t elem_size = type_size (c2m_ctx, elem_type);
+                mir_size_t total_size = type_size (c2m_ctx, var_type);
+                mir_size_t n_elems = elem_size == 0 ? 0 : total_size / elem_size;
+                /* Ensure the id node has been checked so gen can resolve it */
+                if (id->attr == NULL) {
+                  node_t saved_scope = curr_scope;
+                  curr_scope = decl->scope;
+                  check(c2m_ctx, id, NULL);
+                  curr_scope = saved_scope;
                 }
-                init_val = promote(c2m_ctx, init_val, mt, FALSE);
+                /* Get the variable's base address (fp + offset) */
+                var = gen(c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
                 assert(var.mir_op.mode == MIR_OP_MEM);
-                MIR_op_t dst = MIR_new_alias_mem_op(ctx, mt,
-                    var.mir_op.u.mem.disp + (MIR_disp_t)m_decl->offset,
-                    var.mir_op.u.mem.base, 0, 1,
-                    get_type_alias(c2m_ctx, m_type), 0);
-                emit2(c2m_ctx, tp_mov(mt), dst, init_val.mir_op);
+                /* Zero the whole object/array first so that members without an
+                   explicit default initializer (e.g. an unset String member)
+                   are well-defined null/zero rather than stack garbage.  A
+                   garbage String pointer would otherwise crash at runtime when
+                   dereferenced (printf %s, strlen, ...). */
+                if (var.mir_op.u.mem.index == 0 && total_size != 0)
+                  gen_memset (c2m_ctx, var.mir_op.u.mem.disp, var.mir_op.u.mem.base,
+                              total_size);
+                for (mir_size_t ei = 0; ei < n_elems; ei++) {
+                  mir_size_t elem_off = ei * elem_size;
+                  for (node_t m = NL_HEAD(member_list->u.ops); m != NULL; m = NL_NEXT(m)) {
+                    if (m->code != N_MEMBER) continue;
+                    node_t m_init = MEMBER_INIT (m);
+                    if (!m_init || m_init->code == N_IGNORE) continue;
+                    decl_t m_decl = m->attr;
+                    if (!m_decl) continue;
+                    struct type *m_type = m_decl->decl_spec.type;
+                    struct expr *init_expr = m_init->attr;
+                    if (!init_expr || !m_type) continue;
+                    /* Emit store: *(var_base + elem_off + member_offset) = init_value */
+                    MIR_type_t mt = get_mir_type(c2m_ctx, m_type);
+                    op_t init_val;
+                    if (init_expr->const_p && integer_type_p(m_type)) {
+                      /* Constant integer: emit directly without gen */
+                      init_val = new_op(NULL, MIR_new_int_op(ctx, init_expr->c.i_val));
+                    } else {
+                      init_val = gen(c2m_ctx, m_init, NULL, NULL, TRUE, NULL, NULL);
+                    }
+                    init_val = promote(c2m_ctx, init_val, mt, FALSE);
+                    MIR_op_t dst = MIR_new_alias_mem_op(ctx, mt,
+                        var.mir_op.u.mem.disp + (MIR_disp_t)(elem_off + m_decl->offset),
+                        var.mir_op.u.mem.base, 0, 1,
+                        get_type_alias(c2m_ctx, m_type), 0);
+                    emit2(c2m_ctx, tp_mov(mt), dst, init_val.mir_op);
+                  }
+                }
               }
             }
           }
@@ -16389,10 +16715,21 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     res = top_gen_last_op;
     break;
   }
-  case N_BLOCK:
+  case N_BLOCK: {
+    size_t defer_mark = VARR_LENGTH (node_t, defer_stmts);
+    MIR_insn_t last;
     emit_label (c2m_ctx, r);
     gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, FALSE, NULL, NULL);
+    /* Run this block's deferred statements (LIFO) on the fall-through exit.
+       Exits via return/break/continue already ran them at the jump, so skip if
+       the block ends in a terminator. */
+    last = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns);
+    if (last == NULL
+        || (last->code != MIR_RET && last->code != MIR_JRET && last->code != MIR_JMP))
+      gen_run_defers (c2m_ctx, defer_mark);
+    VARR_TRUNC (node_t, defer_stmts, defer_mark);
     break;
+  }
   case N_MODULE: gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL); break;  // ???
   case N_IF: {
     node_t expr = NL_EL (r->u.ops, 1);
@@ -16444,6 +16781,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct expr *e2;
     case_t c;
     MIR_label_t saved_break_label = break_label;
+    size_t saved_defer_break_mark = defer_break_mark;
     int signed_p, short_p;
     size_t len;
     mir_ullong range = 0;
@@ -16451,6 +16789,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
     break_label = MIR_new_label (ctx);
+    defer_break_mark = VARR_LENGTH (node_t, defer_stmts);
     case_reg_op = val_gen (c2m_ctx, expr);
     type = ((struct expr *) expr->attr)->type;
     signed_p = signed_integer_type_p (type);
@@ -16542,17 +16881,21 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     top_gen (c2m_ctx, stmt, NULL, NULL, NULL);
     emit_label_insn_opt (c2m_ctx, break_label);
     break_label = saved_break_label;
+    defer_break_mark = saved_defer_break_mark;
     break;
   }
   case N_DO: {
     node_t expr = NL_EL (r->u.ops, 1);
     node_t stmt = NL_NEXT (expr);
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
+    size_t saved_defer_break_mark = defer_break_mark;
+    size_t saved_defer_continue_mark = defer_continue_mark;
     MIR_label_t start_label = MIR_new_label (ctx);
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
     break_label = MIR_new_label (ctx);
+    defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
     emit_label (c2m_ctx, r);
     emit_label_insn_opt (c2m_ctx, start_label);
     gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
@@ -16561,6 +16904,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label_insn_opt (c2m_ctx, break_label);
     continue_label = saved_continue_label;
     break_label = saved_break_label;
+    defer_break_mark = saved_defer_break_mark;
+    defer_continue_mark = saved_defer_continue_mark;
     break;
   }
   case N_WHILE: {
@@ -16568,10 +16913,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     node_t stmt = NL_NEXT (expr);
     MIR_label_t stmt_label = MIR_new_label (ctx);
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
+    size_t saved_defer_break_mark = defer_break_mark;
+    size_t saved_defer_continue_mark = defer_continue_mark;
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
     break_label = MIR_new_label (ctx);
+    defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
     emit_label (c2m_ctx, r);
     emit_label_insn_opt (c2m_ctx, continue_label);
     top_gen (c2m_ctx, expr, stmt_label, break_label, NULL);
@@ -16581,6 +16929,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label_insn_opt (c2m_ctx, break_label);
     continue_label = saved_continue_label;
     break_label = saved_break_label;
+    defer_break_mark = saved_defer_break_mark;
+    defer_continue_mark = saved_defer_continue_mark;
     break;
   }
   case N_FOR: {
@@ -16590,10 +16940,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     node_t stmt = NL_NEXT (iter);
     MIR_label_t stmt_label = MIR_new_label (ctx);
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
+    size_t saved_defer_break_mark = defer_break_mark;
+    size_t saved_defer_continue_mark = defer_continue_mark;
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
     break_label = MIR_new_label (ctx);
+    defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
     emit_label (c2m_ctx, r);
     top_gen (c2m_ctx, init, NULL, NULL, NULL);
     if (cond->code != N_IGNORE) /* non-empty condition: */
@@ -16610,6 +16963,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label_insn_opt (c2m_ctx, break_label);
     continue_label = saved_continue_label;
     break_label = saved_break_label;
+    defer_break_mark = saved_defer_break_mark;
+    defer_continue_mark = saved_defer_continue_mark;
     break;
   }
   case N_IN: {
@@ -16642,8 +16997,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_label_t body_label = MIR_new_label (ctx);
     MIR_label_t saved_continue_label = continue_label;
     MIR_label_t saved_break_label = break_label;
+    size_t saved_defer_break_mark = defer_break_mark;
+    size_t saved_defer_continue_mark = defer_continue_mark;
     continue_label = MIR_new_label (ctx);
     break_label = MIR_new_label (ctx);
+    defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
     unsigned fsn = r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0;
 
     assert (false_label == NULL && true_label == NULL);
@@ -16770,6 +17128,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 
     continue_label = saved_continue_label;
     break_label = saved_break_label;
+    defer_break_mark = saved_defer_break_mark;
+    defer_continue_mark = saved_defer_continue_mark;
     break;
   }
   case N_GOTO: {
@@ -16792,11 +17152,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_CONTINUE:
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
+    gen_run_defers (c2m_ctx, defer_continue_mark); /* unwind loop-body defers */
     emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, continue_label));
     break;
   case N_BREAK:
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
+    gen_run_defers (c2m_ctx, defer_break_mark); /* unwind loop/switch-body defers */
     emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, break_label));
     break;
   case N_RETURN: {
@@ -16809,6 +17171,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
     if (NL_EL (r->u.ops, 1)->code == N_IGNORE) {
+      gen_run_defers (c2m_ctx, 0); /* run all pending defers before returning */
       if (str_scope_active) gen_str_release_to (c2m_ctx, str_scope_mark.mir_op);
       emit_insn (c2m_ctx, MIR_new_ret_insn (ctx, 0));
       break;
@@ -16825,6 +17188,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       t = promote_mir_int_type (t);
       val = promote (c2m_ctx, val, t, FALSE);
     }
+    gen_run_defers (c2m_ctx, 0); /* run all pending defers after computing result */
     /* Reclaim this scope's Strings before returning; protect a returned String
        so it survives into the caller's scope (no use-after-free). */
     if (str_scope_active) {
@@ -16844,92 +17208,61 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label (c2m_ctx, r);
     top_gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, NULL);
     break;
+  case N_DEFER:
+    /* Register the deferred statement; its code is emitted (LIFO) at scope exit
+       by gen_run_defers from N_BLOCK / N_RETURN / N_BREAK / N_CONTINUE. */
+    assert (false_label == NULL && true_label == NULL);
+    VARR_PUSH (node_t, defer_stmts, NL_EL (r->u.ops, 1));
+    break;
+  case N_DELETE: {
+    /* delete <ptr>: run the destructor (if any) then free the heap object. */
+    node_t expr = NL_EL (r->u.ops, 1);
+    node_t dtor_def = (node_t) r->attr; /* resolved in check, NULL if none */
+
+    assert (false_label == NULL && true_label == NULL);
+    emit_label (c2m_ctx, r);
+    op1 = val_gen (c2m_ctx, expr); /* the heap pointer */
+    op1 = force_reg (c2m_ctx, op1, MIR_T_I64); /* stable: used by dtor and free */
+    if (dtor_def != NULL) {
+      decl_t cdecl = dtor_def->attr;
+      struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+      MIR_item_t proto;
+      char pname[64];
+      size_t ops_start;
+
+      collect_args_and_func_types (c2m_ctx, ft);
+      sprintf (pname, "__dtorproto%d", new_proto_count++);
+      proto = MIR_new_proto_arr (ctx, pname,
+                                 VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                                 VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                                 VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                                 VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+      move_item_to_module_start (curr_func->module, proto);
+      ops_start = VARR_LENGTH (MIR_op_t, call_ops);
+      VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
+      VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, cdecl->u.item));
+      VARR_PUSH (MIR_op_t, call_ops, op1.mir_op); /* implicit 'this' */
+      emit_insn (c2m_ctx,
+                 MIR_new_insn_arr (ctx, MIR_CALL,
+                                   VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
+                                   VARR_ADDR (MIR_op_t, call_ops) + ops_start));
+      VARR_TRUNC (MIR_op_t, call_ops, ops_start);
+    }
+    gen_heap_free (c2m_ctx, op1.mir_op);
+    break;
+  }
   case N_CONCAT: {
-    // Get the two string operand nodes from the linked list
-    node_t str1_node = NL_HEAD(r->u.ops);         // First operand
-    node_t str2_node = NL_EL(r->u.ops, 1);        // Second operand
-    node_t str1data, str2data;
+    /* String `+` concatenation.  Each operand is lowered to a char* (string
+       operands directly, basic arithmetic operands auto-cast via the
+       c2m_str_from_* runtime), then joined with c2m_str_concat, which returns a
+       fresh tracked String buffer.  Nested concatenations compose naturally
+       because each N_CONCAT result is itself a String value. */
+    node_t op1_node = NL_HEAD (r->u.ops);
+    node_t op2_node = NL_EL (r->u.ops, 1);
+    op_t s1 = gen_string_concat_operand (c2m_ctx, op1_node);
+    op_t s2 = gen_string_concat_operand (c2m_ctx, op2_node);
 
-    // Get array values (returns N_STR)
-    if(str1_node->code == N_IND)
-        str1_node = get_array_member_id(c2m_ctx, str1_node);
-    if(str2_node->code == N_IND)
-        str2_node = get_array_member_id(c2m_ctx, str2_node);
-
-    // Check for static string first
-    if(str1_node && str1_node->code != N_STR && str1_node->u.ops.tail && str1_node->u.ops.tail->code == N_STR)
-    //if(str1_node && str1_node->code != N_STR)
-    //    if(str1_node->u.ops.tail && str1_node->u.ops.tail > 0x1000)
-    //        if(str1_node->u.ops.tail->code == N_STR)
-                str1_node = str1_node->u.ops.tail;
-
-    // Locate the N_ID nodes
-    if(str1_node->code != N_STR) {
-        for(; str1_node->code != N_ID && str1_node->u.ops.tail; str1_node = str1_node->u.ops.tail );
-        // Access the expression attributes for both strings
-        struct expr *e1 = str1_node->attr;
-        // Find the string2  N_STR
-        str1data = e1->u.lvalue_node;
-        for(; str1data && str1data->code != N_STR && str1data->u.ops.tail ; str1data = str1data->u.ops.tail );
-    } else {
-        str1data = str1_node;
-    }
-
-    // Check for static string first
-    if(str2_node && str2_node->code != N_STR && str2_node->u.ops.tail && str2_node->u.ops.tail->code == N_STR)
-    //if(str2_node && str2_node->code != N_STR)
-    //    if(str2_node->u.ops.tail && str2_node->u.ops.tail > 0x1000)
-    //        if(str2_node->u.ops.tail->code == N_STR)
-                str2_node = str2_node->u.ops.tail;
-
-    if(str2_node->code != N_STR) {
-        for(; str2_node->code != N_ID && str2_node->u.ops.tail; str2_node = str2_node->u.ops.tail )
-            {};
-        struct expr *e2 = str2_node->attr;
-        // Find the string2  N_STR
-        str2data = e2->u.lvalue_node;
-        for(; str2data && str2data != NULL && str2data->code != N_STR && str2data->u.ops.tail ; str2data = str2data->u.ops.tail );
-    } else {
-        str2data = str2_node;
-    }
-
-    if (str1data == NULL || str2data == NULL) {
-        warning (c2m_ctx, POS (r), "N_CONCAT MIR gen failure: invalid lvalue strings");
-        break;
-    }
-    
-    // Extract the string pointers and lengths
-    const char *str1 = str1data->u.s.s;    // Pointer to first string
-    size_t len1 = str1data->u.s.len-1;       // Length of first string
-    const char *str2 = str2data->u.s.s;    // Pointer to second string
-    size_t len2 = str2data->u.s.len;       // Length of second string
-    
-    // Calculate total length for the concatenated string, including null terminator
-    size_t total_len = len1 + len2;
-    
-    // Allocate stack space and get a unique temp register for the pointer
-    op_t stack_ptr_op = get_new_temp(c2m_ctx, MIR_T_I64);
-    MIR_reg_t stack_ptr_reg = stack_ptr_op.mir_op.u.reg;
-    MIR_append_insn(ctx, curr_func,
-                    MIR_new_insn(ctx, MIR_ALLOCA,
-                                 MIR_new_reg_op(ctx, stack_ptr_reg),
-                                 MIR_new_int_op(ctx, total_len)));
-    
-    // Copy the first string to the start of the allocated memory (offset 0)
-    gen_memcpy(c2m_ctx, 0, stack_ptr_reg, 
-               new_op(NULL, MIR_new_str_op(ctx, (MIR_str_t){len1, str1})), len1);
-    
-    // Copy the second string immediately after the first (offset len1)
-    gen_memcpy(c2m_ctx, len1, stack_ptr_reg, 
-               new_op(NULL, MIR_new_str_op(ctx, (MIR_str_t){len2, str2})), len2);
-    
-    // Add null terminator at the end (offset len1 + len2)
-    MIR_op_t mem_op = MIR_new_mem_op(ctx, MIR_T_I8, len1 + len2, stack_ptr_reg, 0, 1);
-    MIR_op_t null_op = MIR_new_int_op(ctx, 0);
-    emit2(c2m_ctx, MIR_MOV, mem_op, null_op);
-    
-    // Set the result to point to the concatenated string
-    res = new_op(NULL, MIR_new_reg_op(ctx, stack_ptr_reg));
+    res = gen_str_concat_call (c2m_ctx, s1.mir_op, s2.mir_op);
     break;
   }
   
@@ -17069,6 +17402,7 @@ static void gen_finish (c2m_ctx_t c2m_ctx) {
   if (switch_cases != NULL) VARR_DESTROY (case_t, switch_cases);
   if (init_els != NULL) VARR_DESTROY (init_el_t, init_els);
   if (node_stack != NULL) VARR_DESTROY (node_t, node_stack);
+  if (defer_stmts != NULL) VARR_DESTROY (node_t, defer_stmts);
   if(c2m_ctx->gen_ctx) {
       reg_free (c2m_ctx, c2m_ctx->gen_ctx);
   }
@@ -17093,6 +17427,7 @@ static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   VARR_CREATE (case_t, switch_cases, alloc, 64);
   VARR_CREATE (init_el_t, init_els, alloc, 128);
   VARR_CREATE (node_t, node_stack, alloc, 8);
+  VARR_CREATE (node_t, defer_stmts, alloc, 16);
   memset_proto = memset_item = memcpy_proto = memcpy_item = NULL;
   top_gen (c2m_ctx, r, NULL, NULL, NULL);
   gen_finish (c2m_ctx);
@@ -17125,7 +17460,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
-    C (IN); C (FORIN); C (NEW);
+    C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE);
   default: abort ();
   }
 #undef C
@@ -17398,6 +17733,8 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_CONTINUE:
   case N_BREAK:
   case N_RETURN:
+  case N_DEFER:
+  case N_DELETE:
   case N_EXPR:
   case N_CASE:
   case N_DEFAULT:

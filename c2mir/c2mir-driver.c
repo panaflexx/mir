@@ -490,6 +490,13 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_checkpoint") == 0) return (void *) c2m_str_checkpoint;
     if (strcmp (name, "c2m_str_release_to") == 0) return (void *) c2m_str_release_to;
     if (strcmp (name, "c2m_str_release_keeping") == 0) return (void *) c2m_str_release_keeping;
+    /* String '+' concatenation / basic-type auto-cast helpers */
+    if (strcmp (name, "c2m_str_concat") == 0) return (void *) c2m_str_concat;
+    if (strcmp (name, "c2m_str_from_int") == 0) return (void *) c2m_str_from_int;
+    if (strcmp (name, "c2m_str_from_uint") == 0) return (void *) c2m_str_from_uint;
+    if (strcmp (name, "c2m_str_from_bool") == 0) return (void *) c2m_str_from_bool;
+    if (strcmp (name, "c2m_str_from_char") == 0) return (void *) c2m_str_from_char;
+    if (strcmp (name, "c2m_str_from_double") == 0) return (void *) c2m_str_from_double;
     fprintf (stderr, "can not load symbol %s\n", name);
     close_std_libs ();
     exit (1);
