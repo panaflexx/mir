@@ -4563,6 +4563,24 @@ D (unary_expr) {
       args = new_node (c2m_ctx, N_LIST);
       if (!C (')')) {
         for (;;) {
+          /* Named argument:  name = value .  Stored as N_FIELD_ID(name, value);
+             the constructor call resolves it to positional order in check.
+             A single '=' (not '==') after an identifier marks it. */
+          if (C (T_ID)) {
+            size_t am = record_start (c2m_ctx);
+            node_t nm;
+            pos_t nmpos = curr_token->pos;
+            MN (T_ID, nm);
+            if (M ('=')) {
+              record_stop (c2m_ctx, am, FALSE); /* commit: named argument */
+              P (assign_expr);
+              op_append (c2m_ctx, args,
+                         new_pos_node2 (c2m_ctx, N_FIELD_ID, nmpos, nm, r));
+              if (!M (',')) break;
+              continue;
+            }
+            record_stop (c2m_ctx, am, TRUE); /* not named: rewind */
+          }
           P (assign_expr);
           op_append (c2m_ctx, args, r);
           if (!M (',')) break;
@@ -10098,6 +10116,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         char ctor_name[300];
         struct type *class_type;
 
+        int has_named = FALSE;
+
         class_def = find_def (c2m_ctx, S_REGULAR, type_id, curr_scope, NULL);
         e = create_expr (c2m_ctx, r);
         if (class_def == NULL || class_def->code != N_CLASS) {
@@ -10112,12 +10132,79 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         e->type->u.ptr_type = class_type;
         set_type_layout (c2m_ctx, e->type);
 
-        for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
-          check (c2m_ctx, arg, r);
-
         snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", type_id->u.s.s);
         ctor_id = build_id (c2m_ctx, ctor_name, POS (r));
         ctor_def = find_def (c2m_ctx, S_REGULAR, ctor_id, curr_scope, NULL);
+
+        for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
+          if (arg->code == N_FIELD_ID) has_named = TRUE;
+
+        /* Named arguments (new Foo(b=2, a=1)): reorder them into positional
+           order using the constructor's parameter names. */
+        if (has_named) {
+          if (ctor_def == NULL || ctor_def->code != N_FUNC_DEF) {
+            error (c2m_ctx, POS (r),
+                   "named arguments require a constructor for class '%s'", type_id->u.s.s);
+          } else {
+            decl_t cdecl = ctor_def->attr;
+            struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+            node_t reordered = new_node (c2m_ctx, N_LIST);
+            node_t a2;
+            param = NL_HEAD (ft->param_list->u.ops);
+            if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
+            for (; param != NULL; param = NL_NEXT (param)) {
+              node_t pdeclr = NL_EL (param->u.ops, 1);
+              node_t pid = (pdeclr != NULL && pdeclr->code == N_DECL)
+                             ? NL_HEAD (pdeclr->u.ops) : NULL;
+              const char *pname = (pid != NULL && pid->code == N_ID) ? pid->u.s.s : NULL;
+              node_t found_val = NULL, name_node = NULL;
+              for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL; a2 = NL_NEXT (a2)) {
+                node_t an;
+                if (a2->code != N_FIELD_ID) continue;
+                an = NL_HEAD (a2->u.ops);
+                if (pname != NULL && an->code == N_ID && NL_NEXT (an) != NULL
+                    && strcmp (an->u.s.s, pname) == 0) {
+                  name_node = an;
+                  found_val = NL_NEXT (an);
+                  break;
+                }
+              }
+              if (found_val == NULL) {
+                error (c2m_ctx, POS (r),
+                       "no argument provided for constructor parameter '%s'",
+                       pname != NULL ? pname : "?");
+              } else {
+                NL_REMOVE (a2->u.ops, found_val); /* detach value from its marker */
+                op_append (c2m_ctx, reordered, found_val);
+                (void) name_node;
+              }
+            }
+            /* Any named marker that still owns its value names an unknown param. */
+            for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL; a2 = NL_NEXT (a2)) {
+              node_t an;
+              if (a2->code != N_FIELD_ID) continue;
+              an = NL_HEAD (a2->u.ops);
+              if (NL_NEXT (an) != NULL)
+                error (c2m_ctx, POS (r), "unknown constructor parameter '%s'", an->u.s.s);
+            }
+            /* Replace arg_list contents with the positional value list. */
+            for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL;) {
+              node_t nx = NL_NEXT (a2);
+              NL_REMOVE (arg_list->u.ops, a2);
+              a2 = nx;
+            }
+            for (a2 = NL_HEAD (reordered->u.ops); a2 != NULL;) {
+              node_t nx = NL_NEXT (a2);
+              NL_REMOVE (reordered->u.ops, a2);
+              op_append (c2m_ctx, arg_list, a2);
+              a2 = nx;
+            }
+          }
+        }
+
+        for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
+          check (c2m_ctx, arg, r);
+
         if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
           decl_t cdecl = ctor_def->attr;
           struct func_type *ft = cdecl->decl_spec.type->u.func_type;
