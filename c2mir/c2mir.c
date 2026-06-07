@@ -5155,6 +5155,10 @@ DA (type_spec) {
         if (struct_p == 3) { // T_CLASS == 3
           node_t last_class = parse_ctx->curr_class;
           parse_ctx->curr_class = op1;
+          /* Register the class name as a typedef *before* parsing the body so a
+             method/member can refer to the class's own type (e.g. a method that
+             returns `ClassName *` for Go-style chaining, or a self-pointer). */
+          if (id_p) tpname_add (c2m_ctx, op1, curr_scope, TRUE);
           P (class_member_list);
           parse_ctx->curr_class = last_class;
         } else {
@@ -10904,18 +10908,25 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
               func_type = func_type_type->u.func_type;
               ret_type = func_type->ret_type;
 
-              // Create 'this' argument: use a copy of obj so we don't
-              // corrupt the N_FIELD/N_DEREF_FIELD node's child list.
+              // Create 'this' argument from a copy of obj (so we don't unlink
+              // obj from the N_FIELD/N_DEREF_FIELD child list).  The receiver is
+              // already checked, so we reuse its computed attr and do NOT re-run
+              // check on the copy: re-checking would re-execute side effects of a
+              // chained receiver (e.g. new Foo().withX(..).withY(..)), which for
+              // a method call would prepend 'this' to the shared arg list twice.
               node_t this_arg;
+              node_t obj_copy = copy_node(c2m_ctx, obj);
+              obj_copy->attr = obj->attr;
               if (op1->code == N_FIELD) {
-                // obj.method(): Pass address of a copy of the object node
-                node_t obj_copy = copy_node(c2m_ctx, obj);
+                // obj.method(): pass the address of the (value) class object.
                 this_arg = new_node1(c2m_ctx, N_ADDR, obj_copy);
-                check(c2m_ctx, this_arg, r);
+                struct expr *ae = create_expr(c2m_ctx, this_arg);
+                ae->type->mode = TM_PTR;
+                ae->type->u.ptr_type = obj_type;
+                set_type_layout(c2m_ctx, ae->type);
               } else {
-                // ptr->method(): Pass a copy of the pointer node
-                this_arg = copy_node(c2m_ctx, obj);
-                check(c2m_ctx, this_arg, r);
+                // ptr->method(): the receiver is already a pointer value.
+                this_arg = obj_copy;
               }
 
               // Prepend 'this' argument directly into the call's arg_list
