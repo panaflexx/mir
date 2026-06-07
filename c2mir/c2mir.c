@@ -672,6 +672,7 @@ typedef enum {
   REP8 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT),
   N_IN,     /* "key" in dict — existence check */
   N_FORIN,  /* for (auto var in dict) loop */
+  N_NEW,    /* new ClassName(args) — heap allocation + constructor call */
 } node_code_t;
 
 #undef REP_SEP
@@ -4542,9 +4543,38 @@ D (post_expr) {
 }
 
 D (unary_expr) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r, t;
   node_code_t code;
   pos_t pos;
+
+  /* new-expression:  new ClassName ( arg-list? )   — heap allocation + ctor.
+     `new` is a soft keyword: only treated specially when immediately followed
+     by `Identifier (`, so it stays usable as an ordinary C identifier. */
+  if (C_SOFT ("new")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t npos = curr_token->pos;
+    node_t tid = NULL;
+    M_SOFT ("new");
+    if (MN (T_ID, tid) && C ('(')) {
+      node_t args;
+      record_stop (c2m_ctx, mark, FALSE); /* commit: this is a new-expression */
+      M ('(');
+      args = new_node (c2m_ctx, N_LIST);
+      if (!C (')')) {
+        for (;;) {
+          P (assign_expr);
+          op_append (c2m_ctx, args, r);
+          if (!M (',')) break;
+        }
+      }
+      PT (')');
+      r = new_pos_node2 (c2m_ctx, N_NEW, npos, tid, args);
+      PA (post_expr_part, r); /* allow chaining: new Foo(..).method(..) */
+      return r;
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a new-expression: rewind */
+  }
 
   if ((r = TRY (par_type_name)) != err_node) {
     t = r;
@@ -4958,7 +4988,44 @@ D (class_member_declaration) {
   node_t r, spec, decl;
   
   if (c2m_options->debug_p) printf("class_member_declaration\n");
-  
+
+  /* Constructor:  ClassName ( params? ) { body }   (no return type).
+     Detected when an identifier matching the enclosing class name is followed
+     by '('.  Lowered to a method named "__ctor_<ClassName>" returning void; the
+     implicit 'this' parameter is prepended later like any other method. */
+  if (parse_ctx->curr_class != NULL && C (T_ID) && curr_token->repr != NULL
+      && strcmp (curr_token->repr, parse_ctx->curr_class->u.s.s) == 0) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t cpos = curr_token->pos;
+    M (T_ID); /* consume the class name */
+    if (C ('(')) {
+      node_t plist, func_node, decl_list, ctor_id, declr, cspec, block;
+      pos_t ppos;
+      char ctor_name[300];
+      record_stop (c2m_ctx, mark, FALSE); /* commit: this is a constructor */
+      MP ('(', ppos);
+      if ((r = TRY (param_type_list)) != err_node) {
+        plist = r;
+      } else {
+        P (id_list);
+        plist = r;
+      }
+      PT (')');
+      func_node = new_pos_node1 (c2m_ctx, N_FUNC, ppos, plist);
+      decl_list = new_node1 (c2m_ctx, N_LIST, func_node);
+      snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s",
+                parse_ctx->curr_class->u.s.s);
+      ctor_id = build_id (c2m_ctx, ctor_name, cpos);
+      declr = new_pos_node2 (c2m_ctx, N_DECL, cpos, ctor_id, decl_list);
+      cspec = new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_VOID, cpos));
+      P (compound_stmt);
+      block = r;
+      return build_func_def (c2m_ctx, cpos, cspec, declr,
+                             new_node (c2m_ctx, N_LIST), block);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a constructor: rewind */
+  }
+
   // Try static assertion first
   if (C(T_STATIC_ASSERT)) {
     P(st_assert);
@@ -4980,16 +5047,29 @@ D (class_member_declaration) {
 
       return build_func_def(c2m_ctx, POS(decl), spec, decl, new_node(c2m_ctx, N_LIST), r);
     } else {
-      // This is a data member - check for optional initializer
-      node_t member_init;
-      if (M('=')) {
-        P(initializer);
-        member_init = r;
-      } else {
-        member_init = new_node(c2m_ctx, N_IGNORE);
+      // One or more data members sharing `spec`, comma-separated:
+      //   type d1 [= init], d2 [= init], ... ;
+      // Each declarator becomes its own N_MEMBER; the shared spec is wrapped in
+      // N_SHARE by build_shared_member.  Returns an N_LIST that the caller
+      // flattens, so a single declaration can yield several members.
+      node_t members = new_node (c2m_ctx, N_LIST);
+      for (;;) {
+        node_t member_init;
+        if (M('=')) {
+          P(initializer);
+          member_init = r;
+        } else {
+          member_init = new_node(c2m_ctx, N_IGNORE);
+        }
+        op_append (c2m_ctx, members,
+                   build_shared_member (c2m_ctx, POS(decl), spec, decl, NULL, NULL,
+                                        member_init));
+        if (!M(',')) break;
+        P(declarator);
+        decl = r;
       }
       PT(';');
-      return build_shared_member(c2m_ctx, POS(decl), spec, decl, NULL, NULL, member_init);
+      return members;
     }
   }
   
@@ -5008,7 +5088,9 @@ D (class_member_declaration) {
   
   while (!C('}') && !C(T_EOFILE)) {
     P(class_member_declaration);
-    op_append(c2m_ctx, list, r);
+    /* A data-member declaration may yield several members (comma-separated);
+       flatten the returned N_LIST so each becomes a top-level class member. */
+    op_flat_append(c2m_ctx, list, r);
   }
 
   //class_add_this(c2m_ctx, list);
@@ -9344,6 +9426,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         REP8 (NODE_CASE, DEREF_FIELD, COND, INC, DEC, POST_INC, POST_DEC, ALIGNOF, SIZEOF)
         REP6 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC)
         NODE_CASE (IN)
+        NODE_CASE (NEW)
         *expr_attr_p = TRUE;
         break;
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
@@ -9997,6 +10080,64 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         e->type->u.basic_type = TP_INT;
         if (t2->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "right operand of 'in' must be a dict");
+        }
+        break;
+      }
+      case N_NEW: {
+        /* new ClassName(args): allocate on the heap and run the constructor.
+           children: type_id(0, N_ID of class), arg_list(1, N_LIST).
+           Result type is a pointer to the class.  e->def_node is set to the
+           constructor N_FUNC_DEF (or NULL when the class has none) for gen. */
+        node_t type_id = NL_HEAD (r->u.ops);
+        node_t arg_list = NL_NEXT (type_id);
+        node_t class_def, ctor_def, ctor_id, arg, param;
+        char ctor_name[300];
+        struct type *class_type;
+
+        class_def = find_def (c2m_ctx, S_REGULAR, type_id, curr_scope, NULL);
+        e = create_expr (c2m_ctx, r);
+        if (class_def == NULL || class_def->code != N_CLASS) {
+          error (c2m_ctx, POS (r), "'new' requires a class type, '%s' is not a class",
+                 type_id->u.s.s);
+          e->type->mode = TM_UNDEF;
+          break;
+        }
+        class_type = create_class_type (c2m_ctx, class_def);
+        set_class_layout (c2m_ctx, class_def, class_type);
+        e->type->mode = TM_PTR;
+        e->type->u.ptr_type = class_type;
+        set_type_layout (c2m_ctx, e->type);
+
+        for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
+          check (c2m_ctx, arg, r);
+
+        snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", type_id->u.s.s);
+        ctor_id = build_id (c2m_ctx, ctor_name, POS (r));
+        ctor_def = find_def (c2m_ctx, S_REGULAR, ctor_id, curr_scope, NULL);
+        if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
+          decl_t cdecl = ctor_def->attr;
+          struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+          e->def_node = ctor_def;
+          param = NL_HEAD (ft->param_list->u.ops);
+          if (param != NULL) param = NL_NEXT (param); /* skip implicit 'this' */
+          arg = NL_HEAD (arg_list->u.ops);
+          for (; arg != NULL && param != NULL;
+               arg = NL_NEXT (arg), param = NL_NEXT (param)) {
+            struct decl_spec *pds = get_param_decl_spec (param);
+            check_assignment_types (c2m_ctx, pds->type, NULL, arg->attr, r);
+          }
+          if (arg != NULL)
+            error (c2m_ctx, POS (r), "too many arguments to constructor of '%s'",
+                   type_id->u.s.s);
+          if (param != NULL)
+            error (c2m_ctx, POS (r), "too few arguments to constructor of '%s'",
+                   type_id->u.s.s);
+        } else {
+          e->def_node = NULL;
+          if (NL_HEAD (arg_list->u.ops) != NULL)
+            error (c2m_ctx, POS (r),
+                   "class '%s' has no constructor but arguments were given",
+                   type_id->u.s.s);
         }
         break;
       }
@@ -11014,8 +11155,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       create_decl (c2m_ctx, curr_scope, r, decl_spec, initializer,
                    context != NULL && context->code == N_FUNC);
       decl_t decl = r->attr;
-      // Set the type to TM_CLASS if the specifier is a class type
-      if (decl_spec.type->mode == TM_CLASS)
+      // Refresh the (laid-out) class type for a by-value class variable, but
+      // only when no pointer/array/function declarator was applied -- otherwise
+      // this would discard the pointer from `ClassName *p` (needed by `new`).
+      if (decl_spec.type->mode == TM_CLASS && decl->decl_spec.type->mode == TM_CLASS)
         decl->decl_spec.type = decl_spec.type;
 
       const char *antialias = check_attrs (c2m_ctx, r, decl, attrs, TRUE);
@@ -11814,6 +11957,9 @@ struct gen_ctx {
   VARR (init_el_t) * init_els;
   MIR_item_t memset_proto, memset_item;
   MIR_item_t memcpy_proto, memcpy_item;
+  /* heap allocation for `new ClassName(...)` */
+  MIR_item_t malloc_proto, malloc_item;
+  int new_proto_count; /* makes per-new constructor-call protos unique */
   /* dict runtime helpers */
   MIR_item_t dict_init_funcs[64]; /* generated __dict_init_* funcs */
   int dict_init_func_count;
@@ -11863,6 +12009,9 @@ struct gen_ctx {
 #define memset_item gen_ctx->memset_item
 #define memcpy_proto gen_ctx->memcpy_proto
 #define memcpy_item gen_ctx->memcpy_item
+#define malloc_proto gen_ctx->malloc_proto
+#define malloc_item gen_ctx->malloc_item
+#define new_proto_count gen_ctx->new_proto_count
 #define dict_init_funcs gen_ctx->dict_init_funcs
 #define dict_init_func_count gen_ctx->dict_init_func_count
 #define dict_create_object_proto gen_ctx->dict_create_object_proto
@@ -13474,6 +13623,34 @@ static void gen_memcpy (c2m_ctx_t c2m_ctx, MIR_disp_t disp, MIR_reg_t base, op_t
   args[4] = mem_to_address (c2m_ctx, val, FALSE).mir_op;
   args[5] = MIR_new_uint_op (ctx, len);
   emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6 /* args + proto + func + res */, args));
+}
+
+/* Emit a call to the C library malloc and return a temp register holding the
+   resulting pointer.  Used to back `new ClassName(...)` heap allocations. */
+static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+  op_t res;
+
+  if (malloc_item == NULL) {
+    MIR_type_t ret_type = MIR_T_I64;
+    MIR_var_t var;
+    MIR_module_t module = curr_func->module;
+    var.name = "size";
+    var.type = get_int_mir_type (sizeof (mir_size_t));
+    malloc_proto = MIR_new_proto_arr (ctx, "__new_malloc_p", 1, &ret_type, 1, &var);
+    malloc_item = MIR_new_import (ctx, "malloc");
+    move_item_to_module_start (module, malloc_proto);
+    move_item_to_module_start (module, malloc_item);
+  }
+  res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, malloc_proto);
+  args[1] = MIR_new_ref_op (ctx, malloc_item);
+  args[2] = res.mir_op;
+  args[3] = MIR_new_uint_op (ctx, size);
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
 }
 
 /* ========== Dict runtime call helpers ========== */
@@ -15180,6 +15357,59 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     res = var;
     break;
   }
+  case N_NEW: {
+    /* new ClassName(args): obj = malloc(sizeof(Class)); memset 0; ctor(obj,args). */
+    struct expr *ne = r->attr;
+    node_t type_id = NL_HEAD (r->u.ops);
+    node_t arg_list = NL_NEXT (type_id);
+    node_t ctor_def = ne->def_node;
+    struct type *class_type = ne->type->u.ptr_type;
+    mir_size_t csize = type_size (c2m_ctx, class_type);
+    op_t obj = gen_heap_alloc (c2m_ctx, csize == 0 ? 1 : csize);
+
+    if (csize > 0) gen_memset (c2m_ctx, 0, obj.mir_op.u.reg, csize);
+    if (ctor_def != NULL) {
+      decl_t cdecl = ctor_def->attr;
+      struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+      MIR_item_t proto;
+      char pname[64];
+      size_t ops_start;
+      node_t param;
+
+      collect_args_and_func_types (c2m_ctx, ft);
+      sprintf (pname, "__ctorproto%d", new_proto_count++);
+      proto = MIR_new_proto_arr (ctx, pname,
+                                 VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                                 VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                                 VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                                 VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+      move_item_to_module_start (curr_func->module, proto);
+      ops_start = VARR_LENGTH (MIR_op_t, call_ops);
+      VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
+      VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, cdecl->u.item));
+      VARR_PUSH (MIR_op_t, call_ops, obj.mir_op); /* implicit 'this' */
+      param = NL_HEAD (ft->param_list->u.ops);
+      if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
+      for (node_t a = NL_HEAD (arg_list->u.ops); a != NULL; a = NL_NEXT (a)) {
+        op_t av = val_gen (c2m_ctx, a);
+        if (param != NULL) {
+          struct decl_spec *pds = get_param_decl_spec (param);
+          if (scalar_type_p (pds->type))
+            av = promote (c2m_ctx, av,
+                          promote_mir_int_type (get_mir_type (c2m_ctx, pds->type)), FALSE);
+          param = NL_NEXT (param);
+        }
+        VARR_PUSH (MIR_op_t, call_ops, av.mir_op);
+      }
+      emit_insn (c2m_ctx,
+                 MIR_new_insn_arr (ctx, MIR_CALL,
+                                   VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
+                                   VARR_ADDR (MIR_op_t, call_ops) + ops_start));
+      VARR_TRUNC (MIR_op_t, call_ops, ops_start);
+    }
+    res = obj;
+    break;
+  }
   case N_CALL: {
     node_t func = NL_HEAD (r->u.ops), param_list, param, args = NL_EL (r->u.ops, 1), first_arg;
     struct decl_spec *decl_spec;
@@ -15724,6 +15954,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                    && decl->scope != top_scope) {
           /* Local dict scalar initializer: dict d = expr;
              Evaluate the expression and store the pointer. */
+          if (id->attr == NULL) {
+            node_t saved_scope = curr_scope;
+            curr_scope = decl->scope;
+            check (c2m_ctx, id, NULL);
+            curr_scope = saved_scope;
+          }
+          var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+          op_t val_op = val_gen (c2m_ctx, initializer);
+          emit2 (c2m_ctx, MIR_MOV, var.mir_op, val_op.mir_op);
+        } else if (initializer->code == N_NEW && decl->scope != top_scope) {
+          /* Local:  ClassType *p = new ClassType(...);
+             The result of `new` is a heap pointer (an ordinary scalar value);
+             evaluate it and store directly, bypassing the aggregate
+             collect_init_els path (which is for constant/braced initializers). */
           if (id->attr == NULL) {
             node_t saved_scope = curr_scope;
             curr_scope = decl->scope;
@@ -16783,7 +17027,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
-    C (IN); C (FORIN);
+    C (IN); C (FORIN); C (NEW);
   default: abort ();
   }
 #undef C
@@ -17043,6 +17287,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_STMTEXPR:
   case N_LABEL_ADDR:
   case N_IN:
+  case N_NEW:
     if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
     fprintf (f, "\n");
     print_ops (c2m_ctx, f, n, indent, attr_p);
