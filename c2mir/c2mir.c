@@ -9631,7 +9631,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         } else if (op1->code == N_CLASS) {
           // Class type usage (e.g., "class myClass *this")
           decl = op1->attr;
-          if (!decl || decl->decl_spec.type->mode != TM_CLASS) {
+          if (!decl || !decl->decl_spec.type || decl->decl_spec.type->mode != TM_CLASS) {
               error (c2m_ctx, POS (r), "invalid class definition for %s", r->u.s.s);
           } else {
               decl->used_p = TRUE;
