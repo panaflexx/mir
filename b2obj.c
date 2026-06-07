@@ -9,8 +9,28 @@
 #include <elf.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "mir-alloc-default.c"
 #include "mir-gen.h"  // mir.h gets included as well
+
+/* Debug tracing: enabled when B2OBJ_DEBUG is set in the environment. */
+static int b2obj_debug = -1;
+static double b2obj_t0 = 0.0;
+static double b2obj_now (void) {
+    struct timespec ts;
+    clock_gettime (CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+#define DBG(...) do {                                            \
+    if (b2obj_debug < 0) b2obj_debug = getenv ("B2OBJ_DEBUG") != NULL; \
+    if (b2obj_debug) {                                           \
+        if (b2obj_t0 == 0.0) b2obj_t0 = b2obj_now ();            \
+        fprintf (stderr, "[b2obj +%7.3fs] ", b2obj_now () - b2obj_t0); \
+        fprintf (stderr, __VA_ARGS__);                           \
+        fputc ('\n', stderr);                                    \
+        fflush (stderr);                                         \
+    }                                                            \
+} while (0)
 
 #define MIR_TYPE_INTERP 1
 #define MIR_TYPE_INTERP_NAME "interp"
@@ -222,9 +242,11 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "_MIR_set_code") == 0) return _MIR_set_code;
 #endif
 #endif
-    fprintf (stderr, "can not load symbol %s\n", name);
-    close_std_libs ();
-    exit (1);
+    /* Not found in any shared library.  For ahead-of-time object generation
+       this is normal: the symbol is likely defined in another object file
+       (or in a library) that the final linker will resolve.  Return NULL so
+       the caller can substitute a placeholder address. */
+    return NULL;
   }
   return sym;
 }
@@ -315,12 +337,17 @@ typedef struct {
 
 static symbol_list_t symbols = {0};
 
-void *hybrid_import_resolver(const char *name) {
-    // Call the original resolver to get the real address
-    void *addr = import_resolver(name);
+/* Placeholder address handed to MIR_link for symbols that are not present in
+   any loaded shared library.  Such symbols are emitted as undefined in the
+   object file and resolved by the final linker; the concrete address used here
+   is never relied upon, because relocations are emitted by symbol name. */
+static char aot_undef_placeholder;
 
-	printf("hybrid_import_resolver: importing %s at %p\n", name, addr);
-    
+void *hybrid_import_resolver(const char *name) {
+    // Call the original resolver to get the real address (NULL if not found)
+    void *addr = import_resolver(name);
+    if (addr == NULL) addr = &aot_undef_placeholder; /* keep MIR_link happy */
+
     // Record the symbol and its address
     if (symbols.n_entries >= symbols.capacity) {
         symbols.capacity = symbols.capacity ? symbols.capacity * 2 : 16;
@@ -329,8 +356,8 @@ void *hybrid_import_resolver(const char *name) {
     symbols.entries[symbols.n_entries].symbol = strdup(name);  // Duplicate to manage memory
     symbols.entries[symbols.n_entries].addr = addr;
     symbols.n_entries++;
-    
-    return addr;  // Return real address for MIR_link
+
+    return addr;  // Return address for MIR_link (real or placeholder)
 }
 
 /* ================================================================== */
@@ -425,6 +452,34 @@ static int name_set_find(name_set_t *s, const char *name, size_t *idx) {
 }
 
 /* ================================================================== */
+/*  Map internal MIR builtin names to real, linkable symbols           */
+/* ================================================================== */
+/*
+ * The code generator emits calls to internal "mir.*" builtin functions
+ * (e.g. for passing aggregates by value or for va_arg).  At JIT time these
+ * resolve to in-process addresses, but in an object file they must reference
+ * the real backing function so the system linker can resolve them.
+ */
+static const char *map_symbol(const char *name) {
+    if (name == NULL) return name;
+    static const struct { const char *from; const char *to; } map[] = {
+        /* aggregate-by-value copy: backed by libc memcpy */
+        { "mir.arg_memcpy",   "memcpy" },
+        /* varargs helpers: exported from the MIR core library (mir.o) */
+        { "mir.va_arg",       "va_arg_builtin" },
+        { "mir.va_block_arg", "va_block_arg_builtin" },
+        /* conversion helpers: provided by mir-aot-runtime.c */
+        { "mir.ui2f",         "mir_aot_ui2f" },
+        { "mir.ui2d",         "mir_aot_ui2d" },
+        { "mir.ui2ld",        "mir_aot_ui2ld" },
+        { "mir.ld2i",         "mir_aot_ld2i" },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (strcmp(name, map[i].from) == 0) return map[i].to;
+    return name;
+}
+
+/* ================================================================== */
 /*  create_object_file_from_module                                     */
 /*  Walks all items in all modules, generates code, collects data/bss, */
 /*  builds ELF sections, and writes a valid ELF64 relocatable object.  */
@@ -439,6 +494,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     name_set_t imports = {0};
 
     /* ----- Phase 1a: Generate machine code for all functions ----- */
+    DBG("phase 1a: generating machine code for all functions");
+    size_t gen_count = 0;
     for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
          module != NULL;
          module = DLIST_NEXT(MIR_module_t, module)) {
@@ -447,11 +504,14 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
              item = DLIST_NEXT(MIR_item_t, item)) {
             if (item->item_type == MIR_func_item) {
                 MIR_gen(ctx, item);
+                if ((++gen_count % 200) == 0) DBG("  phase 1a: %zu functions generated", gen_count);
             }
         }
     }
+    DBG("phase 1a done: %zu functions", gen_count);
 
     /* ----- Phase 1b: Collect all items (including those created by MIR_gen) ----- */
+    DBG("phase 1b: collecting items");
     for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
          module != NULL;
          module = DLIST_NEXT(MIR_module_t, module)) {
@@ -466,7 +526,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 break;
 
             case MIR_import_item:
-                name_set_find_or_add(&imports, item->u.import_id);
+                name_set_find_or_add(&imports, map_symbol(item->u.import_id));
                 break;
 
             case MIR_func_item: {
@@ -486,14 +546,17 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 memcpy(fe->code, f->machine_code, fe->code_len);
                 fe->text_offset = 0;
                 fe->item = item;
-                printf("  func: %s  code_len=%zu\n", f->name, fe->code_len);
+                DBG("  func: %s  code_len=%zu", f->name, fe->code_len);
                 break;
             }
 
             case MIR_data_item: {
                 MIR_data_t d = item->u.data;
                 size_t sz = d->nel * _MIR_type_size(ctx, d->el_type);
-                if (sz == 0) break;
+                /* Drop only anonymous empty data; a *named* zero-length item
+                   (e.g. an unused __func__ array) must still define a symbol so
+                   that code referencing its address can be linked. */
+                if (sz == 0 && d->name == NULL) break;
                 if (n_datas >= cap_datas) {
                     cap_datas = cap_datas ? cap_datas * 2 : 32;
                     datas = realloc(datas, cap_datas * sizeof(data_entry_t));
@@ -501,14 +564,14 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 data_entry_t *de = &datas[n_datas++];
                 de->name = d->name;
                 de->size = sz;
-                de->bytes = malloc(sz);
-                memcpy(de->bytes, d->u.els, sz);
+                de->bytes = sz ? malloc(sz) : NULL;
+                if (sz) memcpy(de->bytes, d->u.els, sz);
                 de->data_offset = 0;
                 de->is_ref_data = 0;
                 de->ref_item = NULL;
                 de->ref_disp = 0;
                 de->item_addr = item->addr;
-                printf("  data: %s  size=%zu  addr=%p\n", d->name ? d->name : "(anon)", sz, item->addr);
+                DBG("  data: %s  size=%zu  addr=%p", d->name ? d->name : "(anon)", sz, item->addr);
                 break;
             }
 
@@ -527,9 +590,9 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 de->ref_item = rd->ref_item;
                 de->ref_disp = rd->disp;
                 de->item_addr = item->addr;
-                printf("  ref_data: %s -> %s + %ld\n",
-                       rd->name ? rd->name : "(anon)",
-                       MIR_item_name(ctx, rd->ref_item), (long)rd->disp);
+                DBG("  ref_data: %s -> %s + %ld",
+                    rd->name ? rd->name : "(anon)",
+                    MIR_item_name(ctx, rd->ref_item), (long)rd->disp);
                 break;
             }
 
@@ -545,7 +608,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 be->bss_offset = 0;
                 be->item_addr = item->addr;
                 if (b->name)
-                    printf("  bss: %s  len=%lu  addr=%p\n", b->name, (unsigned long)b->len, item->addr);
+                    DBG("  bss: %s  len=%lu  addr=%p", b->name, (unsigned long)b->len, item->addr);
                 break;
             }
 
@@ -562,6 +625,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     }
 
     /* ----- Phase 2: assign offsets within sections ----- */
+    DBG("phase 1b done: %zu funcs, %zu datas, %zu bsses", n_funcs, n_datas, n_bsses);
+    DBG("phase 2: assigning section offsets and building buffers");
 
     /* .text: concatenate all function codes (16-byte aligned) */
     size_t text_size = 0;
@@ -595,82 +660,43 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* Build .data data buffer */
     uint8_t *data_buf = calloc(1, data_size ? data_size : 1);
     for (size_t i = 0; i < n_datas; i++)
-        memcpy(data_buf + datas[i].data_offset, datas[i].bytes, datas[i].size);
+        if (datas[i].size) memcpy(data_buf + datas[i].data_offset, datas[i].bytes, datas[i].size);
 
-    /* ----- Phase 2b: collect relocations by scanning for embedded addresses ----- */
+    DBG("phase 2b: collecting relocations from generator");
+    /* ----- Phase 2b: collect .text relocations from the code generator ----- */
 
-    /* Build address-to-symbol map from all MIR items */
-    typedef struct { uint64_t addr; const char *name; int in_text; /* 0=data/bss, 1=text */ } addr_sym_t;
-    addr_sym_t *addr_map = NULL;
-    size_t n_addr_map = 0, cap_addr_map = 0;
-
-    #define ADDR_MAP_ADD(a, n, sec) do { \
-        if (n_addr_map >= cap_addr_map) { \
-            cap_addr_map = cap_addr_map ? cap_addr_map * 2 : 128; \
-            addr_map = realloc(addr_map, cap_addr_map * sizeof(addr_sym_t)); \
-        } \
-        addr_map[n_addr_map].addr = (uint64_t)(uintptr_t)(a); \
-        addr_map[n_addr_map].name = (n); \
-        addr_map[n_addr_map].in_text = (sec); \
-        n_addr_map++; \
-    } while(0)
-
-    /* Add collected data/bss items' loaded addresses */
-    for (size_t i = 0; i < n_datas; i++) {
-        if (datas[i].item_addr && datas[i].name)
-            ADDR_MAP_ADD(datas[i].item_addr, datas[i].name, 0);
-    }
-    for (size_t i = 0; i < n_bsses; i++) {
-        if (bsses[i].item_addr && bsses[i].name)
-            ADDR_MAP_ADD(bsses[i].item_addr, bsses[i].name, 0);
-    }
-    /* Add function call_addr (thunks) for inter-function refs */
-    for (size_t i = 0; i < n_funcs; i++) {
-        if (funcs[i].item && funcs[i].item->addr)
-            ADDR_MAP_ADD(funcs[i].item->addr, funcs[i].name, 1);
-    }
-
-    /* Add imported symbol addresses (from hybrid_import_resolver records) */
-    for (size_t si = 0; si < symbols.n_entries; si++) {
-        if (symbols.entries[si].addr)
-            ADDR_MAP_ADD(symbols.entries[si].addr, symbols.entries[si].symbol, 0);
-    }
-
-    /* Scan each function's code for embedded absolute 8-byte addresses */
+    /*
+     * The MIR code generator (run with MIR_gen_set_save_relocs) records, for
+     * each function, the exact code offsets that reference external symbols
+     * along with the symbol name.  These are far more reliable than scanning
+     * the machine code for embedded addresses, because some references (e.g.
+     * string literals with reserved ".lc" names) do not embed the symbol's
+     * loaded address at all.
+     */
     for (size_t fi = 0; fi < n_funcs; fi++) {
-        uint8_t *fc = text_buf + funcs[fi].text_offset;
-        size_t flen = funcs[fi].code_len;
-        for (size_t i = 0; i + 7 < flen; i++) {
-            uint64_t val;
-            memcpy(&val, fc + i, 8);
-            if (val < 0x10000) continue; /* skip small values */
-            for (size_t j = 0; j < n_addr_map; j++) {
-                if (val == addr_map[j].addr) {
-                    if (n_relocs >= cap_relocs) {
-                        cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
-                        relocs = realloc(relocs, cap_relocs * sizeof(elf_reloc_t));
-                    }
-                    elf_reloc_t *er = &relocs[n_relocs++];
-                    er->offset = funcs[fi].text_offset + i;
-                    er->symbol = addr_map[j].name;
-                    er->type = R_X86_64_64;
-                    er->addend = 0;
-                    er->in_data = 0;
-                    /* Zero out the 8 bytes in the text buffer */
-                    memset(fc + i, 0, 8);
-                    i += 7; /* skip past the matched bytes */
-                    break;
-                }
+        MIR_func_t f = funcs[fi].item->u.func;
+        if (f->relocs == NULL) continue;
+        size_t nr = VARR_LENGTH(MIR_code_reloc_t, f->relocs);
+        for (size_t ri = 0; ri < nr; ri++) {
+            MIR_code_reloc_t cr = VARR_GET(MIR_code_reloc_t, f->relocs, ri);
+            if (cr.symbol == NULL) continue;
+            if (n_relocs >= cap_relocs) {
+                cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
+                relocs = realloc(relocs, cap_relocs * sizeof(elf_reloc_t));
             }
+            elf_reloc_t *er = &relocs[n_relocs++];
+            er->offset = funcs[fi].text_offset + cr.offset;
+            er->symbol = map_symbol(cr.symbol);
+            er->type   = cr.type;
+            er->addend = cr.addend;
+            er->in_data = 0;
         }
     }
-    free(addr_map);
-    #undef ADDR_MAP_ADD
 
     /* .data relocations from ref_data items */
     for (size_t i = 0; i < n_datas; i++) {
         if (!datas[i].is_ref_data) continue;
-        const char *target_name = MIR_item_name(ctx, datas[i].ref_item);
+        const char *target_name = map_symbol(MIR_item_name(ctx, datas[i].ref_item));
         if (!target_name) continue;
         if (n_relocs >= cap_relocs) {
             cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
@@ -685,6 +711,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         /* The 8 bytes in data_buf are already zero (calloc) */
     }
 
+    DBG("phase 2b done: %zu relocations", n_relocs);
     /* ----- Phase 3: build string tables and symbol table ----- */
 
     /*
@@ -939,6 +966,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
             rela_text[rt_idx++] = r;
     }
 
+    DBG("phase 3 done: %zu symbols", n_syms);
     /* ----- Phase 4: compute file layout and write ELF ----- */
 
     /* File layout:
@@ -1095,6 +1123,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     ehdr.e_shstrndx  = SEC_SHSTRTAB;
 
     /* ----- Write to file ----- */
+    DBG("phase 4: writing ELF file");
     int fd = open(output_file, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         perror("Failed to open output file");
@@ -1152,13 +1181,13 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
 
     close(fd);
 
-    printf("Wrote ELF object: %s\n", output_file);
-    printf("  .text:  %zu bytes, %zu functions\n", text_size, n_funcs);
-    printf("  .data:  %zu bytes, %zu items\n", data_size, n_datas);
-    printf("  .bss:   %zu bytes, %zu items\n", bss_size, n_bsses);
-    printf("  .rela.text: %zu entries\n", n_rela_text);
-    printf("  .rela.data: %zu entries\n", n_rela_data);
-    printf("  symtab: %zu symbols (first_global=%zu)\n", n_syms, first_global);
+    DBG("wrote ELF object: %s", output_file);
+    DBG("  .text:  %zu bytes, %zu functions", text_size, n_funcs);
+    DBG("  .data:  %zu bytes, %zu items", data_size, n_datas);
+    DBG("  .bss:   %zu bytes, %zu items", bss_size, n_bsses);
+    DBG("  .rela.text: %zu entries", n_rela_text);
+    DBG("  .rela.data: %zu entries", n_rela_data);
+    DBG("  symtab: %zu symbols (first_global=%zu)", n_syms, first_global);
 
     /* ----- Cleanup ----- */
     free(text_buf);
@@ -1211,33 +1240,52 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    DBG("reading MIR from %s", mir_input_file);
     MIR_read(ctx, fp);
     fclose(fp);
+    DBG("MIR_read done");
 
     /* Load all modules */
+    size_t n_modules = 0, n_funcs_total = 0;
     for (MIR_module_t module = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
          module != NULL;
          module = DLIST_NEXT(MIR_module_t, module)) {
-        printf("Loading module: %s\n", module->name);
+        n_modules++;
         for (MIR_item_t item = DLIST_HEAD(MIR_item_t, module->items);
              item != NULL;
              item = DLIST_NEXT(MIR_item_t, item)) {
             if (item->item_type == MIR_func_item)
-                printf("  found function: %s\n", item->u.func->name);
+                n_funcs_total++;
         }
         MIR_load_module(ctx, module);
     }
+    DBG("loaded %zu module(s), %zu function(s) total", n_modules, n_funcs_total);
 
     open_std_libs();
     open_extra_libs();
+    DBG("opened libraries");
 
     /* Initialize code generator and link */
     MIR_gen_init(ctx);
     MIR_gen_set_save_relocs(ctx, 1);
+    {
+        /* Optimisation level for code generation.  The MIR generator's default
+           is 2 (GVN/CCP), but that pass can be extremely slow on large inputs
+           (e.g. self-compiling c2mir.c).  Level 1 (register allocation +
+           combiner) is a good default for ahead-of-time builds: it optimises
+           well and completes quickly.  Override with the B2OBJ_OPT env var. */
+        const char *opt = getenv("B2OBJ_OPT");
+        int level = opt != NULL ? atoi(opt) : 1;
+        MIR_gen_set_optimize_level(ctx, (unsigned)level);
+        DBG("optimize level = %d", level);
+    }
+    DBG("starting MIR_link (eager code generation of all functions)");
     MIR_link(ctx, MIR_set_gen_interface, hybrid_import_resolver);
+    DBG("MIR_link done (all functions generated)");
 
     /* Generate code for all functions and write the ELF object */
     create_object_file_from_module(ctx, output_file);
+    DBG("create_object_file_from_module done");
 
     MIR_gen_finish(ctx);
 

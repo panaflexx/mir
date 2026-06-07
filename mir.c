@@ -1417,6 +1417,8 @@ static MIR_item_t new_func_arr (MIR_context_t ctx, const char *name, size_t nres
   func->expr_p = func->jret_p = FALSE;
   func->n_inlines = 0;
   func->machine_code = func->call_addr = NULL;
+  func->machine_code_len = 0;
+  func->relocs = NULL;
   func->first_lref = NULL;
   func_regs_init (ctx, func);
   for (size_t i = 0; i < nargs; i++) {
@@ -4468,6 +4470,13 @@ void _MIR_update_code_arr (MIR_context_t ctx, uint8_t *base, size_t nloc,
   len = (size_t) base + max_offset + sizeof (void *) - start;
   _MIR_set_code (ctx->code_alloc, start, len, base, nloc, relocs, 0);
   _MIR_flush_code_cache (base, base + max_offset + sizeof (void *));
+}
+
+void _MIR_set_func_code_relocs (MIR_context_t ctx, MIR_func_t func,
+                                const MIR_code_reloc_t *relocs, size_t n) {
+  if (func->relocs == NULL) VARR_CREATE (MIR_code_reloc_t, func->relocs, ctx->alloc, n == 0 ? 1 : n);
+  VARR_TRUNC (MIR_code_reloc_t, func->relocs, 0);
+  for (size_t i = 0; i < n; i++) VARR_PUSH (MIR_code_reloc_t, func->relocs, relocs[i]);
 }
 
 void _MIR_update_code (MIR_context_t ctx, uint8_t *base, size_t nloc, ...) { /* thread safe */

@@ -4890,7 +4890,7 @@ D (attr_spec) {
 DA (declaration_specs) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t list, r, prev_type_spec = NULL;
-  int first_p;
+  int first_p, auto_seen = FALSE;
   pos_t pos = curr_token->pos, spec_pos;
 
   list = new_node (c2m_ctx, N_LIST);
@@ -4899,6 +4899,7 @@ DA (declaration_specs) {
     if (C (T_ALIGNAS)) {
       P (align_spec);
     } else if ((r = TRY (sc_spec)) != err_node) {
+      if (r != NULL && r->code == N_AUTO) auto_seen = TRUE;
     } else if ((r = TRY (type_qual)) != err_node) {
     } else if ((r = TRY (func_spec)) != err_node) {
     } else if (first_p) {
@@ -4912,11 +4913,13 @@ DA (declaration_specs) {
       break;
     op_append (c2m_ctx, list, r);
   }
-  if (prev_type_spec == NULL && arg != NULL) {
+  if (prev_type_spec == NULL && arg != NULL && !auto_seen) {
     if (c2m_options->pedantic_p) warning (c2m_ctx, pos, "type defaults to int");
     r = new_pos_node (c2m_ctx, N_INT, pos);
     op_append (c2m_ctx, list, r);
   }
+  /* `auto x = init;` with no type spec: leave the type unspecified so the
+     semantic phase can infer it from the initializer. */
   return list;
 }
 
@@ -7866,8 +7869,11 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
     }
   if (type->mode == TM_BASIC && type->u.basic_type == TP_UNDEF) {
     if (size == 0 && sign == 0) {
-      (c2m_options->pedantic_p ? error (c2m_ctx, POS (r), "no any type specifier")
-                               : warning (c2m_ctx, POS (r), "type defaults to int"));
+      /* `auto x = init;` has no type specifier on purpose: the type is inferred
+         from the initializer later, so don't warn about defaulting to int. */
+      if (!res->auto_p)
+        (c2m_options->pedantic_p ? error (c2m_ctx, POS (r), "no any type specifier")
+                                 : warning (c2m_ctx, POS (r), "type defaults to int"));
       type->u.basic_type = TP_INT;
     } else if (size == 0) {
       type->u.basic_type = sign >= 0 ? TP_INT : TP_UINT;
@@ -9518,6 +9524,26 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       }
     }
 
+    /* TRUE iff a declaration-specifier list explicitly names a type (rather than
+       relying on the implicit int default).  Used to recognise inferred
+       declarations of the form  auto x = init; */
+    static int specs_have_type_spec_p (node_t specs) {
+      if (specs == NULL) return FALSE;
+      node_t list = UNSHARE (specs);
+      if (list == NULL || list->code != N_LIST) return FALSE;
+      for (node_t n = NL_HEAD (list->u.ops); n != NULL; n = NL_NEXT (n)) {
+        switch (n->code) {
+        case N_VOID: case N_CHAR: case N_SHORT: case N_INT: case N_LONG:
+        case N_FLOAT: case N_DOUBLE: case N_SIGNED: case N_UNSIGNED: case N_BOOL:
+        case N_STRUCT: case N_UNION: case N_CLASS: case N_ENUM:
+        case N_DICT: case N_STRING: case N_ID:
+          return TRUE;
+        default: break;
+        }
+      }
+      return FALSE;
+    }
+
     static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
       node_t op1, op2;
@@ -9629,15 +9655,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           *e->type = *decl->decl_spec.type;
           if (e->type->mode != TM_FUNC) e->u.lvalue_node = op1;
         } else if (op1->code == N_CLASS) {
-          // Class type usage (e.g., "class myClass *this")
-          decl = op1->attr;
-          if (!decl || !decl->decl_spec.type || decl->decl_spec.type->mode != TM_CLASS) {
-              error (c2m_ctx, POS (r), "invalid class definition for %s", r->u.s.s);
-          } else {
-              decl->used_p = TRUE;
-              *e->type = *decl->decl_spec.type;
-              if (e->type->mode != TM_FUNC) e->u.lvalue_node = op1;
-          }
+          // Bare class name used as namespace for static members (e.g. Fruit.variants or direct Fruit.Apple for const)
+          e->type->mode = TM_CLASS;
+          e->type->u.tag_type = op1;
+          e->def_node = op1;
         } else if (op1->code == N_FUNC_DEF) {
           decl = op1->attr;
           decl->used_p = TRUE;
@@ -10045,9 +10066,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             FORIN_DECL_VAR(key_id, el_copy);
           }
         } else {
-          /* Dict: key_id = char* (TM_DICT for register matching) */
-          struct type *kt = create_type(c2m_ctx, NULL);
-          kt->mode = TM_DICT; kt->pos_node = key_id;
+          /* Dict: key_id = char* , value_id = TM_DICT */
+          struct type *char_t = create_basic_type(c2m_ctx, TP_CHAR);
+          struct type *kt = create_ptr_type(c2m_ctx, char_t);
+          kt->pos_node = key_id;
           FORIN_DECL_VAR(key_id, kt);
           if (val_id->code == N_ID) {
             struct type *vt = create_type(c2m_ctx, NULL);
@@ -10181,14 +10203,80 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
             !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
             // FIXME: Needs to be able to find clsss cuntions
-             if (t1->mode != TM_DICT)
-               error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
-                  op2->u.s.s);
-             /* Member not found: 'sym' is left unpopulated by symbol_find, so we
-                must not fall through to the member-access code below (which
-                would dereference garbage and crash).  Stop here. */
+             if (t1->mode != TM_DICT) {
+               if (t1->mode == TM_CLASS) {
+                 /* TM_CLASS namespace static: variants dict member or bare variant as const */
+                 node_t class_node = t1->u.tag_type;
+                 symbol_t vsym;
+                 if (symbol_find(c2m_ctx, S_REGULAR, op2, class_node, &vsym)) {
+                   decl = vsym.def_node->attr;
+                   if (decl) {
+                     *e->type = *decl->decl_spec.type;
+                     e->u.lvalue_node = vsym.def_node;
+                     r->attr = e;
+                     break;
+                   }
+                 }
+                 /* Declarative-dict variant sugar:  ClassName.Variant resolves
+                    to the integer  variants["Variant"]["value"]  at compile
+                    time, for use in constant contexts (case labels, etc.). */
+                 node_t v_id = build_id(c2m_ctx, "variants", POS(op2));
+                 symbol_t vsym2;
+                 node_t valnode = NULL;
+                 if (symbol_find(c2m_ctx, S_REGULAR, v_id, class_node, &vsym2)) {
+                   node_t vd = vsym2.def_node;
+                   node_t vi = vd ? MEMBER_INIT(vd) : NULL;
+                   node_t found_sub = NULL;
+                   if (vi && vi->code == N_LIST) {
+                     for (node_t ii = NL_HEAD(vi->u.ops); ii != NULL; ii = NL_NEXT(ii)) {
+                       if (ii->code != N_INIT) continue;
+                       node_t dlist = NL_HEAD(ii->u.ops);
+                       node_t fid = dlist ? NL_HEAD(dlist->u.ops) : NULL;
+                       node_t kn = (fid && fid->code == N_FIELD_ID) ? NL_HEAD(fid->u.ops) : NULL;
+                       if (kn && (kn->code == N_STR || kn->code == N_ID)
+                           && strcmp(kn->u.s.s, op2->u.s.s) == 0) {
+                         found_sub = NL_NEXT(dlist);
+                         break;
+                       }
+                     }
+                   }
+                   if (found_sub && found_sub->code == N_LIST) {
+                     for (node_t si = NL_HEAD(found_sub->u.ops); si != NULL; si = NL_NEXT(si)) {
+                       if (si->code != N_INIT) continue;
+                       node_t sdlist = NL_HEAD(si->u.ops);
+                       node_t sfid = sdlist ? NL_HEAD(sdlist->u.ops) : NULL;
+                       node_t sk = (sfid && sfid->code == N_FIELD_ID) ? NL_HEAD(sfid->u.ops) : NULL;
+                       if (sk && (sk->code == N_STR || sk->code == N_ID)
+                           && strcmp(sk->u.s.s, "value") == 0) {
+                         valnode = NL_NEXT(sdlist);
+                         break;
+                       }
+                     }
+                   }
+                 }
+                 if (valnode != NULL && valnode->code != N_LIST) {
+                   check(c2m_ctx, valnode, r); /* ensure const expr attr is set */
+                   struct expr *vve = valnode->attr;
+                   if (vve != NULL && vve->const_p && integer_type_p(vve->type)) {
+                     e->const_p = TRUE;
+                     e->c.i_val = vve->c.i_val;
+                     e->type->mode = TM_BASIC;
+                     e->type->u.basic_type = TP_INT;
+                     e->u.lvalue_node = NULL;
+                     r->attr = e;
+                     break;
+                   }
+                 }
+                 error (c2m_ctx, POS (r), "%s has no member %s", "class", op2->u.s.s);
+                 break;
+               } else {
+                 error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
+                    op2->u.s.s);
+                 break;
+               }
+             }
              break;
-         } 
+          } 
          if (t1->mode == TM_DICT) {
            e = create_expr(c2m_ctx, r);
            if (strcmp(op2->u.s.s, "json") == 0) {
@@ -10200,6 +10288,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
              e->type->u.ptr_type->u.basic_type = TP_CHAR;
              set_type_layout(c2m_ctx, e->type->u.ptr_type);
              set_type_layout(c2m_ctx, e->type);
+           } else if (strcmp(op2->u.s.s, "value") == 0) {
+             /* special for variant sub-dict .value to get the int */
+             e->type->mode = TM_BASIC;
+             e->type->u.basic_type = TP_INT;
+           } else if (strcmp(op2->u.s.s, "desc") == 0) {
+             /* special for .desc to get char* */
+             e->type->mode = TM_PTR;
+             struct type *c = create_basic_type(c2m_ctx, TP_CHAR);
+             e->type->u.ptr_type = create_ptr_type(c2m_ctx, c);
            } else {
              /* dict member access: key = op2 (N_ID), treat as runtime lookup */
              e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
@@ -10886,6 +10983,30 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           error (c2m_ctx, POS (r), "asm register name %s contains wrong char '%c'", asm_str,
                  asm_str[i]);
           asm_str = NULL;
+        }
+      }
+    }
+    /* auto type inference:  `auto x = init;` with no explicit type specifier.
+       The declared type is taken from the initializer (a brace initializer
+       yields a dict). */
+    if (decl_spec.auto_p && !specs_have_type_spec_p (specs)
+        && declarator->code != N_IGNORE && initializer != NULL
+        && initializer->code != N_IGNORE) {
+      if (initializer->code == N_LIST) {
+        struct type *it = create_type (c2m_ctx, NULL);
+        it->mode = TM_DICT;
+        it->pos_node = r;
+        set_type_layout (c2m_ctx, it);
+        decl_spec.type = it;
+      } else {
+        check (c2m_ctx, initializer, r);
+        struct expr *ie = initializer->attr;
+        if (ie != NULL && ie->type != NULL && ie->type->mode != TM_UNDEF) {
+          struct type *it = create_type (c2m_ctx, ie->type);
+          it->pos_node = r;
+          if (it->mode == TM_ARR) it = adjust_type (c2m_ctx, it); /* decay */
+          set_type_layout (c2m_ctx, it);
+          decl_spec.type = it;
         }
       }
     }
@@ -13646,6 +13767,87 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
   }
 }
 
+/* Locate the named dict member (a member whose brace initializer is an N_LIST)
+   of a class tag node, returning the matching N_MEMBER, or NULL. */
+static node_t find_class_dict_member (node_t class_node, const char *member_name) {
+  if (class_node == NULL) return NULL;
+  node_t mlist = TAG_MEMBER_LIST (class_node);
+  if (mlist == NULL || mlist->code != N_LIST) return NULL;
+  for (node_t m = NL_HEAD (mlist->u.ops); m != NULL; m = NL_NEXT (m)) {
+    if (m->code != N_MEMBER) continue;
+    node_t mdecl = MEMBER_DECL (m);
+    node_t mid = (mdecl != NULL && mdecl->code == N_DECL) ? DECL_ID (mdecl) : NULL;
+    node_t minit = MEMBER_INIT (m);
+    if (minit == NULL || minit->code != N_LIST) continue;
+    if (member_name == NULL
+        || (mid != NULL && mid->code == N_ID && strcmp (mid->u.s.s, member_name) == 0))
+      return m;
+  }
+  return NULL;
+}
+
+/* Materialise a class's declarative dict member (ClassName.member) as a
+   process-wide singleton.  A BSS slot holds the DictValue* and a generated
+   __dict_init_* function (run from main) builds the object from the member's
+   brace initializer.  Returns the BSS item, or NULL if there is no such member.
+   The result is cached on the member's decl so repeated accesses reuse it. */
+static MIR_item_t ensure_class_static_dict (c2m_ctx_t c2m_ctx, node_t class_node,
+                                            const char *member_name) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  node_t member = find_class_dict_member (class_node, member_name);
+
+  if (member == NULL) return NULL;
+  node_t init = MEMBER_INIT (member);
+  decl_t mdec = member->attr;
+  if (mdec != NULL && mdec->u.item != NULL) return mdec->u.item; /* already built */
+
+  node_t cls_id = TAG_ID (class_node);
+  const char *cls = (cls_id != NULL && cls_id->code == N_ID) ? cls_id->u.s.s : "anon";
+  char gname[256];
+  snprintf (gname, sizeof gname, "__class_%s_%s", cls, member_name);
+  MIR_item_t bss = MIR_new_bss (ctx, gname, sizeof (void *));
+  if (mdec != NULL) mdec->u.item = bss;
+
+  {
+    MIR_item_t saved_func = curr_func;
+    int saved_reg_free_mark = reg_free_mark;
+    char init_name[300];
+    snprintf (init_name, sizeof init_name, "__dict_init_class_%s_%s", cls, member_name);
+    reg_free_mark = 0;
+    curr_func = MIR_new_func (ctx, init_name, 0, NULL, 0);
+    if (dict_init_func_count < (int) (sizeof (dict_init_funcs) / sizeof (dict_init_funcs[0])))
+      dict_init_funcs[dict_init_func_count++] = curr_func; /* main will call it */
+    op_t obj = gen_dict_create_object (c2m_ctx);
+    gen_dict_init_list (c2m_ctx, obj.mir_op, init);
+    {
+      op_t addr_temp = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, addr_temp.mir_op, MIR_new_ref_op (ctx, bss));
+      emit2 (c2m_ctx, MIR_MOV,
+             MIR_new_mem_op (ctx, MIR_T_I64, 0, addr_temp.mir_op.u.reg, 0, 1), obj.mir_op);
+    }
+    emit_insn (c2m_ctx, MIR_new_ret_insn (ctx, 0));
+    MIR_finish_func (ctx);
+    HTAB_CLEAR (reg_var_t, reg_var_tab);
+    curr_func = saved_func;
+    reg_free_mark = saved_reg_free_mark;
+  }
+  return bss;
+}
+
+/* Given an op holding a DictValue*, load the 8-byte union payload (offset 8).
+   The int64/double/string_value/object pointer members all overlap there, so a
+   single load serves every scalar/string use of a dict value. */
+static op_t gen_dict_unwrap (c2m_ctx_t c2m_ctx, op_t dop) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  op_t ptr = force_reg (c2m_ctx, dop, MIR_T_I64);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  emit2 (c2m_ctx, MIR_MOV, res.mir_op,
+         MIR_new_mem_op (ctx, MIR_T_I64, 8, ptr.mir_op.u.reg, 0, 1));
+  return res;
+}
+
 /* Import the UTF-8 String runtime helpers (cstring.h) into the current module,
    once per module.  All String values are char* (passed/returned as I64). */
 static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
@@ -14467,10 +14669,36 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        lhs lvalue. */
     if (rhs_node->code == N_LIST
         && ((struct expr *) r->attr)->type->mode == TM_DICT) {
-      var = gen (c2m_ctx, lhs, NULL, NULL, FALSE, NULL, NULL);
       op_t obj = gen_dict_create_object (c2m_ctx);
       gen_dict_init_list (c2m_ctx, obj.mir_op, rhs_node);
-      emit2 (c2m_ctx, MIR_MOV, var.mir_op, obj.mir_op);
+      /* When the lhs is itself a dict element (d.key / d["key"]) the new object
+         must be inserted into the parent dict; otherwise it is stored into the
+         lhs (dict) variable. */
+      int lhs_is_dict_elem
+        = (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
+           || (lhs->code == N_IND
+               && ((struct expr *) NL_HEAD (lhs->u.ops)->attr)->type->mode == TM_DICT));
+      if (lhs_is_dict_elem) {
+        MIR_op_t key_op;
+        if (lhs->code == N_IND) {
+          node_t dict_node = NL_HEAD (lhs->u.ops);
+          node_t key_node = NL_EL (lhs->u.ops, 1);
+          op1 = val_gen (c2m_ctx, dict_node);
+          key_op = val_gen (c2m_ctx, key_node).mir_op;
+        } else {
+          node_t parent_node = NL_HEAD (lhs->u.ops);
+          node_t key_id = NL_NEXT (parent_node);
+          op1 = val_gen (c2m_ctx, parent_node);
+          const char *key_str = key_id->u.s.s;
+          MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
+                                    (MIR_str_t){strlen (key_str) + 1, key_str});
+          key_op = MIR_new_ref_op (ctx, str_item);
+        }
+        gen_dict_object_set (c2m_ctx, op1.mir_op, key_op, obj.mir_op);
+      } else {
+        var = gen (c2m_ctx, lhs, NULL, NULL, FALSE, NULL, NULL);
+        emit2 (c2m_ctx, MIR_MOV, var.mir_op, obj.mir_op);
+      }
       res = obj;
       break;
     }
@@ -14757,40 +14985,59 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       node_t obj_node = NL_HEAD (r->u.ops);
       node_t key_node = NL_NEXT (obj_node);
       struct expr *obj_e = obj_node->attr;
-      if (obj_e && obj_e->type->mode == TM_DICT && key_node->code == N_ID
-          && strcmp(key_node->u.s.s, "json") == 0) {
-        /* d.json — serialize dict to JSON string */
+
+      /* ClassName.member where the object is the class itself (not an
+         instance) and member is a declarative dict: load the singleton. */
+      if (obj_node->code == N_ID && obj_e != NULL && obj_e->def_node != NULL
+          && obj_e->def_node->code == N_CLASS && obj_e->type != NULL
+          && obj_e->type->mode == TM_CLASS && e->type != NULL && e->type->mode == TM_DICT
+          && key_node != NULL && key_node->code == N_ID) {
+        MIR_item_t bss = ensure_class_static_dict (c2m_ctx, obj_e->def_node, key_node->u.s.s);
+        if (bss != NULL) {
+          op_t addr = get_new_temp (c2m_ctx, MIR_T_I64);
+          emit2 (c2m_ctx, MIR_MOV, addr.mir_op, MIR_new_ref_op (ctx, bss));
+          res = get_new_temp (c2m_ctx, MIR_T_I64);
+          emit2 (c2m_ctx, MIR_MOV, res.mir_op,
+                 MIR_new_mem_op (ctx, MIR_T_I64, 0, addr.mir_op.u.reg, 0, 1));
+          break;
+        }
+      }
+
+      /* Dict member access:  obj.key  where obj is a dict value. */
+      if (obj_e != NULL && obj_e->type != NULL && obj_e->type->mode == TM_DICT
+          && key_node != NULL && key_node->code == N_ID) {
+        const char *key_str = key_node->u.s.s;
+        if (strcmp (key_str, "json") == 0) {
+          /* d.json — serialize dict to JSON string */
+          op1 = val_gen (c2m_ctx, obj_node);
+          dict_ensure_imports (c2m_ctx);
+          MIR_op_t call_args[7];
+          op_t buf_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+          MIR_append_insn (ctx, curr_func,
+                           MIR_new_insn (ctx, MIR_ALLOCA, buf_reg.mir_op,
+                                         MIR_new_int_op (ctx, 4096)));
+          res = get_new_temp (c2m_ctx, MIR_T_I64);
+          call_args[0] = MIR_new_ref_op (ctx, dict_serialize_json_proto);
+          call_args[1] = MIR_new_ref_op (ctx, dict_serialize_json_item);
+          call_args[2] = res.mir_op;
+          call_args[3] = op1.mir_op;
+          call_args[4] = buf_reg.mir_op;
+          call_args[5] = MIR_new_int_op (ctx, 4096);
+          call_args[6] = MIR_new_int_op (ctx, 0);
+          emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 7, call_args));
+          break;
+        }
         op1 = val_gen (c2m_ctx, obj_node);
-        dict_ensure_imports (c2m_ctx);
-        MIR_op_t call_args[7];
-        op_t buf_reg = get_new_temp (c2m_ctx, MIR_T_I64);
-        MIR_append_insn (ctx, curr_func,
-                         MIR_new_insn (ctx, MIR_ALLOCA, buf_reg.mir_op,
-                                       MIR_new_int_op (ctx, 4096)));
-        res = get_new_temp (c2m_ctx, MIR_T_I64);
-        call_args[0] = MIR_new_ref_op (ctx, dict_serialize_json_proto);
-        call_args[1] = MIR_new_ref_op (ctx, dict_serialize_json_item);
-        call_args[2] = res.mir_op;
-        call_args[3] = op1.mir_op;
-        call_args[4] = buf_reg.mir_op;
-        call_args[5] = MIR_new_int_op (ctx, 4096);
-        call_args[6] = MIR_new_int_op (ctx, 0);
-        emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 7, call_args));
+        MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
+                                  (MIR_str_t){strlen (key_str) + 1, key_str});
+        MIR_op_t key_op = MIR_new_ref_op (ctx, str_item);
+        op_t got = gen_dict_object_get (c2m_ctx, op1.mir_op, key_op);
+        /* A nested dict stays a DictValue* (for chaining); a scalar/string
+           result is unwrapped to its union payload. */
+        res = (e->type != NULL && e->type->mode == TM_DICT)
+                ? got : gen_dict_unwrap (c2m_ctx, got);
         break;
       }
-    }
-    if (e->type->mode == TM_DICT) {
-      /* Dict member access: cfg.key -> dict_object_get(cfg, "key") */
-      node_t obj_node = NL_HEAD (r->u.ops);
-      node_t key_node = NL_NEXT (obj_node);
-      assert (key_node->code == N_ID);
-      op1 = val_gen (c2m_ctx, obj_node);
-      const char *key_str = key_node->u.s.s;
-      MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
-                                (MIR_str_t){strlen (key_str) + 1, key_str});
-      MIR_op_t key_op = MIR_new_ref_op (ctx, str_item);
-      res = gen_dict_object_get (c2m_ctx, op1.mir_op, key_op);
-      break;
     }
     if (e->def_node && e->def_node->code == N_FUNC_DEF) {
       // method access: produce MIR ref to the function item (with mangled name)
@@ -15552,6 +15799,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           gen(c2m_ctx, member, true_label, false_label, val_p, desirable_dest, expect_res);
         }
       }
+      /* Build process-wide singletons for declarative dict members so that
+         ClassName.member (and the ClassName.Variant sugar) have storage.
+         Done here, between top-level definitions, where no MIR function is
+         open for construction. */
+      for (node_t member = NL_HEAD(decl_list->u.ops); member != NULL; member = NL_NEXT(member)) {
+        if (member->code != N_MEMBER) continue;
+        node_t mdecl = MEMBER_DECL (member);
+        node_t mid = (mdecl != NULL && mdecl->code == N_DECL) ? DECL_ID (mdecl) : NULL;
+        node_t minit = MEMBER_INIT (member);
+        if (minit != NULL && minit->code == N_LIST && mid != NULL && mid->code == N_ID)
+          ensure_class_static_dict (c2m_ctx, r, mid->u.s.s);
+      }
     }
     break;
   }
@@ -16128,16 +16387,33 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
              i_reg.mir_op, n_save.mir_op);
       emit_label_insn_opt (c2m_ctx, body_label);
 
+      /* Store loop variables using each variable's *declared* MIR type so the
+         register name matches what N_ID reads in the body.  The dict key is a
+         char* (which get_mir_type maps to U64), the value is a dict (I64); a
+         hardcoded type here would mismatch the reader and yield a garbage
+         register. */
       op_t key_reg = gen_dict_object_key_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
       {
-        const char *kname = get_reg_var_name (c2m_ctx, MIR_T_I64, key_id->u.s.s, fsn);
-        reg_var_t kvar = get_reg_var (c2m_ctx, MIR_T_I64, kname, NULL);
+        symbol_t ksym;
+        MIR_type_t kt = MIR_T_I64;
+        if (symbol_find (c2m_ctx, S_REGULAR, key_id, r, &ksym) && ksym.def_node != NULL
+            && ksym.def_node->attr != NULL)
+          kt = promote_mir_int_type (
+                 get_mir_type (c2m_ctx, ((decl_t) ksym.def_node->attr)->decl_spec.type));
+        const char *kname = get_reg_var_name (c2m_ctx, kt, key_id->u.s.s, fsn);
+        reg_var_t kvar = get_reg_var (c2m_ctx, kt, kname, NULL);
         emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), key_reg.mir_op);
       }
       if (val_id->code == N_ID) {
         op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
-        const char *vname = get_reg_var_name (c2m_ctx, MIR_T_I64, val_id->u.s.s, fsn);
-        reg_var_t vvar = get_reg_var (c2m_ctx, MIR_T_I64, vname, NULL);
+        symbol_t vsym;
+        MIR_type_t vt = MIR_T_I64;
+        if (symbol_find (c2m_ctx, S_REGULAR, val_id, r, &vsym) && vsym.def_node != NULL
+            && vsym.def_node->attr != NULL)
+          vt = promote_mir_int_type (
+                 get_mir_type (c2m_ctx, ((decl_t) vsym.def_node->attr)->decl_spec.type));
+        const char *vname = get_reg_var_name (c2m_ctx, vt, val_id->u.s.s, fsn);
+        reg_var_t vvar = get_reg_var (c2m_ctx, vt, vname, NULL);
         emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), val_reg.mir_op);
       }
     }

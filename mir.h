@@ -306,6 +306,7 @@ struct MIR_code_reloc {
   const void *value;
   const char *symbol; // object_file_gen
   int type;
+  int64_t addend;     // object_file_gen: RELA addend
 };
 
 typedef struct MIR_code_reloc MIR_code_reloc_t;
@@ -710,6 +711,11 @@ extern void _MIR_change_code (MIR_context_t ctx, uint8_t *addr, const uint8_t *c
 extern void _MIR_update_code_arr (MIR_context_t ctx, uint8_t *base, size_t nloc,
                                   const MIR_code_reloc_t *relocs);
 extern void _MIR_update_code (MIR_context_t ctx, uint8_t *base, size_t nloc, ...);
+
+/* Store object-file relocations (function-relative offsets) on a func, for
+   use by an object-file writer.  Used by the code generator. */
+extern void _MIR_set_func_code_relocs (MIR_context_t ctx, MIR_func_t func,
+                                       const MIR_code_reloc_t *relocs, size_t n);
 
 extern void *va_arg_builtin (void *p, uint64_t t);
 extern void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t t);
