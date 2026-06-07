@@ -475,6 +475,7 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "dict_serialize_json") == 0) return (void *) dict_serialize_json;
     if (strcmp (name, "dict_deserialize_json") == 0) return (void *) dict_deserialize_json;
     if (strcmp (name, "dict_destroy") == 0) return (void *) dict_destroy;
+    if (strcmp (name, "dict_create_heap_arena") == 0) return (void *) dict_create_heap_arena;
     if (strcmp (name, "dict_find_path") == 0) return (void *) dict_find_path;
     if (strcmp (name, "dict_value_free") == 0) return (void *) dict_value_free;
     if (strcmp (name, "dict_array_append") == 0) return (void *) dict_array_append;
@@ -487,6 +488,14 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_substr") == 0) return (void *) c2m_str_substr;
     if (strcmp (name, "c2m_str_find") == 0) return (void *) c2m_str_find;
     if (strcmp (name, "c2m_str_replace") == 0) return (void *) c2m_str_replace;
+    if (strcmp (name, "c2m_str_upper") == 0) return (void *) c2m_str_upper;
+    if (strcmp (name, "c2m_str_lower") == 0) return (void *) c2m_str_lower;
+    if (strcmp (name, "c2m_str_starts_with") == 0) return (void *) c2m_str_starts_with;
+    if (strcmp (name, "c2m_str_ends_with") == 0) return (void *) c2m_str_ends_with;
+    if (strcmp (name, "c2m_str_contains") == 0) return (void *) c2m_str_contains;
+    if (strcmp (name, "c2m_str_trim") == 0) return (void *) c2m_str_trim;
+    if (strcmp (name, "c2m_str_detach") == 0) return (void *) c2m_str_detach;
+    if (strcmp (name, "c2m_str_attach") == 0) return (void *) c2m_str_attach;
     if (strcmp (name, "c2m_str_cleanup") == 0) return (void *) c2m_str_cleanup;
     if (strcmp (name, "c2m_str_checkpoint") == 0) return (void *) c2m_str_checkpoint;
     if (strcmp (name, "c2m_str_release_to") == 0) return (void *) c2m_str_release_to;
@@ -497,8 +506,9 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_from_uint") == 0) return (void *) c2m_str_from_uint;
     if (strcmp (name, "c2m_str_from_bool") == 0) return (void *) c2m_str_from_bool;
     if (strcmp (name, "c2m_str_from_char") == 0) return (void *) c2m_str_from_char;
-    if (strcmp (name, "c2m_str_from_double") == 0) return (void *) c2m_str_from_double;
-    fprintf (stderr, "can not load symbol %s\n", name);
+    	if (strcmp (name, "c2m_str_from_double") == 0) return (void *) c2m_str_from_double;
+    	if (strcmp (name, "c2m_str_copy") == 0) return (void *) c2m_str_copy;
+    	fprintf (stderr, "can not load symbol %s\n", name);
     close_std_libs ();
     exit (1);
   }
@@ -938,7 +948,8 @@ int main (int argc, char *argv[], char *env[]) {
                     (MIR_val_t){.i = VARR_LENGTH (char_ptr_t, exec_argv)},
                     (MIR_val_t){.a = (void *) VARR_ADDR (char_ptr_t, exec_argv)},
                     (MIR_val_t){.a = (void *) env});
-        result_code = (int) val.i;
+        /* void main() leaves the return register unset; treat as 0 (C99 §5.1.2.2.3) */
+        result_code = (main_func->u.func->nres == 0) ? 0 : (int) val.i;
         if (options.verbose_p) {
           fprintf (stderr, "  execution       -- %.0f usec\n", real_usec_time () - start_time);
           fprintf (stderr, "exit code: %lu\n", (long unsigned) result_code);
@@ -969,6 +980,8 @@ int main (int argc, char *argv[], char *env[]) {
         fun_addr = main_func->addr;
         start_time = real_usec_time ();
         result_code = (int) fun_addr (fun_argc, fun_argv, env);
+        /* void main() has no return register — treat as exit 0 */
+        if (main_func->u.func->nres == 0) result_code = 0;
         if (options.verbose_p) {
           fprintf (stderr, "  execution       -- %.0f msec\n",
                    (real_usec_time () - start_time) / 1000.0);

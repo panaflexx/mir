@@ -22,7 +22,7 @@ class myClass {
 
 char ss[] = "char string array";
 
-void main() {
+int main() {
 	Exception e;
 	String search = "Hello, this is a test";
 
@@ -44,4 +44,5 @@ void main() {
 	}
 
 	printf("Hello %s\n", myutf8 + pliny[0]);
+	return 0;
 }

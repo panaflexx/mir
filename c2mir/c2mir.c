@@ -1132,7 +1132,7 @@ static void add_stream (c2m_ctx_t c2m_ctx, FILE *f, const char *fname,
     // FIXME existing streams crash because c2m_ctx->cs->getc_fund is undefined
     //cs = existing;
     //printf("add_stream: Should using existing stream %s\n", fname);
-  } 
+  }
   cs = new_stream (alloc, f, fname, getc_func);
   VARR_PUSH (stream_t, streams, cs);
   //print_streams(c2m_ctx);
@@ -4446,9 +4446,12 @@ D (primary_expr) {
   node_t r, n, op, gn, list;
   pos_t pos;
 
-  if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
-    return r;
-  } else if (MP (T_ANDAND, pos)) {
+  	if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
+  	    return r;
+  	  } else if (MP (T_STRING, pos)) {
+  	    r = new_pos_node (c2m_ctx, N_STRING, pos);
+  	    return r;
+  	  } else if (MP (T_ANDAND, pos)) {
     PTN (T_ID);
     return new_pos_node1 (c2m_ctx, N_LABEL_ADDR, pos, r);
   } else if (M ('(')) {
@@ -4558,6 +4561,29 @@ D (unary_expr) {
     pos_t npos = curr_token->pos;
     node_t tid = NULL;
     M_SOFT ("new");
+    /* new dict(size?)  — heap-arena-backed empty dict.
+       `size` is an optional byte-count for the arena; 0 means "use default". */
+    if (C (T_DICT)) {
+      pos_t dpos = curr_token->pos;
+      size_t dmark = record_start (c2m_ctx);
+      M (T_DICT);
+      if (C ('(')) {
+        record_stop (c2m_ctx, dmark, FALSE); /* commit */
+        record_stop (c2m_ctx, mark, FALSE);
+        M ('(');
+        node_t size_arg = new_node (c2m_ctx, N_LIST);
+        if (!C (')')) {
+          P (assign_expr);
+          op_append (c2m_ctx, size_arg, r);
+        }
+        PT (')');
+        r = new_pos_node2 (c2m_ctx, N_NEW, npos,
+                           new_pos_node (c2m_ctx, N_DICT, dpos), size_arg);
+        PA (post_expr_part, r);
+        return r;
+      }
+      record_stop (c2m_ctx, dmark, TRUE); /* not new dict(): rewind */
+    }
     if (MN (T_ID, tid) && C ('(')) {
       node_t args;
       record_stop (c2m_ctx, mark, FALSE); /* commit: this is a new-expression */
@@ -4826,7 +4852,7 @@ D (declaration) {
     PA (declaration_specs, curr_scope == top_scope ? (node_t) 1 : NULL);
     spec = r;
     last_pos = POS (spec);
-    
+
     // Check if this is a class declaration that should be treated like a typedef
     int is_class_typedef = FALSE;
     for (node_t spec_node = NL_HEAD (spec->u.ops); spec_node != NULL; spec_node = NL_NEXT (spec_node)) {
@@ -4841,7 +4867,7 @@ D (declaration) {
         }
       }
     }
-    
+
     list = new_node (c2m_ctx, N_LIST);
     if (C (';')) {
       // For class declarations without declarators, create proper type definition
@@ -4857,7 +4883,7 @@ D (declaration) {
       for (op = NL_HEAD (spec->u.ops); op != NULL; op = NL_NEXT (op))
         if (op->code == N_TYPEDEF) break;
       typedef_p = op != NULL || is_class_typedef;
-      
+
       for (;;) { /* init-declarator */
         P (declarator);
         decl = r;
@@ -5006,7 +5032,7 @@ D (sc_spec) {
 D (class_member_declaration) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r, spec, decl;
-  
+
   if (c2m_options->debug_p) printf("class_member_declaration\n");
 
   /* Destructor:  ~ClassName ( ) { body }   (no return type, no params).
@@ -5088,15 +5114,31 @@ D (class_member_declaration) {
     P(st_assert);
     return r;
   }
-  
+
+  // Check for `static` keyword — static class method (no implicit `this` parameter).
+  // We consume it here and inject N_STATIC into the spec list so that
+  // check_decl_spec will see static_p = TRUE on the resulting N_FUNC_DEF.
+  int is_static_method = FALSE;
+  pos_t static_kw_pos;
+  if (MP(T_STATIC, static_kw_pos)) {
+    is_static_method = TRUE;
+  }
+
   // Parse declaration specifiers (return type, etc.)
   P(spec_qual_list);
   spec = r;
-  
+
+  // If the method was prefixed with `static`, prepend N_STATIC to the spec list
+  // so that check_decl_spec sets decl_spec.static_p = TRUE.
+  if (is_static_method) {
+    node_t static_node = new_pos_node(c2m_ctx, N_STATIC, static_kw_pos);
+    NL_PREPEND(spec->u.ops, static_node);
+  }
+
   // Try to parse a declarator
   if ((r = TRY(declarator)) != err_node) {
     decl = r;
-    
+
     // Check if this is a function definition (has a compound statement)
     if (C('{')) {
       // This is a method definition - treat as regular function
@@ -5129,7 +5171,7 @@ D (class_member_declaration) {
       return members;
     }
   }
-  
+
   // If no declarator, just a type declaration
   PT(';');
   return build_shared_member(c2m_ctx, POS(spec), spec, decl, NULL, NULL, NULL);
@@ -5140,9 +5182,9 @@ D (class_member_declaration) {
   node_t list, r;
 
   printf("class_member_list: class %s\n", parse_ctx->curr_class->u.s.s);
-  
+
   list = new_node(c2m_ctx, N_LIST);
-  
+
   while (!C('}') && !C(T_EOFILE)) {
     P(class_member_declaration);
     /* A data-member declaration may yield several members (comma-separated);
@@ -5151,7 +5193,7 @@ D (class_member_declaration) {
   }
 
   //class_add_this(c2m_ctx, list);
-  
+
   return list;
 }
 
@@ -5159,7 +5201,7 @@ static struct type *create_type (c2m_ctx_t c2m_ctx, struct type *copy);
 
 static void symbol_insert (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
                            node_t def_node, node_t aux_node);
-// Updated for T_CLASS 
+// Updated for T_CLASS
 DA (type_spec) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t op1, op2, op3, op4, r;
@@ -5210,7 +5252,7 @@ DA (type_spec) {
     } else {
       id_p = TRUE;
     }
-    
+
     if (M ('{')) {
       if (!C ('}') && !M (';')) {
         if (struct_p == 3) { // T_CLASS == 3
@@ -5235,7 +5277,7 @@ DA (type_spec) {
     } else {
       r = new_node (c2m_ctx, N_IGNORE);
     }
-    
+
     if (struct_p == 1) {
       r = new_pos_node2 (c2m_ctx, N_STRUCT, pos, op1, r);
     } else if (struct_p == 2) {
@@ -5837,8 +5879,10 @@ D (initializer_list) {
 
   list = new_node (c2m_ctx, N_LIST);
   if (C ('}')) {
-    (c2m_options->pedantic_p ? error : warning) (c2m_ctx, curr_token->pos,
-                                                 "empty initializer list");
+    /* Empty {} is valid for dict (and accepted as a GCC extension for other
+       aggregate types).  Only flag it as an error in strict pedantic mode. */
+    if (c2m_options->pedantic_p)
+      error (c2m_ctx, curr_token->pos, "empty initializer list");
     return list;
   }
   for (;;) { /* designation */
@@ -6272,7 +6316,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   kw_add (c2m_ctx, "break", T_BREAK, 0);
   kw_add (c2m_ctx, "case", T_CASE, 0);
   kw_add (c2m_ctx, "char", T_CHAR, 0);
-  kw_add (c2m_ctx, "String", T_STRING, 0); // lowercase string is too common... perhaps _string?  
+  kw_add (c2m_ctx, "String", T_STRING, 0); // lowercase string is too common... perhaps _string?
   kw_add (c2m_ctx, "const", T_CONST, 0);
   kw_add (c2m_ctx, "continue", T_CONTINUE, 0);
   kw_add (c2m_ctx, "default", T_DEFAULT, 0);
@@ -6616,7 +6660,7 @@ static int arithmetic_type_p (const struct type *type) {
 static int string_type_p (const struct type *type) {
     if (type->mode == TM_PTR && type->pos_node && type->pos_node->code == N_STR)
         return 1;
-    return (type->mode == TM_BASIC || type->mode == TM_PTR) 
+    return (type->mode == TM_BASIC || type->mode == TM_PTR)
         && (type->u.basic_type == TP_STRING || type->u.basic_type == TM_PTR);
 }
 
@@ -6641,14 +6685,23 @@ static int str_concat_string_operand_p (const struct type *type, node_t op) {
 }
 
 /* Built-in String methods recognized as `s.method(...)` call syntax. */
-enum str_method {
-  SM_NONE = 0,
-  SM_LENGTH,  /* s.length()                       -> size_t          */
-  SM_EMPTY,   /* s.empty()                        -> int  (0/1)      */
-  SM_SUBSTR,  /* s.substr(pos, len)               -> String          */
-  SM_FIND,    /* s.find(needle)                   -> size_t          */
-  SM_REPLACE, /* s.replace(pos, len, replacement) -> String (in-place) */
-};
+	enum str_method {
+	  SM_NONE = 0,
+	  SM_LENGTH,  /* s.length()                       -> size_t          */
+	  SM_EMPTY,   /* s.empty()                        -> int  (0/1)      */
+	  SM_SUBSTR,  /* s.substr(pos, len)               -> String          */
+	  SM_FIND,    /* s.find(needle)                   -> size_t          */
+	  SM_REPLACE, /* s.replace(pos, len, replacement) -> String (in-place) */
+	  SM_UPPER,   /* s.upper()                        -> String          */
+	  SM_LOWER,   /* s.lower()                        -> String          */
+	  SM_COPY,       /* String.copy(p, len)                -> String          */
+	  SM_DETACH,     /* s.detach()                         -> char * (untracked) */
+	  SM_ATTACH,     /* String.attach(p)                   -> String (tracked)  */
+	  SM_STARTS_WITH, /* s.starts_with(prefix)             -> int (0/1)         */
+	  SM_ENDS_WITH,   /* s.ends_with(suffix)               -> int (0/1)         */
+	  SM_CONTAINS,    /* s.contains(needle)                -> int (0/1)         */
+	  SM_TRIM,        /* s.trim()                          -> String            */
+	};
 
 /* Map a method name to its enum, the exact argument count it expects, and the
    runtime helper symbol name.  Returns SM_NONE for unknown names. */
@@ -6662,7 +6715,16 @@ static enum str_method get_string_method (const char *name, int *nargs,
   else if (strcmp (name, "substr") == 0)  { m = SM_SUBSTR;  n = 2; rt = "c2m_str_substr"; }
   else if (strcmp (name, "find") == 0)    { m = SM_FIND;    n = 1; rt = "c2m_str_find"; }
   else if (strcmp (name, "replace") == 0) { m = SM_REPLACE; n = 3; rt = "c2m_str_replace"; }
-  else                                    { m = SM_NONE;    n = 0; rt = NULL; }
+	  else if (strcmp (name, "upper") == 0)   { m = SM_UPPER;   n = 0; rt = "c2m_str_upper"; }
+	  else if (strcmp (name, "lower") == 0)   { m = SM_LOWER;   n = 0; rt = "c2m_str_lower"; }
+	  else if (strcmp (name, "copy") == 0)     { m = SM_COPY;    n = 2; rt = "c2m_str_copy"; }
+		  else if (strcmp (name, "detach") == 0)  { m = SM_DETACH;  n = 0; rt = "c2m_str_detach"; }
+			  else if (strcmp (name, "attach") == 0)      { m = SM_ATTACH;      n = 1; rt = "c2m_str_attach"; }
+			  else if (strcmp (name, "starts_with") == 0) { m = SM_STARTS_WITH; n = 1; rt = "c2m_str_starts_with"; }
+			  else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
+			  else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
+			  else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
+			  else                                        { m = SM_NONE;        n = 0; rt = NULL; }
   if (nargs != NULL) *nargs = n;
   if (rt_name != NULL) *rt_name = rt;
   return m;
@@ -7207,9 +7269,9 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
   if (type->mode == TM_PTR) /* Visit the pointed but after setting size to avoid looping */
     set_type_layout (c2m_ctx, type->u.ptr_type);
   if (c2m_options->debug_p) {
-    fprintf (stderr, "set_type_layout: "); 
+    fprintf (stderr, "set_type_layout: ");
     print_type (c2m_ctx, stderr, type);
-    fprintf (stderr, " raw_size=%zu, align=%d; type: \n", (size_t) type->raw_size, type->align); 
+    fprintf (stderr, " raw_size=%zu, align=%d; type: \n", (size_t) type->raw_size, type->align);
   }
 }
 
@@ -7477,7 +7539,7 @@ static node_t find_def (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
 
   for (;;) {
     if (!symbol_find (c2m_ctx, mode, id, scope, &sym)) {
-      if (scope == NULL) 
+      if (scope == NULL)
           return NULL;
       if(scope->attr) {
           scope = ((struct node_scope *) scope->attr)->scope;
@@ -7514,7 +7576,7 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
     // Classes need both, since they implement their own definition(tag)
     //if (r->code != N_CLASS)
     //    symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
-    //else 
+    //else
         symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
   } else if (sym.def_node->code != r->code) {
     error (c2m_ctx, POS (id), "kind of tag %s is unmatched with previous declaration", id->u.s.s);
@@ -8055,7 +8117,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       }
       break;
     }
-    default: 
+    default:
         printf("ERROR: Invalide n->code = %d\n", n->code);
         exit(-1);
     }
@@ -8189,8 +8251,8 @@ static struct type *check_declarator (c2m_ctx_t c2m_ctx, node_t r, int func_def_
       func_type->ret_type = NULL;
       func_type->proto_item = NULL;
       func_type->class_scope = (curr_scope && curr_scope->code == N_CLASS) ? curr_scope : NULL;
-      
-      //printf("func_type curr_scope class=%s code=%s\n", curr_scope->code==N_CLASS?"CLASS":"NO CLASS", 
+
+      //printf("func_type curr_scope class=%s code=%s\n", curr_scope->code==N_CLASS?"CLASS":"NO CLASS",
       //        get_token_name( c2m_ctx, curr_scope->code ));
 
       if ((func_type->dots_p = last != NULL && last->code == N_DOTS))
@@ -8227,7 +8289,7 @@ static struct type *check_declarator (c2m_ctx_t c2m_ctx, node_t r, int func_def_
       if (!func_def_p) finish_scope (c2m_ctx);
       break;
     }
-    
+
     default: abort ();
     }
     res = append_type (res, type);
@@ -8404,7 +8466,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         break;
       }
       case TM_BASIC: break;
-      default: 
+      default:
         //printf("UNKNOWN TM TYPE MODE %d\n", type->mode);
         break;  // ???
       }
@@ -8433,7 +8495,19 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           }
         }
       } else if (string_type_p (left)) {
-          if (!string_type_p (right)) {
+          /* String lvalue: accept String, char*, const char*, and string literals
+             (TM_ARR of char), so that `String key = "foo"` and struct field
+             initializers like `{.key = "Content-Type"}` work naturally. */
+          int rhs_ok = string_type_p (right)
+                       || null_const_p (expr, right)
+                       || (right->mode == TM_PTR && right->u.ptr_type != NULL
+                           && right->u.ptr_type->mode == TM_BASIC
+                           && char_type_p (right->u.ptr_type))
+                       || (right->mode == TM_ARR && right->u.arr_type != NULL
+                           && right->u.arr_type->el_type != NULL
+                           && right->u.arr_type->el_type->mode == TM_BASIC
+                           && char_type_p (right->u.arr_type->el_type));
+          if (!rhs_ok) {
             msg = (code == N_CALL ? "incompatible argument type for string type parameter"
                    : code != N_RETURN
                      ? "incompatible types in assignment to an string type lvalue"
@@ -8460,10 +8534,12 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         }
       } else if (left->mode == TM_PTR) {
         if (null_const_p (expr, right)) {
-        } else if (builtin_string_type_p (right) && left->u.ptr_type->mode == TM_BASIC
-                   && char_type_p (left->u.ptr_type)) {
-          /* A built-in String is a char*; accept it wherever a char* or
-             const char* parameter/lvalue is expected (strcmp, strlen, ...). */
+        } else if (builtin_string_type_p (right)
+                   && (void_ptr_p (left)
+                       || (left->u.ptr_type->mode == TM_BASIC
+                           && char_type_p (left->u.ptr_type)))) {
+          /* A built-in String is a char*; accept it wherever char*, const char*,
+             or void* is expected (strcmp, strlen, free, memcpy, ...). */
         } else if (right->mode == TM_CLASS) {
             printf("Accepting TM_PTR -> TM_CLASS\n");
         } else if (right->mode != TM_PTR
@@ -8668,17 +8744,18 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       return TRUE;
     }
 
-    static int check_const_addr_p (c2m_ctx_t c2m_ctx, node_t r, node_t *base, mir_llong *offset,
-                                   int *deref) {
-      check_ctx_t check_ctx = c2m_ctx->check_ctx;
-      struct expr *e = r->attr;
-      struct type *type;
-      node_t op1, op2, temp;
-      decl_t decl;
-      struct decl_spec *decl_spec;
-      mir_size_t size;
+	    static int check_const_addr_p (c2m_ctx_t c2m_ctx, node_t r, node_t *base, mir_llong *offset,
+	                                   int *deref) {
+	      check_ctx_t check_ctx = c2m_ctx->check_ctx;
+	      struct expr *e = r->attr;
+	      struct type *type;
+	      node_t op1, op2, temp;
+	      decl_t decl;
+	      struct decl_spec *decl_spec;
+	      mir_size_t size;
 
-      if (e->const_p && integer_type_p (e->type)) {
+	      if (e == NULL || r->code == N_STRING) return FALSE;
+	      if (e->const_p && integer_type_p (e->type)) {
         *base = NULL;
         *offset = (mir_size_t) e->c.u_val;
         *deref = 0;
@@ -8942,7 +9019,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         return;
       }
       if (init == NULL) {
-        if (scalar_type_p (type)) error (c2m_ctx, POS (initializer), "empty scalar initializer");
+        /* TM_DICT: empty {} means "create an empty dict object"; gen handles it
+           via gen_dict_create_object() + an empty gen_dict_init_list() pass. */
+        if (scalar_type_p (type) && type->mode != TM_DICT)
+          error (c2m_ctx, POS (initializer), "empty scalar initializer");
         return;
       }
       assert (init->code == N_INIT);
@@ -9263,7 +9343,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         node_t id_node, i_node, spec_node;
         node_t list_node, init_node;
         struct expr *e;
-        long count=0; 
+        long count=0;
 
         if(ind->code != N_IND) {
             error(c2m_ctx, no_pos, "get_array_member not called with N_IND\n");
@@ -9302,7 +9382,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         // Should be the dara item in the list
         return init_node->u.ops.tail;
 
-        return NULL;    
+        return NULL;
     }
 
     static struct expr *check_assign_op (c2m_ctx_t c2m_ctx, node_t r, struct expr *e1, struct expr *e2,
@@ -9755,13 +9835,13 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         case N_VOID: case N_CHAR: case N_SHORT: case N_INT: case N_LONG:
         case N_FLOAT: case N_DOUBLE: case N_SIGNED: case N_UNSIGNED: case N_BOOL:
         case N_STRUCT: case N_UNION: case N_CLASS: case N_ENUM:
-        case N_DICT: case N_STRING: case N_ID:
-          return TRUE;
-        default: break;
-        }
-      }
-      return FALSE;
-    }
+	    case N_DICT: case N_STRING: case N_ID:
+	          return TRUE;
+	    default: break;
+	    }
+	  }
+	  return FALSE;
+	}
 
     static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
@@ -9833,7 +9913,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         break;
       case N_STR:
       case N_STR16:
-      case N_STR32: 
+      case N_STR32:
       case N_STRING: {
         // TODO: Handle fstring in N_STRING
         struct arr_type *arr_type;
@@ -10106,8 +10186,23 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           int s2 = str_concat_string_operand_p (t2, op2);
 
           if (s1 || s2) {
-            int ok1 = s1 || arithmetic_type_p (t1);
-            int ok2 = s2 || arithmetic_type_p (t2);
+            /* char* / const char* is a NUL-terminated string value in the
+               same in-memory form as String; accept it as a concat operand
+               so `sb + host` works without an explicit (String) cast.
+               Arithmetic operands (int, size_t, …) are accepted ONLY when
+               at least one side is a genuine TP_STRING — this preserves C11
+               pointer arithmetic for `"literal" + int` while still allowing
+               `str + port` (str is TP_STRING). */
+            int has_real_str = (builtin_string_type_p (t1)
+                                || builtin_string_type_p (t2));
+            int char_ptr1 = (t1 != NULL && t1->mode == TM_PTR
+                             && t1->u.ptr_type != NULL
+                             && char_type_p (t1->u.ptr_type));
+            int char_ptr2 = (t2 != NULL && t2->mode == TM_PTR
+                             && t2->u.ptr_type != NULL
+                             && char_type_p (t2->u.ptr_type));
+            int ok1 = s1 || char_ptr1 || (arithmetic_type_p (t1) && has_real_str);
+            int ok2 = s2 || char_ptr2 || (arithmetic_type_p (t2) && has_real_str);
 
             if (ok1 && ok2) {
               debug (c2m_ctx, POS (r), "Overload N_ADD to N_CONCAT (String concat)");
@@ -10236,7 +10331,11 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         /* new ClassName(args): allocate on the heap and run the constructor.
            children: type_id(0, N_ID of class), arg_list(1, N_LIST).
            Result type is a pointer to the class.  e->def_node is set to the
-           constructor N_FUNC_DEF (or NULL when the class has none) for gen. */
+           constructor N_FUNC_DEF (or NULL when the class has none) for gen.
+
+           new dict(size?)  is a special form handled here first: it creates a
+           heap-arena-backed empty dict and returns a TM_DICT value.  The
+           optional size argument (bytes) is passed through to gen. */
         node_t type_id = NL_HEAD (r->u.ops);
         node_t arg_list = NL_NEXT (type_id);
         node_t class_def, ctor_def, ctor_id, arg, param;
@@ -10244,6 +10343,23 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         struct type *class_type;
 
         int has_named = FALSE;
+
+        /* ── new dict(size?) ─────────────────────────────────────── */
+        if (type_id->code == N_DICT) {
+          e = create_expr (c2m_ctx, r);
+          e->type->mode = TM_DICT;
+          e->type->raw_size = sizeof (void *);
+          e->type->align = sizeof (void *);
+          /* Validate optional size argument if present */
+          arg = NL_HEAD (arg_list->u.ops);
+          if (arg != NULL) {
+            check (c2m_ctx, arg, r);
+            struct expr *ae = arg->attr;
+            if (!integer_type_p (ae->type))
+              error (c2m_ctx, POS (arg), "new dict() size must be an integer");
+          }
+          break;
+        }
 
         class_def = find_def (c2m_ctx, S_REGULAR, type_id, curr_scope, NULL);
         e = create_expr (c2m_ctx, r);
@@ -10524,37 +10640,56 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           e->u.lvalue_node = r;
         }
         break;
-      case N_FIELD:
-      case N_DEREF_FIELD: {
-        symbol_t sym;
-        decl_t decl;
-        node_t width, func=NULL, func_op;;
-        struct expr *width_expr, method;
+	      case N_FIELD:
+	      case N_DEREF_FIELD: {
+	        symbol_t sym;
+	        decl_t decl;
+	        node_t width, func=NULL, func_op;;
+	        struct expr *width_expr, method;
 
-        process_unop (c2m_ctx, r, &op1, &e1, &t1, r);
-        e = create_expr (c2m_ctx, r);
-        e->type->mode = TM_BASIC;
-        e->type->u.basic_type = TP_INT;
-        op2 = NL_NEXT (op1);
-        assert (op2->code == N_ID);
-        if (r->code == N_DEREF_FIELD && t1->mode == TM_PTR) {
-          t1 = t1->u.ptr_type;
-        }
-        // Auto-dereference pointer-to-class for '.' access (e.g. this.member)
-        if (r->code == N_FIELD && t1->mode == TM_PTR && t1->u.ptr_type
-            && t1->u.ptr_type->mode == TM_CLASS) {
-          t1 = t1->u.ptr_type;
-          r->code = N_DEREF_FIELD; // rewrite so gen takes the pointer-deref path
-        }
-        /* Built-in String method access (s.length, s.substr, ...): the N_CALL
-           handler does the real work; here we just type the N_FIELD as a
-           placeholder so member resolution below doesn't reject it. */
-        if (builtin_string_type_p (t1) && get_string_method (op2->u.s.s, NULL, NULL) != SM_NONE) {
-          e->type->mode = TM_BASIC;
-          e->type->u.basic_type = TP_VOID;
-          e->u.lvalue_node = NULL;
-          break;
-        }
+	        node_t base = NL_HEAD (r->u.ops);
+	        if (base != NULL && base->code == N_STRING) {
+	          node_t mem = NL_NEXT (base);
+	          assert (mem->code == N_ID);
+	          if (get_string_method (mem->u.s.s, NULL, NULL) != SM_NONE) {
+	            /* Special case for built-in String static method: String.copy(p, len) etc.
+	               The base N_STRING here is the type keyword used as receiver for static.
+	               Do NOT process_unop the base (would treat bare "String" as char[] literal). */
+	            e = create_expr (c2m_ctx, r);
+	            e->type->mode = TM_BASIC;
+	            e->type->u.basic_type = TP_VOID;
+	            e->u.lvalue_node = NULL;
+	            break;
+	          } else {
+	            error (c2m_ctx, POS (r), "no static method '%s' on String", mem->u.s.s);
+	            break;
+	          }
+	        }
+
+	        process_unop (c2m_ctx, r, &op1, &e1, &t1, r);
+	        e = create_expr (c2m_ctx, r);
+	        e->type->mode = TM_BASIC;
+	        e->type->u.basic_type = TP_INT;
+	        op2 = NL_NEXT (op1);
+	        assert (op2->code == N_ID);
+	        if (r->code == N_DEREF_FIELD && t1->mode == TM_PTR) {
+	          t1 = t1->u.ptr_type;
+	        }
+	        // Auto-dereference pointer-to-class for '.' access (e.g. this.member)
+	        if (r->code == N_FIELD && t1->mode == TM_PTR && t1->u.ptr_type
+	            && t1->u.ptr_type->mode == TM_CLASS) {
+	          t1 = t1->u.ptr_type;
+	          r->code = N_DEREF_FIELD; // rewrite so gen takes the pointer-deref path
+	        }
+	        /* Built-in String method access (s.length, s.substr, ...): the N_CALL
+	           handler does the real work; here we just type the N_FIELD as a
+	           placeholder so member resolution below doesn't reject it. */
+	        if (builtin_string_type_p (t1) && get_string_method (op2->u.s.s, NULL, NULL) != SM_NONE) {
+	          e->type->mode = TM_BASIC;
+	          e->type->u.basic_type = TP_VOID;
+	          e->u.lvalue_node = NULL;
+	          break;
+	        }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
@@ -10635,7 +10770,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                }
              }
              break;
-          } 
+          }
          if (t1->mode == TM_DICT) {
            e = create_expr(c2m_ctx, r);
            if (strcmp(op2->u.s.s, "json") == 0) {
@@ -11083,148 +11218,229 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           check(c2m_ctx, op1, r);
           e1 = op1->attr;
           t1 = e1->type;
-          // Check if this is a method call (N_FIELD: obj.method, N_DEREF_FIELD: ptr->method)
-          if ((op1->code == N_FIELD || op1->code == N_DEREF_FIELD)) {
-            node_t obj = NL_HEAD(op1->u.ops);        // Object (obj or ptr)
-            struct type *obj_type = ((struct expr *)obj->attr)->type;
+	          // Check if this is a method call (N_FIELD: obj.method, N_DEREF_FIELD: ptr->method)
+	          if ((op1->code == N_FIELD || op1->code == N_DEREF_FIELD)) {
+	            node_t obj = NL_HEAD(op1->u.ops);        // Object (obj or ptr)
 
-            // For N_DEREF_FIELD, dereference the pointer to get the actual type
-            if (op1->code == N_DEREF_FIELD) {
-              if (obj_type->mode != TM_PTR) {
-                error(c2m_ctx, POS(r), "dereference operator applied to non-pointer in method call");
-                break;
-              }
-              obj_type = obj_type->u.ptr_type;  // Get the pointed-to type
-            }
+	            if (obj->code == N_STRING) {
+	              // Special case for built-in String identifier (static method):
+	              // String.copy(p, len), etc.  No receiver value, static lookup via get_string_method.
+	              node_t method_id = NL_NEXT(obj);
+	              int nargs = 0;
+	              enum str_method sm = get_string_method(method_id->u.s.s, &nargs, NULL);
+	              if (sm == SM_NONE) {
+	                error(c2m_ctx, POS(r), "unknown String static method '%s'", method_id->u.s.s);
+	                break;
+	              }
+	              if (NL_LENGTH(arg_list->u.ops) != nargs) {
+	                error(c2m_ctx, POS(r), "String method '%s' expects %d argument%s",
+	                      method_id->u.s.s, nargs, nargs == 1 ? "" : "s");
+	              }
+	              for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+	                if (!arg->attr) check(c2m_ctx, arg, r);
+	              init_type(&res_type);
+	              res_type.mode = TM_BASIC;
+	              if (sm == SM_COPY || sm == SM_ATTACH) {
+	                res_type.u.basic_type = TP_STRING;
+	                res_type.type_qual.const_p = 1;
+	                res_type.raw_size = 8;
+	                res_type.align = 8;
+	              } else {
+	                error(c2m_ctx, POS(r), "static String method '%s' not supported yet", method_id->u.s.s);
+	                break;
+	              }
+	              ret_type = &res_type;
+	              method_call_p = TRUE;
+	            } else {
+	              struct type *obj_type = ((struct expr *)obj->attr)->type;
 
-            // Only proceed with method call logic if the object is a class (TM_CLASS)
-            if (obj_type->mode == TM_CLASS) {
-              node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
+	              // For N_DEREF_FIELD, dereference the pointer to get the actual type
+	              if (op1->code == N_DEREF_FIELD) {
+	                if (obj_type->mode != TM_PTR) {
+	                  error(c2m_ctx, POS(r), "dereference operator applied to non-pointer in method call");
+	                  break;
+	                }
+	                obj_type = obj_type->u.ptr_type;  // Get the pointed-to type
+	              }
 
-              // Find method definition in class scope
-              node_t func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
-              if (!func_def) {
-                error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
-                break;
-              }
-              if (func_def->code != N_FUNC_DEF) {
-                error(c2m_ctx, POS(r), "member '%s' is not a function", method_id->u.s.s);
-                break;
-              }
+	              // Only proceed with method call logic if the object is a class (TM_CLASS)
+	              if (obj_type->mode == TM_CLASS) {
+	                node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
 
-              // Get function type from method definition
-              decl_t decl = func_def->attr;
-              struct type *func_type_type = decl->decl_spec.type;
-              if (func_type_type->mode != TM_FUNC) {
-                error(c2m_ctx, POS(r), "method '%s' does not have function type", method_id->u.s.s);
-                break;
-              }
-              func_type = func_type_type->u.func_type;
-              ret_type = func_type->ret_type;
+	                // Find method definition in class scope
+	                node_t func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+	                if (!func_def) {
+	                  error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
+	                  break;
+	                }
+	                if (func_def->code != N_FUNC_DEF) {
+	                  error(c2m_ctx, POS(r), "member '%s' is not a function", method_id->u.s.s);
+	                  break;
+	                }
 
-              // Create 'this' argument from a copy of obj (so we don't unlink
-              // obj from the N_FIELD/N_DEREF_FIELD child list).  The receiver is
-              // already checked, so we reuse its computed attr and do NOT re-run
-              // check on the copy: re-checking would re-execute side effects of a
-              // chained receiver (e.g. new Foo().withX(..).withY(..)), which for
-              // a method call would prepend 'this' to the shared arg list twice.
-              node_t this_arg;
-              node_t obj_copy = copy_node(c2m_ctx, obj);
-              obj_copy->attr = obj->attr;
-              if (op1->code == N_FIELD) {
-                // obj.method(): pass the address of the (value) class object.
-                this_arg = new_node1(c2m_ctx, N_ADDR, obj_copy);
-                struct expr *ae = create_expr(c2m_ctx, this_arg);
-                ae->type->mode = TM_PTR;
-                ae->type->u.ptr_type = obj_type;
-                set_type_layout(c2m_ctx, ae->type);
-              } else {
-                // ptr->method(): the receiver is already a pointer value.
-                this_arg = obj_copy;
-              }
+	                // Get function type from method definition
+	                decl_t decl = func_def->attr;
+	                struct type *func_type_type = decl->decl_spec.type;
+	                if (func_type_type->mode != TM_FUNC) {
+	                  error(c2m_ctx, POS(r), "method '%s' does not have function type", method_id->u.s.s);
+	                  break;
+	                }
+	                func_type = func_type_type->u.func_type;
+	                ret_type = func_type->ret_type;
 
-              // Prepend 'this' argument directly into the call's arg_list
-              NL_PREPEND(arg_list->u.ops, this_arg);
+	                // Determine if this is a static class method (no implicit 'this').
+	                int is_static_meth = decl->decl_spec.static_p;
 
-              // Check arguments against parameters (including 'this')
-              param_list = func_type->param_list;
-              param = NL_HEAD(param_list->u.ops);
-              for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
-                if (!arg->attr) check(c2m_ctx, arg, r);
-                e2 = arg->attr;
-                if (param == NULL) {
-                  if (!func_type->dots_p) {
-                    error(c2m_ctx, POS(arg), "too many arguments in method call");
-                  }
-                  continue;
-                }
-                struct decl_spec *decl_spec = get_param_decl_spec(param);
-                check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
-                param = NL_NEXT(param);
-              }
-              if (param != NULL) {
-                error(c2m_ctx, POS(r), "too few arguments in method call");
-              }
-              method_call_p = TRUE;
-            } else if (builtin_string_type_p(obj_type)) {
-              // Built-in String method call: s.length(), s.substr(p,n), s.find(x),
-              // s.replace(p,n,x), s.empty().  Lowered to UTF-8 runtime calls in gen.
-              node_t method_id = NL_NEXT(obj);
-              int nargs = 0;
-              enum str_method sm = get_string_method(method_id->u.s.s, &nargs, NULL);
-              if (sm == SM_NONE) {
-                error(c2m_ctx, POS(r), "unknown String method '%s'", method_id->u.s.s);
-                break;
-              }
-              if (NL_LENGTH(arg_list->u.ops) != nargs) {
-                error(c2m_ctx, POS(r), "String method '%s' expects %d argument%s",
-                      method_id->u.s.s, nargs, nargs == 1 ? "" : "s");
-              }
-              for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
-                if (!arg->attr) check(c2m_ctx, arg, r);
-              init_type(&res_type);
-              res_type.mode = TM_BASIC;
-              switch (sm) {
-              case SM_LENGTH:
-              case SM_FIND:
-                res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
-                set_type_layout(c2m_ctx, &res_type);
-                break;
-              case SM_EMPTY:
-                res_type.u.basic_type = TP_INT;
-                set_type_layout(c2m_ctx, &res_type);
-                break;
-              case SM_SUBSTR:
-              case SM_REPLACE:
-                /* String result is a char*; size/align set as in the N_STRING
-                   path (set_type_layout/basic_type_size reject TP_STRING). */
-                res_type.u.basic_type = TP_STRING;
-                res_type.type_qual.const_p = 1;
-                res_type.raw_size = 8;
-                res_type.align = 8;
-                break;
-              default: break;
-              }
-              ret_type = &res_type;
-              method_call_p = TRUE;
-            } else {
-              // Not a class, treat as regular function call (e.g., struct delegate)
-              if (t1->mode != TM_PTR || (t1 = t1->u.ptr_type)->mode != TM_FUNC) {
-                error(c2m_ctx, POS(r), "called object is not a function or function pointer");
-                break;
-              }
-              func_type = t1->u.func_type;
-              ret_type = func_type->ret_type;
-            }
-          } else {
-            // Regular function call
-            if (t1->mode != TM_PTR || (t1 = t1->u.ptr_type)->mode != TM_FUNC) {
-              error(c2m_ctx, POS(r), "called object is not a function or function pointer");
-              break;
-            }
-            func_type = t1->u.func_type;
-            ret_type = func_type->ret_type;
-          }
+	                // Detect whether the base expression is the class TYPE itself
+	                // (e.g. ClassName.method()) rather than a class instance (obj.method()).
+	                // A bare class-type reference has def_node == N_CLASS node (no lvalue).
+	                struct expr *obj_expr_attr = obj->attr;
+	                int is_type_ref = (obj_expr_attr != NULL
+	                                   && obj_expr_attr->def_node != NULL
+	                                   && obj_expr_attr->def_node->code == N_CLASS);
+
+	                // Calling a non-static method on a class type (not an instance) is an error.
+	                if (is_type_ref && !is_static_meth) {
+	                  error(c2m_ctx, POS(r),
+	                        "cannot call non-static method '%s' on class type (use an instance)",
+	                        method_id->u.s.s);
+	                  break;
+	                }
+
+	                if (!is_static_meth) {
+	                  // Non-static method: prepend 'this' argument.
+	                  // Create a copy of obj so we don't unlink it from the N_FIELD child list.
+	                  // Reuse the already-checked attr to avoid re-checking side effects.
+	                  node_t this_arg;
+	                  node_t obj_copy = copy_node(c2m_ctx, obj);
+	                  obj_copy->attr = obj->attr;
+	                  if (op1->code == N_FIELD) {
+	                    // obj.method(): pass the address of the (value) class object.
+	                    this_arg = new_node1(c2m_ctx, N_ADDR, obj_copy);
+	                    struct expr *ae = create_expr(c2m_ctx, this_arg);
+	                    ae->type->mode = TM_PTR;
+	                    ae->type->u.ptr_type = obj_type;
+	                    set_type_layout(c2m_ctx, ae->type);
+	                  } else {
+	                    // ptr->method(): the receiver is already a pointer value.
+	                    this_arg = obj_copy;
+	                  }
+	                  // Prepend 'this' argument into the call's arg_list
+	                  NL_PREPEND(arg_list->u.ops, this_arg);
+	                }
+	                // For static methods: no 'this' is added; args are passed as-is.
+
+	                // Check arguments against parameters.
+	                // For non-static methods, param_list starts with the 'this' param;
+	                // for static methods, param_list starts directly at the user params.
+	                param_list = func_type->param_list;
+	                param = NL_HEAD(param_list->u.ops);
+	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
+	                  if (!arg->attr) check(c2m_ctx, arg, r);
+	                  e2 = arg->attr;
+	                  if (param == NULL) {
+	                    if (!func_type->dots_p) {
+	                      error(c2m_ctx, POS(arg), "too many arguments in method call");
+	                    }
+	                    continue;
+	                  }
+	                  struct decl_spec *decl_spec = get_param_decl_spec(param);
+	                  check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
+	                  param = NL_NEXT(param);
+	                }
+	                if (param != NULL) {
+	                  error(c2m_ctx, POS(r), "too few arguments in method call");
+	                }
+	                method_call_p = TRUE;
+	              } else if (builtin_string_type_p(obj_type)) {
+	                // Built-in String method call: s.length(), s.substr(p,n), s.find(x),
+	                // s.replace(p,n,x), s.empty().  Lowered to UTF-8 runtime calls in gen.
+	                node_t method_id = NL_NEXT(obj);
+	                int nargs = 0;
+	                enum str_method sm = get_string_method(method_id->u.s.s, &nargs, NULL);
+	                if (sm == SM_NONE) {
+	                  error(c2m_ctx, POS(r), "unknown String method '%s'", method_id->u.s.s);
+	                  break;
+	                }
+	                if (NL_LENGTH(arg_list->u.ops) != nargs) {
+	                  error(c2m_ctx, POS(r), "String method '%s' expects %d argument%s",
+	                        method_id->u.s.s, nargs, nargs == 1 ? "" : "s");
+	                }
+	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+	                  if (!arg->attr) check(c2m_ctx, arg, r);
+	                init_type(&res_type);
+	                res_type.mode = TM_BASIC;
+	                switch (sm) {
+	                case SM_LENGTH:
+	                case SM_FIND:
+	                  res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
+	                  set_type_layout(c2m_ctx, &res_type);
+	                  break;
+	                case SM_EMPTY:
+	                  res_type.u.basic_type = TP_INT;
+	                  set_type_layout(c2m_ctx, &res_type);
+	                  break;
+	                case SM_UPPER:
+	                case SM_LOWER:
+	                case SM_SUBSTR:
+	                case SM_REPLACE:
+	                  /* String result is a char*; size/align set as in the N_STRING
+	                     path (set_type_layout/basic_type_size reject TP_STRING). */
+	                  res_type.u.basic_type = TP_STRING;
+	                  res_type.type_qual.const_p = 1;
+	                  res_type.raw_size = 8;
+	                  res_type.align = 8;
+	                  break;
+	                case SM_DETACH: {
+	                  /* Returns untracked char* — caller owns, must free() it. */
+	                  struct type *pt = create_type(c2m_ctx, NULL);
+	                  pt->mode = TM_BASIC;
+	                  pt->u.basic_type = TP_CHAR;
+	                  set_type_layout(c2m_ctx, pt);
+	                  init_type(&res_type);
+	                  res_type.mode = TM_PTR;
+	                  res_type.u.ptr_type = pt;
+	                  res_type.raw_size = 8;
+	                  res_type.align = 8;
+	                  break;
+	                }
+	                case SM_STARTS_WITH:
+	                case SM_ENDS_WITH:
+	                case SM_CONTAINS:
+	                  /* Returns int (0/1 boolean) */
+	                  res_type.u.basic_type = TP_INT;
+	                  set_type_layout(c2m_ctx, &res_type);
+	                  break;
+	                case SM_TRIM:
+	                  /* Returns a fresh String (tracked allocation) */
+	                  res_type.u.basic_type = TP_STRING;
+	                  res_type.type_qual.const_p = 1;
+	                  res_type.raw_size = 8;
+	                  res_type.align = 8;
+	                  break;
+	                default: break;
+	                }
+	                ret_type = &res_type;
+	                method_call_p = TRUE;
+	              } else {
+	                // Not a class, treat as regular function call (e.g., struct delegate)
+	                if (t1->mode != TM_PTR || (t1 = t1->u.ptr_type)->mode != TM_FUNC) {
+	                  error(c2m_ctx, POS(r), "called object is not a function or function pointer");
+	                  break;
+	                }
+	                func_type = t1->u.func_type;
+	                ret_type = func_type->ret_type;
+	              }
+	            }
+	          } else {
+	            // Regular function call
+	            if (t1->mode != TM_PTR || (t1 = t1->u.ptr_type)->mode != TM_FUNC) {
+	              error(c2m_ctx, POS(r), "called object is not a function or function pointer");
+	              break;
+	            }
+	            func_type = t1->u.func_type;
+	            ret_type = func_type->ret_type;
+	          }
         }
 
         e = create_expr(c2m_ctx, r);
@@ -11554,8 +11770,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     assert(func != NULL && func->code == N_FUNC);
     param_list = NL_HEAD(func->u.ops);
 
-        // If it's a class method, add 'this' parameter using curr_class
-            if (curr_class) {
+        // If it's a class method and NOT a static method, add 'this' parameter.
+        // Static class methods (decl_spec.static_p == TRUE) have no implicit receiver.
+            if (curr_class && !decl_spec.static_p) {
             if (c2m_options->verbose_p) printf("CLASS SCOPE\n");
             if (c2m_options->verbose_p || c2m_options->debug_p) {
                 printf("N_FUNC_DEF: entered with curr_class uid=%u code=%d has_attr=%d\n",
@@ -11610,7 +11827,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         // Prepend 'this' to the parameter list
         NL_PREPEND(param_list->u.ops, this_param);
     }
-    
+
 
     // Process parameter identifier list
     for (p = NL_HEAD(param_list->u.ops); p != NULL; p = next_p) {
@@ -12020,8 +12237,11 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     e1 = expr->attr;
     t1 = e1->type;
     r->attr = NULL; /* destructor def_node, NULL = none */
+    /* dict values are TM_DICT (a DictValue* pointer at MIR level); they are
+       freed by dict_destroy() which handles both arena-backed and plain dicts. */
+    if (t1->mode == TM_DICT) break;
     if (t1->mode != TM_PTR) {
-      error (c2m_ctx, POS (r), "delete requires a pointer operand");
+      error (c2m_ctx, POS (r), "delete requires a pointer operand (or a dict)");
     } else {
       struct type *pt = t1->u.ptr_type;
       if (pt != NULL && pt->mode == TM_CLASS && pt->u.tag_type != NULL) {
@@ -12069,8 +12289,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     }
     break;
   }
-  
-  default: 
+
+  default:
     printf("ERROR: invalid r->code = %d\n", r->code);
       abort ();
   }
@@ -12246,15 +12466,26 @@ struct gen_ctx {
   MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
   MIR_item_t dict_serialize_json_proto, dict_serialize_json_item;
   MIR_item_t dict_deserialize_json_proto, dict_deserialize_json_item;
+  MIR_item_t dict_destroy_proto, dict_destroy_item;              /* delete d  */
+  MIR_item_t dict_create_heap_arena_proto, dict_create_heap_arena_item; /* new dict() */
   /* String (UTF-8) runtime helpers */
   MIR_item_t str_length_proto, str_length_item;
   MIR_item_t str_empty_proto, str_empty_item;
   MIR_item_t str_substr_proto, str_substr_item;
   MIR_item_t str_find_proto, str_find_item;
   MIR_item_t str_replace_proto, str_replace_item;
+  MIR_item_t str_upper_proto, str_upper_item;
+  MIR_item_t str_lower_proto, str_lower_item;
+  MIR_item_t str_starts_with_proto, str_starts_with_item;
+  MIR_item_t str_ends_with_proto, str_ends_with_item;
+  MIR_item_t str_contains_proto, str_contains_item;
+  MIR_item_t str_trim_proto, str_trim_item;
+  MIR_item_t str_detach_proto, str_detach_item;
+  MIR_item_t str_attach_proto, str_attach_item;
   MIR_item_t str_checkpoint_proto, str_checkpoint_item;
   MIR_item_t str_release_to_proto, str_release_to_item;
   MIR_item_t str_release_keeping_proto, str_release_keeping_item;
+  MIR_item_t str_copy_proto, str_copy_item;
   /* String `+` concatenation / basic-type auto-cast helpers */
   MIR_item_t str_concat_proto, str_concat_item;
   MIR_item_t str_from_i64_proto;  /* shared char*(int64) proto */
@@ -12321,6 +12552,10 @@ struct gen_ctx {
 #define dict_serialize_json_item gen_ctx->dict_serialize_json_item
 #define dict_deserialize_json_proto gen_ctx->dict_deserialize_json_proto
 #define dict_deserialize_json_item gen_ctx->dict_deserialize_json_item
+#define dict_destroy_proto gen_ctx->dict_destroy_proto
+#define dict_destroy_item  gen_ctx->dict_destroy_item
+#define dict_create_heap_arena_proto gen_ctx->dict_create_heap_arena_proto
+#define dict_create_heap_arena_item  gen_ctx->dict_create_heap_arena_item
 #define str_length_proto gen_ctx->str_length_proto
 #define str_length_item gen_ctx->str_length_item
 #define str_empty_proto gen_ctx->str_empty_proto
@@ -12331,12 +12566,30 @@ struct gen_ctx {
 #define str_find_item gen_ctx->str_find_item
 #define str_replace_proto gen_ctx->str_replace_proto
 #define str_replace_item gen_ctx->str_replace_item
+#define str_upper_proto gen_ctx->str_upper_proto
+#define str_upper_item gen_ctx->str_upper_item
+#define str_lower_proto gen_ctx->str_lower_proto
+#define str_lower_item gen_ctx->str_lower_item
+#define str_starts_with_proto gen_ctx->str_starts_with_proto
+#define str_starts_with_item gen_ctx->str_starts_with_item
+#define str_ends_with_proto gen_ctx->str_ends_with_proto
+#define str_ends_with_item gen_ctx->str_ends_with_item
+#define str_contains_proto gen_ctx->str_contains_proto
+#define str_contains_item gen_ctx->str_contains_item
+#define str_trim_proto gen_ctx->str_trim_proto
+#define str_trim_item gen_ctx->str_trim_item
+#define str_detach_proto gen_ctx->str_detach_proto
+#define str_detach_item gen_ctx->str_detach_item
+#define str_attach_proto gen_ctx->str_attach_proto
+#define str_attach_item gen_ctx->str_attach_item
 #define str_checkpoint_proto gen_ctx->str_checkpoint_proto
 #define str_checkpoint_item gen_ctx->str_checkpoint_item
 #define str_release_to_proto gen_ctx->str_release_to_proto
 #define str_release_to_item gen_ctx->str_release_to_item
 #define str_release_keeping_proto gen_ctx->str_release_keeping_proto
 #define str_release_keeping_item gen_ctx->str_release_keeping_item
+#define str_copy_proto gen_ctx->str_copy_proto
+#define str_copy_item gen_ctx->str_copy_item
 #define str_concat_proto gen_ctx->str_concat_proto
 #define str_concat_item gen_ctx->str_concat_item
 #define str_from_i64_proto gen_ctx->str_from_i64_proto
@@ -12480,7 +12733,7 @@ static MIR_type_t get_mir_type (c2m_ctx_t c2m_ctx, struct type *type) {
   if (type->mode == TM_DICT) return MIR_T_I64; /* dict is a DictValue* pointer */
   int int_p = !floating_type_p (type), signed_p = signed_integer_type_p (type);
 
-  //RSD: New 
+  //RSD: New
   if (type->mode == TM_CLASS || type->mode == TM_STRUCT || type->mode == TM_UNION)
         return MIR_T_UNDEF;  // Classes treated as aggregates like structs
 
@@ -14085,6 +14338,20 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   dict_serialize_json_item = MIR_new_import (ctx, "dict_serialize_json");
   move_item_to_module_start (module, dict_serialize_json_proto);
   move_item_to_module_start (module, dict_serialize_json_item);
+
+  /* dict_destroy(DictValue *val) -> void  — used by `delete d` for dict */
+  vars[0].name = "val"; vars[0].type = MIR_T_I64;
+  dict_destroy_proto = MIR_new_proto_arr (ctx, "__dict_destroy_p", 0, NULL, 1, vars);
+  dict_destroy_item = MIR_new_import (ctx, "dict_destroy");
+  move_item_to_module_start (module, dict_destroy_proto);
+  move_item_to_module_start (module, dict_destroy_item);
+
+  /* dict_create_heap_arena(size_t bytes) -> DictValue*  — used by `new dict(size)` */
+  vars[0].name = "bytes"; vars[0].type = MIR_T_I64;
+  dict_create_heap_arena_proto = MIR_new_proto_arr (ctx, "__dict_create_heap_arena_p", 1, &ptr_t, 1, vars);
+  dict_create_heap_arena_item = MIR_new_import (ctx, "dict_create_heap_arena");
+  move_item_to_module_start (module, dict_create_heap_arena_proto);
+  move_item_to_module_start (module, dict_create_heap_arena_item);
 }
 
 /* Emit: res = dict_create_object() */
@@ -14099,6 +14366,35 @@ static op_t gen_dict_create_object (c2m_ctx_t c2m_ctx) {
   args[1] = MIR_new_ref_op (ctx, dict_create_object_item);
   args[2] = res.mir_op;
   emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  return res;
+}
+
+/* Emit: dict_destroy(val)  — called by `delete d` for dict values. */
+static void gen_dict_destroy (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  dict_ensure_imports (c2m_ctx);
+  args[0] = MIR_new_ref_op (ctx, dict_destroy_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_destroy_item);
+  args[2] = val_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+}
+
+/* Emit: res = dict_create_heap_arena(bytes)  — called by `new dict(size?)`. */
+static op_t gen_dict_create_heap_arena_call (c2m_ctx_t c2m_ctx, MIR_op_t size_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_create_heap_arena_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_create_heap_arena_item);
+  args[2] = res.mir_op;
+  args[3] = size_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
   return res;
 }
 
@@ -14433,6 +14729,65 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, str_replace_proto);
   move_item_to_module_start (module, str_replace_item);
 
+  /* char *c2m_str_upper(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_upper_proto = MIR_new_proto_arr (ctx, "__c2m_str_upper_p", 1, &ptr_t, 1, vars);
+  str_upper_item = MIR_new_import (ctx, "c2m_str_upper");
+  move_item_to_module_start (module, str_upper_proto);
+  move_item_to_module_start (module, str_upper_item);
+
+  /* char *c2m_str_lower(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_lower_proto = MIR_new_proto_arr (ctx, "__c2m_str_lower_p", 1, &ptr_t, 1, vars);
+  str_lower_item = MIR_new_import (ctx, "c2m_str_lower");
+  move_item_to_module_start (module, str_lower_proto);
+  move_item_to_module_start (module, str_lower_item);
+
+  /* int64_t c2m_str_starts_with(const char *s, const char *prefix) */
+  vars[0].name = "s";      vars[0].type = MIR_T_I64;
+  vars[1].name = "prefix"; vars[1].type = MIR_T_I64;
+  str_starts_with_proto = MIR_new_proto_arr (ctx, "__c2m_str_starts_with_p", 1, &ptr_t, 2, vars);
+  str_starts_with_item = MIR_new_import (ctx, "c2m_str_starts_with");
+  move_item_to_module_start (module, str_starts_with_proto);
+  move_item_to_module_start (module, str_starts_with_item);
+
+  /* int64_t c2m_str_ends_with(const char *s, const char *suffix) */
+  vars[0].name = "s";      vars[0].type = MIR_T_I64;
+  vars[1].name = "suffix"; vars[1].type = MIR_T_I64;
+  str_ends_with_proto = MIR_new_proto_arr (ctx, "__c2m_str_ends_with_p", 1, &ptr_t, 2, vars);
+  str_ends_with_item = MIR_new_import (ctx, "c2m_str_ends_with");
+  move_item_to_module_start (module, str_ends_with_proto);
+  move_item_to_module_start (module, str_ends_with_item);
+
+  /* int64_t c2m_str_contains(const char *s, const char *needle) */
+  vars[0].name = "s";      vars[0].type = MIR_T_I64;
+  vars[1].name = "needle"; vars[1].type = MIR_T_I64;
+  str_contains_proto = MIR_new_proto_arr (ctx, "__c2m_str_contains_p", 1, &ptr_t, 2, vars);
+  str_contains_item = MIR_new_import (ctx, "c2m_str_contains");
+  move_item_to_module_start (module, str_contains_proto);
+  move_item_to_module_start (module, str_contains_item);
+
+  /* char *c2m_str_trim(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_trim_proto = MIR_new_proto_arr (ctx, "__c2m_str_trim_p", 1, &ptr_t, 1, vars);
+  str_trim_item = MIR_new_import (ctx, "c2m_str_trim");
+  move_item_to_module_start (module, str_trim_proto);
+  move_item_to_module_start (module, str_trim_item);
+
+  /* char *c2m_str_detach(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_detach_proto = MIR_new_proto_arr (ctx, "__c2m_str_detach_p", 1, &ptr_t, 1, vars);
+  str_detach_item = MIR_new_import (ctx, "c2m_str_detach");
+  move_item_to_module_start (module, str_detach_proto);
+  move_item_to_module_start (module, str_detach_item);
+
+  /* char *c2m_str_attach(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_attach_proto = MIR_new_proto_arr (ctx, "__c2m_str_attach_p", 1, &ptr_t, 1, vars);
+  str_attach_item = MIR_new_import (ctx, "c2m_str_attach");
+  move_item_to_module_start (module, str_attach_proto);
+  move_item_to_module_start (module, str_attach_item);
+
   /* size_t c2m_str_checkpoint(void) */
   str_checkpoint_proto = MIR_new_proto_arr (ctx, "__c2m_str_checkpoint_p", 1, &ptr_t, 0, NULL);
   str_checkpoint_item = MIR_new_import (ctx, "c2m_str_checkpoint");
@@ -14451,11 +14806,19 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   vars[1].name = "keep"; vars[1].type = MIR_T_I64;
   str_release_keeping_proto
     = MIR_new_proto_arr (ctx, "__c2m_str_release_keeping_p", 0, NULL, 2, vars);
-  str_release_keeping_item = MIR_new_import (ctx, "c2m_str_release_keeping");
-  move_item_to_module_start (module, str_release_keeping_proto);
-  move_item_to_module_start (module, str_release_keeping_item);
+	  str_release_keeping_item = MIR_new_import (ctx, "c2m_str_release_keeping");
+	  move_item_to_module_start (module, str_release_keeping_proto);
+	  move_item_to_module_start (module, str_release_keeping_item);
 
-  /* char *c2m_str_concat(const char *a, const char *b) */
+	  /* char *c2m_str_copy(const char *p, int64_t len) */
+	  vars[0].name = "p";   vars[0].type = MIR_T_I64;
+	  vars[1].name = "len"; vars[1].type = MIR_T_I64;
+	  str_copy_proto = MIR_new_proto_arr (ctx, "__c2m_str_copy_p", 1, &ptr_t, 2, vars);
+	  str_copy_item = MIR_new_import (ctx, "c2m_str_copy");
+	  move_item_to_module_start (module, str_copy_proto);
+	  move_item_to_module_start (module, str_copy_item);
+
+	  /* char *c2m_str_concat(const char *a, const char *b) */
   vars[0].name = "a"; vars[0].type = MIR_T_I64;
   vars[1].name = "b"; vars[1].type = MIR_T_I64;
   str_concat_proto = MIR_new_proto_arr (ctx, "__c2m_str_concat_p", 1, &ptr_t, 2, vars);
@@ -14573,9 +14936,18 @@ static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *va
   case SM_EMPTY:   proto = str_empty_proto;   item = str_empty_item;   break;
   case SM_SUBSTR:  proto = str_substr_proto;  item = str_substr_item;  break;
   case SM_FIND:    proto = str_find_proto;    item = str_find_item;    break;
-  case SM_REPLACE: proto = str_replace_proto; item = str_replace_item; break;
-  default: assert (0); break;
-  }
+	  case SM_REPLACE: proto = str_replace_proto; item = str_replace_item; break;
+		  case SM_UPPER:   proto = str_upper_proto;   item = str_upper_item;   break;
+		  case SM_LOWER:   proto = str_lower_proto;   item = str_lower_item;   break;
+		  case SM_DETACH:      proto = str_detach_proto;      item = str_detach_item;      break;
+				  case SM_ATTACH:      proto = str_attach_proto;      item = str_attach_item;      break;
+				  case SM_COPY:        proto = str_copy_proto;        item = str_copy_item;        break;
+				  case SM_STARTS_WITH: proto = str_starts_with_proto; item = str_starts_with_item; break;
+				  case SM_ENDS_WITH:   proto = str_ends_with_proto;   item = str_ends_with_item;   break;
+				  case SM_CONTAINS:    proto = str_contains_proto;    item = str_contains_item;    break;
+				  case SM_TRIM:        proto = str_trim_proto;        item = str_trim_item;        break;
+				  default: assert (0); break;
+	}
   op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
   args[0] = MIR_new_ref_op (ctx, proto);
   args[1] = MIR_new_ref_op (ctx, item);
@@ -14643,23 +15015,35 @@ static int node_is_leaf_p (node_code_t c) {
   }
 }
 
-/* Does this subtree contain a String method call that allocates (substr or
-   replace)?  Used to decide whether a function body needs automatic scope
-   reclamation.  Nested function definitions are not descended into -- their
-   allocations belong to their own scope. */
+/* Does this subtree contain any expression that allocates a tracked String?
+   Covers: the `+` concat operator (N_CONCAT), String.copy/attach (static
+   methods), and instance methods that return new Strings (.substr, .replace,
+   .upper, .lower, .trim).  Used to decide whether a function body needs
+   automatic scope reclamation via checkpoint/release_to.
+   Nested function definitions are not descended into -- their allocations
+   belong to their own scope. */
 static int subtree_allocates_string_p (node_t n) {
   if (n == NULL || node_is_leaf_p (n->code)) return FALSE;
+  /* N_CONCAT is the `String +` operator node -- always heap-allocates. */
+  if (n->code == N_CONCAT) return TRUE;
   if (n->code == N_CALL) {
     node_t f = NL_HEAD (n->u.ops);
-    if (f != NULL && (f->code == N_FIELD || f->code == N_DEREF_FIELD)) {
-      node_t obj = NL_HEAD (f->u.ops);
-      node_t m = obj == NULL ? NULL : NL_NEXT (obj);
-      struct expr *oe = obj == NULL ? NULL : obj->attr;
-      if (oe != NULL && builtin_string_type_p (oe->type) && m != NULL && m->code == N_ID) {
-        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
-        if (sm == SM_SUBSTR || sm == SM_REPLACE) return TRUE;
-      }
-    }
+	    if (f != NULL && (f->code == N_FIELD || f->code == N_DEREF_FIELD)) {
+	      node_t obj = NL_HEAD (f->u.ops);
+	      node_t m = obj == NULL ? NULL : NL_NEXT (obj);
+	      if (obj != NULL && obj->code == N_STRING && m != NULL && m->code == N_ID) {
+	        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+	        /* Both copy (allocates) and attach (registers external ptr) add to
+	           the tracker and need a scope checkpoint for cleanup. */
+	        if (sm == SM_COPY || sm == SM_ATTACH) return TRUE;
+	      }
+	      struct expr *oe = obj == NULL ? NULL : obj->attr;
+	      if (oe != NULL && builtin_string_type_p (oe->type) && m != NULL && m->code == N_ID) {
+	        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+	        if (sm == SM_SUBSTR || sm == SM_REPLACE
+	            || sm == SM_UPPER || sm == SM_LOWER || sm == SM_TRIM) return TRUE;
+	      }
+	    }
   }
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
     if (c->code == N_FUNC_DEF) continue; /* separate scope */
@@ -15438,12 +15822,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                 node_t current_scope = func_decl->scope;
                 int found_class = FALSE;
                 int scope_level = 0;
-                
+
                 // Check if this function is defined in a class scope
                 if( func_decl ) {
                     res = new_op (NULL, MIR_new_ref_op (ctx, func_decl->u.item));
                 }
-                
+
                 if (!found_class) {
                     // Not a method, use original logic
                     res = new_op (NULL, MIR_new_ref_op (ctx, ((decl_t) e->def_node->attr)->u.item));
@@ -15823,6 +16207,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* new ClassName(args): obj = malloc(sizeof(Class)); memset 0; ctor(obj,args). */
     struct expr *ne = r->attr;
     node_t type_id = NL_HEAD (r->u.ops);
+    /* ── new dict(size?) ─────────────────────────────────────────────── */
+    if (type_id->code == N_DICT) {
+      node_t size_arg = NL_HEAD (NL_NEXT (type_id)->u.ops);
+      MIR_op_t size_op = size_arg
+        ? val_gen (c2m_ctx, size_arg).mir_op
+        : MIR_new_int_op (c2m_ctx->ctx, 0); /* 0 = use default in dict_create_heap_arena */
+      res = gen_dict_create_heap_arena_call (c2m_ctx, size_op);
+      break;
+    }
     node_t arg_list = NL_NEXT (type_id);
     node_t ctor_def = ne->def_node;
     struct type *class_type = ne->type->u.ptr_type;
@@ -16017,10 +16410,34 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       break;
     }
     /* Built-in String method call: lower s.method(...) to a UTF-8 runtime call. */
-    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
-      node_t mobj = NL_HEAD (func->u.ops);
-      struct expr *obj_e = mobj->attr;
-      if (obj_e != NULL && builtin_string_type_p (obj_e->type)) {
+	    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+	      node_t mobj = NL_HEAD (func->u.ops);
+	      if (mobj->code == N_STRING) {
+	        /* Static built-in String method: String.copy(p, len) etc. No receiver. */
+	        node_t method_id = NL_NEXT (mobj);
+	        enum str_method sm = get_string_method (method_id->u.s.s, NULL, NULL);
+	        if (sm != SM_NONE) {
+	          MIR_op_t vals[4];
+	          int i = 0;
+	          for (node_t arg = (args ? NL_HEAD (args->u.ops) : NULL); arg; arg = NL_NEXT (arg)) {
+	        if (sm == SM_COPY) {
+	              vals[i++] = (i == 0
+	                ? val_gen (c2m_ctx, arg)
+	                : promote (c2m_ctx, val_gen (c2m_ctx, arg), MIR_T_I64, FALSE)
+	              ).mir_op;
+	            } else if (sm == SM_ATTACH) {
+	              /* attach: single char* arg passed as I64 pointer */
+	              vals[i++] = val_gen (c2m_ctx, arg).mir_op;
+	            } else {
+	              vals[i++] = val_gen (c2m_ctx, arg).mir_op;
+	            }
+	          }
+	          res = gen_string_call (c2m_ctx, sm, vals, i);
+	          goto finish;
+	        }
+	      }
+	      struct expr *obj_e = mobj->attr;
+	      if (obj_e != NULL && builtin_string_type_p (obj_e->type)) {
         node_t method_id = NL_NEXT (mobj);
         enum str_method sm = get_string_method (method_id->u.s.s, NULL, NULL);
         if (sm != SM_NONE) {
@@ -16056,6 +16473,30 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                   || (lval.mir_op.mode == MIR_OP_MEM && lval.mir_op.u.mem.index == 0))
                 emit2 (c2m_ctx, MIR_MOV, lval.mir_op, res.mir_op);
             }
+            break;
+          case SM_UPPER:
+            res = gen_string_call (c2m_ctx, SM_UPPER, vals, 1);
+            break;
+          case SM_LOWER:
+            res = gen_string_call (c2m_ctx, SM_LOWER, vals, 1);
+            break;
+          case SM_DETACH:
+            res = gen_string_call (c2m_ctx, SM_DETACH, vals, 1);
+            break;
+          case SM_STARTS_WITH:
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_STARTS_WITH, vals, 2);
+            break;
+          case SM_ENDS_WITH:
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_ENDS_WITH, vals, 2);
+            break;
+          case SM_CONTAINS:
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_CONTAINS, vals, 2);
+            break;
+          case SM_TRIM:
+            res = gen_string_call (c2m_ctx, SM_TRIM, vals, 1);
             break;
           default: break;
           }
@@ -16240,7 +16681,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         decl_t curr_decl;
         size_t i, init_start;
         const char *name;
-    
+
         decl = (decl_t) r->attr;
 
         /* Visit embedded N_CLASS (and N_STRUCT/N_UNION) from the spec list so that
@@ -16509,14 +16950,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     printf("gen processing N_CLASS\n");
     node_t id = NL_HEAD(r->u.ops);
     node_t decl_list = NL_NEXT(id);
-    
+
     if (c2m_options->debug_p) {
       printf("DEBUG: Processing CLASS node %p\n", (void*)r);
       if (id->code == N_ID) {
         printf("DEBUG: Class name = %s\n", id->u.s.s);
       }
     }
-    
+
     if (decl_list->code != N_IGNORE) {
       for (node_t member = NL_HEAD(decl_list->u.ops); member != NULL; member = NL_NEXT(member)) {
         if (member->code == N_FUNC_DEF) {
@@ -16556,7 +16997,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_reg_t fp_reg, param_reg;
     target_arg_info_t arg_info;
     char name[256] = {0};
-    
+
     // NEW: Check if this function is defined inside a class
     int is_method = FALSE;
     const char *class_name = NULL;
@@ -16588,7 +17029,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         if (def_node && def_node == r) { // This is our function definition
             // Check if this function's scope has a class parent
             node_t current_scope = func_decl->scope;
-            
+
             // Walk up the scope hierarchy to find a class
             while (current_scope) {
                 // Check if current scope is a class
@@ -16601,7 +17042,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                         break;
                     }
                 }
-                
+
                 // Move to parent scope
                 struct node_scope *scope_attr = current_scope->attr;
                 if (scope_attr) {
@@ -16744,7 +17185,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       DLIST_APPEND (MIR_insn_t, curr_func->u.func->insns, insn);
     }
     // RSD Ensure all function references in instructions are valid
-    for (MIR_insn_t insn = DLIST_HEAD(MIR_insn_t, curr_func->u.func->insns); 
+    for (MIR_insn_t insn = DLIST_HEAD(MIR_insn_t, curr_func->u.func->insns);
          insn != NULL; insn = DLIST_NEXT(MIR_insn_t, insn)) {
       for (size_t i = 0; i < insn->nops; i++) {
         if (insn->ops[i].mode == MIR_OP_REF && insn->ops[i].u.ref == NULL) {
@@ -16754,7 +17195,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
     }
     MIR_finish_func (ctx);
-    
+
     // NEW: Export with the appropriate name
     if (func_decl->decl_spec.linkage == N_EXTERN) {
         if (is_method && class_name != NULL) {
@@ -16763,9 +17204,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             MIR_new_export (ctx, DECL_ID (declarator)->u.s.s); // Use original name for regular functions
         }
     }
-    
 
-    
+
+
     finish_curr_func_reg_vars (c2m_ctx);
     break;
   }
@@ -17274,14 +17715,25 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     VARR_PUSH (node_t, defer_stmts, NL_EL (r->u.ops, 1));
     break;
   case N_DELETE: {
-    /* delete <ptr>: run the destructor (if any) then free the heap object. */
+    /* delete <ptr>: run the destructor (if any) then free the heap object.
+       delete <dict>: call dict_destroy(d) which handles arena-backed and
+       plain dicts uniformly (frees arena in one shot or recurses). */
     node_t expr = NL_EL (r->u.ops, 1);
     node_t dtor_def = (node_t) r->attr; /* resolved in check, NULL if none */
 
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
-    op1 = val_gen (c2m_ctx, expr); /* the heap pointer */
-    op1 = force_reg (c2m_ctx, op1, MIR_T_I64); /* stable: used by dtor and free */
+    op1 = val_gen (c2m_ctx, expr);
+    op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
+
+    /* ── dict: delegate entirely to dict_destroy ──────────────────────── */
+    {
+      struct expr *del_e = expr->attr;
+      if (del_e && del_e->type && del_e->type->mode == TM_DICT) {
+        gen_dict_destroy (c2m_ctx, op1.mir_op);
+        break;
+      }
+    }
     if (dtor_def != NULL) {
       decl_t cdecl = dtor_def->attr;
       struct func_type *ft = cdecl->decl_spec.type->u.func_type;
@@ -17324,7 +17776,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     res = gen_str_concat_call (c2m_ctx, s1.mir_op, s2.mir_op);
     break;
   }
-  
+
   default: abort ();
   }
 finish:
@@ -17430,9 +17882,12 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
       node_t sobj = NL_HEAD (func->u.ops);
       struct expr *sobj_e = sobj->attr;
       node_t smethod = NL_NEXT (sobj);
-      if (sobj_e != NULL && builtin_string_type_p (sobj_e->type) && smethod != NULL
-          && smethod->code == N_ID
-          && get_string_method (smethod->u.s.s, NULL, NULL) != SM_NONE)
+      /* Skip both static String calls (String.copy where sobj is bare N_STRING keyword
+         with no attr) and instance String method calls (s.length() etc.). */
+      if (smethod != NULL && smethod->code == N_ID
+          && get_string_method (smethod->u.s.s, NULL, NULL) != SM_NONE
+          && (sobj->code == N_STRING
+              || (sobj_e != NULL && builtin_string_type_p (sobj_e->type))))
         continue;
     }
     type = ((struct expr *) func->attr)->type;

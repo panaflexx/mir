@@ -41,7 +41,7 @@ static size_t dict_arena_used(const DictArena *a) { return a ? a->used : 0; }
 
 /* Internal allocator helper */
 static void *dict_alloc(DictArena *arena, size_t sz) {
-    if (!arena) return malloc(sz);
+    if (!arena) return calloc(1, sz); /* zero-init so owned_arena starts NULL */
     if (arena->used + sz > arena->size) return NULL; /* OOM in arena */
     void *p = arena->buf + arena->used;
     arena->used += sz;
@@ -95,6 +95,11 @@ struct DictValue {
         DictArray array_value;
         DictObject object_value;
     };
+    /* Non-NULL only on the *root* object of a heap-arena-backed dict.
+       Points to the DictArena header that was co-allocated with its buffer
+       in a single malloc().  dict_destroy() uses this to free everything in
+       one shot instead of a recursive walk. */
+    DictArena *owned_arena;
 };
 
 static char *dict_strdup(const char *src) {
@@ -568,8 +573,51 @@ static DictValue *dict_object_value_at(const DictValue *obj, size_t index) {
 
 static void dict_destroy(DictValue *val) {
     if (!val) return;
+    DictArena *arena = val->owned_arena;
+    /* Always free the heap-allocated contents (keys, pair arrays, nested
+       values) regardless of whether an arena backs the root. */
+    val->owned_arena = NULL; /* prevent re-entry */
     dict_value_free(val);
-    free(val);
+    if (arena) {
+        /* Arena-backed root: the DictArena header and its buffer were
+           co-allocated in a single malloc() by dict_create_heap_arena().
+           One free() reclaims everything. */
+        free(arena);
+    } else {
+        /* Standard path: root DictValue was individually malloc'd. */
+        free(val);
+    }
+}
+
+/* Create a dict whose root DictValue is backed by a heap-owned arena.
+ *
+ * The DictArena header and its buffer are co-allocated in one malloc() call:
+ *   [ DictArena header ][ arena buffer (bytes) ]
+ *
+ * The root DictValue is bump-allocated from the start of the arena buffer.
+ * Keys, nested values, and pair arrays added via dict_object_set() still use
+ * individual malloc() calls (the full arena path is future work), so
+ * dict_destroy() still recurses to free those — but the single free(arena)
+ * at the end reclaims the arena block rather than free(root_val).
+ *
+ * Typical use:
+ *   dict d = dict_create_heap_arena(256 * 1024);
+ *   defer_delete(d);           // dict_destroy(d) frees everything cleanly
+ */
+static DictValue *dict_create_heap_arena(size_t bytes) {
+    if (bytes == 0) bytes = 256 * 1024; /* 256 KB default */
+    /* Single allocation: [DictArena header][arena buffer] */
+    size_t total = sizeof(DictArena) + bytes;
+    char *block = (char *)malloc(total);
+    if (!block) return NULL;
+    DictArena *a = (DictArena *)block;
+    a->buf  = block + sizeof(DictArena);
+    a->size = bytes;
+    a->used = 0;
+    DictValue *root = dict_create_object_arena(a);
+    if (!root) { free(block); return NULL; }
+    root->owned_arena = a;
+    return root;
 }
 
 /* Deep-copy a DictValue onto the heap (recursive).  Returns a fully
