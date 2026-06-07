@@ -9,6 +9,8 @@
 
 /* Include dict.h to make dict runtime functions available to the import resolver */
 #include "../inc/dict.h"
+/* Include cstring.h to make the UTF-8 String runtime available to the resolver */
+#include "../inc/cstring.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -478,6 +480,16 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "dict_object_count") == 0) return (void *) dict_object_count;
     if (strcmp (name, "dict_object_key_at") == 0) return (void *) dict_object_key_at;
     if (strcmp (name, "dict_object_value_at") == 0) return (void *) dict_object_value_at;
+    /* String runtime functions (from cstring.h, compiled statically) */
+    if (strcmp (name, "c2m_str_length") == 0) return (void *) c2m_str_length;
+    if (strcmp (name, "c2m_str_empty") == 0) return (void *) c2m_str_empty;
+    if (strcmp (name, "c2m_str_substr") == 0) return (void *) c2m_str_substr;
+    if (strcmp (name, "c2m_str_find") == 0) return (void *) c2m_str_find;
+    if (strcmp (name, "c2m_str_replace") == 0) return (void *) c2m_str_replace;
+    if (strcmp (name, "c2m_str_cleanup") == 0) return (void *) c2m_str_cleanup;
+    if (strcmp (name, "c2m_str_checkpoint") == 0) return (void *) c2m_str_checkpoint;
+    if (strcmp (name, "c2m_str_release_to") == 0) return (void *) c2m_str_release_to;
+    if (strcmp (name, "c2m_str_release_keeping") == 0) return (void *) c2m_str_release_keeping;
     fprintf (stderr, "can not load symbol %s\n", name);
     close_std_libs ();
     exit (1);

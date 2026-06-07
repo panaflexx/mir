@@ -4380,6 +4380,27 @@ static int match (c2m_ctx_t c2m_ctx, int c, pos_t *pos, node_code_t *node_code, 
 #define MC(c, pos, code) match (c2m_ctx, c, &(pos), &(code), NULL)
 #define MN(c, node) match (c2m_ctx, c, NULL, NULL, &(node))
 
+/* Match a context-sensitive ("soft") keyword: an ordinary identifier with the
+   given spelling, consumed only in grammar positions that expect it.  This lets
+   words like `in` act as keywords (dict membership, for-in) while remaining
+   usable as normal C identifiers (variables, parameters, members) elsewhere. */
+static int match_soft_kw (c2m_ctx_t c2m_ctx, const char *kw, pos_t *pos, node_t *node) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  if (curr_token->code != T_ID || curr_token->repr == NULL
+      || strcmp (curr_token->repr, kw) != 0)
+    return FALSE;
+  if (pos != NULL) *pos = curr_token->pos;
+  if (node != NULL) *node = curr_token->node;
+  read_token (c2m_ctx);
+  return TRUE;
+}
+
+#define C_SOFT(kw) (curr_token->code == T_ID && curr_token->repr != NULL \
+                    && strcmp (curr_token->repr, kw) == 0)
+#define M_SOFT(kw) match_soft_kw (c2m_ctx, kw, NULL, NULL)
+#define MP_SOFT(kw, pos) match_soft_kw (c2m_ctx, kw, &(pos), NULL)
+
 static node_t try_f (c2m_ctx_t c2m_ctx, nonterm_func_t f) {
   size_t mark = record_start (c2m_ctx);
   node_t r = (f) (c2m_ctx, TRUE);
@@ -4611,8 +4632,8 @@ D (rel_expr) {
       P (sh_expr);
       op_append (c2m_ctx, n, r);
       r = n;
-    } else if (MP (T_IN, pos)) {
-      /* "key" in dict  —  dict key-existence check */
+    } else if (MP_SOFT ("in", pos)) {
+      /* "key" in dict  —  dict key-existence check (soft keyword) */
       n = new_pos_node1 (c2m_ctx, N_IN, pos, r);
       P (sh_expr);
       op_append (c2m_ctx, n, r);
@@ -4646,7 +4667,33 @@ D (cond_expr) {
 
 #define const_expr cond_expr
 
-D (assign_expr) { return right_op (c2m_ctx, no_err_p, T_ASSIGN, '=', cond_expr, assign_expr); }
+D (assign_expr) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t r, n;
+  pos_t pos;
+  node_code_t code;
+
+  P (cond_expr);
+  if (MC (T_ASSIGN, pos, code) || MC ('=', pos, code)) {
+    n = new_pos_node1 (c2m_ctx, code, pos, r);
+    if (code == N_ASSIGN && C ('{')) {
+      /* dict-literal assignment: lhs = { "k": v, ... }.  An ordinary C
+         expression can never start with '{', so this is unambiguous.  The
+         braces are parsed with the same initializer_list grammar used for
+         dict declarations, producing an N_LIST of N_INIT children. */
+      PT ('{');
+      P (initializer_list);
+      if (M (',')) {
+      }
+      PT ('}');
+    } else {
+      P (assign_expr);
+    }
+    op_append (c2m_ctx, n, r);
+    r = n;
+  }
+  return r;
+}
 D (expr) { return right_op (c2m_ctx, no_err_p, ',', -1, assign_expr, expr); }
 
 /* Declarations: */
@@ -5804,7 +5851,7 @@ D (stmt) {
           /* for (auto key, val in expr) */
           if (C (T_ID)) { MN (T_ID, r); val_id = r; }
         }
-        if (M (T_IN)) { is_forin = TRUE; }
+        if (M_SOFT ("in")) { is_forin = TRUE; }
       }
       if (is_forin) {
         /* Commit — parse as for-in */
@@ -6053,7 +6100,9 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   kw_add (c2m_ctx, "else", T_ELSE, 0);
   kw_add (c2m_ctx, "enum", T_ENUM, 0);
   kw_add (c2m_ctx, "dict", T_DICT, 0);
-  kw_add (c2m_ctx, "in", T_IN, 0);
+  /* `in` is a context-sensitive (soft) keyword recognized only in the dict
+     membership operator and for-in loops, so it stays usable as an ordinary
+     C identifier (variable/parameter/member name) everywhere else. */
   kw_add (c2m_ctx, "extern", T_EXTERN, 0);
   kw_add (c2m_ctx, "float", T_FLOAT, 0);
   kw_add (c2m_ctx, "for", T_FOR, 0);
@@ -6388,6 +6437,40 @@ static int string_type_p (const struct type *type) {
         return 1;
     return (type->mode == TM_BASIC || type->mode == TM_PTR) 
         && (type->u.basic_type == TP_STRING || type->u.basic_type == TM_PTR);
+}
+
+/* True only for the built-in String basic type (TP_STRING), not arbitrary
+   pointers.  Used to recognize `String`-typed receivers of method calls. */
+static int builtin_string_type_p (const struct type *type) {
+  return type != NULL && type->mode == TM_BASIC && type->u.basic_type == TP_STRING;
+}
+
+/* Built-in String methods recognized as `s.method(...)` call syntax. */
+enum str_method {
+  SM_NONE = 0,
+  SM_LENGTH,  /* s.length()                       -> size_t          */
+  SM_EMPTY,   /* s.empty()                        -> int  (0/1)      */
+  SM_SUBSTR,  /* s.substr(pos, len)               -> String          */
+  SM_FIND,    /* s.find(needle)                   -> size_t          */
+  SM_REPLACE, /* s.replace(pos, len, replacement) -> String (in-place) */
+};
+
+/* Map a method name to its enum, the exact argument count it expects, and the
+   runtime helper symbol name.  Returns SM_NONE for unknown names. */
+static enum str_method get_string_method (const char *name, int *nargs,
+                                          const char **rt_name) {
+  int n;
+  const char *rt;
+  enum str_method m;
+  if (strcmp (name, "length") == 0)       { m = SM_LENGTH;  n = 0; rt = "c2m_str_length"; }
+  else if (strcmp (name, "empty") == 0)   { m = SM_EMPTY;   n = 0; rt = "c2m_str_empty"; }
+  else if (strcmp (name, "substr") == 0)  { m = SM_SUBSTR;  n = 2; rt = "c2m_str_substr"; }
+  else if (strcmp (name, "find") == 0)    { m = SM_FIND;    n = 1; rt = "c2m_str_find"; }
+  else if (strcmp (name, "replace") == 0) { m = SM_REPLACE; n = 3; rt = "c2m_str_replace"; }
+  else                                    { m = SM_NONE;    n = 0; rt = NULL; }
+  if (nargs != NULL) *nargs = n;
+  if (rt_name != NULL) *rt_name = rt;
+  return m;
 }
 
 static int scalar_type_p (const struct type *type) {
@@ -7327,12 +7410,24 @@ static void set_class_layout (c2m_ctx_t c2m_ctx, node_t decl_node, struct type *
         for (node_t member = NL_HEAD (decl_list->u.ops); member != NULL; member = NL_NEXT (member)) {
             if(member->code == N_FUNC_DEF) continue; // Skip methods
             if(member->attr) {
-                struct type *member_type = ((decl_t)member->attr)->decl_spec.type;
+                decl_t member_decl = (decl_t) member->attr;
+                struct type *member_type = member_decl->decl_spec.type;
                 if(member_type != NULL) {
-                    mir_size_t member_size = member_type->raw_size;
-                    mir_size_t member_align = member_type->align;
+                    mir_size_t member_size;
+                    mir_size_t member_align;
 
+                    /* Make sure the member's own layout is computed first so
+                       raw_size/align are valid (e.g. nested class members). */
+                    set_type_layout (c2m_ctx, member_type);
+                    member_size = member_type->raw_size;
+                    member_align = member_type->align;
+                    if (member_align < 1) member_align = 1;
+
+                    /* Align the running size up to the member's alignment and
+                       record the member's offset.  Failing to set decl->offset
+                       leaves member accesses pointing at the wrong location. */
                     size = (size + member_align - 1) / member_align * member_align;
+                    member_decl->offset = size;
                     size += member_size;
                     if (align < member_align) align = member_align;
                 } else {
@@ -8167,6 +8262,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         }
       } else if (left->mode == TM_PTR) {
         if (null_const_p (expr, right)) {
+        } else if (builtin_string_type_p (right) && left->u.ptr_type->mode == TM_BASIC
+                   && char_type_p (left->u.ptr_type)) {
+          /* A built-in String is a char*; accept it wherever a char* or
+             const char* parameter/lvalue is expected (strcmp, strlen, ...). */
         } else if (right->mode == TM_CLASS) {
             printf("Accepting TM_PTR -> TM_CLASS\n");
         } else if (right->mode != TM_PTR
@@ -9401,6 +9500,24 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       return FALSE;
     }
 
+    /* Recursively check the value expressions inside a dict-literal initializer
+       list (the N_LIST of N_INIT produced for  d = { "k": v, ... } ) so that the
+       value nodes get their expr attrs set, which gen_dict_init_list relies on. */
+    static void check_dict_init_list (c2m_ctx_t c2m_ctx, node_t initializer, node_t context) {
+      if (initializer == NULL || initializer->code != N_LIST) return;
+      for (node_t init = NL_HEAD (initializer->u.ops); init != NULL; init = NL_NEXT (init)) {
+        node_t des_list, value;
+        if (init->code != N_INIT) continue;
+        des_list = NL_HEAD (init->u.ops);
+        value = NL_NEXT (des_list);
+        if (value == NULL) continue;
+        if (value->code == N_LIST)
+          check_dict_init_list (c2m_ctx, value, context);
+        else
+          check (c2m_ctx, value, context);
+      }
+    }
+
     static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
       node_t op1, op2;
@@ -9590,7 +9707,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         e->type->u.basic_type = TP_INT;
         if ((r->code == N_EQ || r->code == N_NE)
             && ((t1->mode == TM_PTR && null_const_p (e2, t2))
-                || (t2->mode == TM_PTR && null_const_p (e1, t1))))
+                || (t2->mode == TM_PTR && null_const_p (e1, t1))
+                /* built-in String compared against null */
+                || (builtin_string_type_p (t1) && null_const_p (e2, t2))
+                || (builtin_string_type_p (t2) && null_const_p (e1, t1))))
           ;
         else if (t1->mode == TM_PTR && t2->mode == TM_PTR) {
           if (!compatible_types_p (t1, t2, TRUE)
@@ -9778,6 +9898,23 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         break;
       }
       case N_ASSIGN:
+        op1 = NL_HEAD (r->u.ops);
+        op2 = NL_NEXT (op1);
+        if (op2->code == N_LIST) {
+          /* dict-literal assignment: lhs = { "k": v, ... } */
+          check (c2m_ctx, op1, NULL);
+          e1 = op1->attr;
+          t1 = e1->type;
+          if (t1->mode != TM_DICT)
+            error (c2m_ctx, POS (r),
+                   "brace initializer assignment is only valid for a dict");
+          check_dict_init_list (c2m_ctx, op2, r);
+          e = create_expr (c2m_ctx, r);
+          *e->type = *t1;
+          if (!e1->u.lvalue_node)
+            error (c2m_ctx, POS (r), "lvalue required as left operand of assignment");
+          break;
+        }
         process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, NULL);
         t2 = e2->type = adjust_type (c2m_ctx, e2->type);
         assign_expr_type = NULL;
@@ -10028,6 +10165,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           t1 = t1->u.ptr_type;
           r->code = N_DEREF_FIELD; // rewrite so gen takes the pointer-deref path
         }
+        /* Built-in String method access (s.length, s.substr, ...): the N_CALL
+           handler does the real work; here we just type the N_FIELD as a
+           placeholder so member resolution below doesn't reject it. */
+        if (builtin_string_type_p (t1) && get_string_method (op2->u.s.s, NULL, NULL) != SM_NONE) {
+          e->type->mode = TM_BASIC;
+          e->type->u.basic_type = TP_VOID;
+          e->u.lvalue_node = NULL;
+          break;
+        }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
@@ -10038,6 +10184,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
              if (t1->mode != TM_DICT)
                error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
                   op2->u.s.s);
+             /* Member not found: 'sym' is left unpopulated by symbol_find, so we
+                must not fall through to the member-access code below (which
+                would dereference garbage and crash).  Stop here. */
+             break;
          } 
          if (t1->mode == TM_DICT) {
            e = create_expr(c2m_ctx, r);
@@ -10070,11 +10220,11 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           e->def_node = func;
           e->u.lvalue_node = NULL;
         } else {
-          assert (sym.def_node->code == N_MEMBER);
           if(sym.def_node == NULL || sym.id == NULL) {
               error (c2m_ctx, POS (r), "undefined member %s", op2->u.s.s);
               break;
           }
+          assert (sym.def_node->code == N_MEMBER);
 
           decl = sym.def_node->attr;
           if(decl) {
@@ -10552,6 +10702,47 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
               if (param != NULL) {
                 error(c2m_ctx, POS(r), "too few arguments in method call");
               }
+              method_call_p = TRUE;
+            } else if (builtin_string_type_p(obj_type)) {
+              // Built-in String method call: s.length(), s.substr(p,n), s.find(x),
+              // s.replace(p,n,x), s.empty().  Lowered to UTF-8 runtime calls in gen.
+              node_t method_id = NL_NEXT(obj);
+              int nargs = 0;
+              enum str_method sm = get_string_method(method_id->u.s.s, &nargs, NULL);
+              if (sm == SM_NONE) {
+                error(c2m_ctx, POS(r), "unknown String method '%s'", method_id->u.s.s);
+                break;
+              }
+              if (NL_LENGTH(arg_list->u.ops) != nargs) {
+                error(c2m_ctx, POS(r), "String method '%s' expects %d argument%s",
+                      method_id->u.s.s, nargs, nargs == 1 ? "" : "s");
+              }
+              for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+                if (!arg->attr) check(c2m_ctx, arg, r);
+              init_type(&res_type);
+              res_type.mode = TM_BASIC;
+              switch (sm) {
+              case SM_LENGTH:
+              case SM_FIND:
+                res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
+                set_type_layout(c2m_ctx, &res_type);
+                break;
+              case SM_EMPTY:
+                res_type.u.basic_type = TP_INT;
+                set_type_layout(c2m_ctx, &res_type);
+                break;
+              case SM_SUBSTR:
+              case SM_REPLACE:
+                /* String result is a char*; size/align set as in the N_STRING
+                   path (set_type_layout/basic_type_size reject TP_STRING). */
+                res_type.u.basic_type = TP_STRING;
+                res_type.type_qual.const_p = 1;
+                res_type.raw_size = 8;
+                res_type.align = 8;
+                break;
+              default: break;
+              }
+              ret_type = &res_type;
               method_call_p = TRUE;
             } else {
               // Not a class, treat as regular function call (e.g., struct delegate)
@@ -11516,6 +11707,18 @@ struct gen_ctx {
   MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
   MIR_item_t dict_serialize_json_proto, dict_serialize_json_item;
   MIR_item_t dict_deserialize_json_proto, dict_deserialize_json_item;
+  /* String (UTF-8) runtime helpers */
+  MIR_item_t str_length_proto, str_length_item;
+  MIR_item_t str_empty_proto, str_empty_item;
+  MIR_item_t str_substr_proto, str_substr_item;
+  MIR_item_t str_find_proto, str_find_item;
+  MIR_item_t str_replace_proto, str_replace_item;
+  MIR_item_t str_checkpoint_proto, str_checkpoint_item;
+  MIR_item_t str_release_to_proto, str_release_to_item;
+  MIR_item_t str_release_keeping_proto, str_release_keeping_item;
+  /* automatic String scope reclamation state for the current function */
+  op_t str_scope_mark;
+  int str_scope_active;
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
@@ -11563,6 +11766,24 @@ struct gen_ctx {
 #define dict_serialize_json_item gen_ctx->dict_serialize_json_item
 #define dict_deserialize_json_proto gen_ctx->dict_deserialize_json_proto
 #define dict_deserialize_json_item gen_ctx->dict_deserialize_json_item
+#define str_length_proto gen_ctx->str_length_proto
+#define str_length_item gen_ctx->str_length_item
+#define str_empty_proto gen_ctx->str_empty_proto
+#define str_empty_item gen_ctx->str_empty_item
+#define str_substr_proto gen_ctx->str_substr_proto
+#define str_substr_item gen_ctx->str_substr_item
+#define str_find_proto gen_ctx->str_find_proto
+#define str_find_item gen_ctx->str_find_item
+#define str_replace_proto gen_ctx->str_replace_proto
+#define str_replace_item gen_ctx->str_replace_item
+#define str_checkpoint_proto gen_ctx->str_checkpoint_proto
+#define str_checkpoint_item gen_ctx->str_checkpoint_item
+#define str_release_to_proto gen_ctx->str_release_to_proto
+#define str_release_to_item gen_ctx->str_release_to_item
+#define str_release_keeping_proto gen_ctx->str_release_keeping_proto
+#define str_release_keeping_item gen_ctx->str_release_keeping_item
+#define str_scope_mark gen_ctx->str_scope_mark
+#define str_scope_active gen_ctx->str_scope_active
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
@@ -13425,6 +13646,191 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
   }
 }
 
+/* Import the UTF-8 String runtime helpers (cstring.h) into the current module,
+   once per module.  All String values are char* (passed/returned as I64). */
+static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t module = curr_func->module;
+  MIR_type_t ptr_t = MIR_T_I64; /* char* / size_t / int64_t all pass as I64 */
+  MIR_var_t vars[4];
+
+  if (str_length_item != NULL) return; /* already imported */
+
+  /* size_t c2m_str_length(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_length_proto = MIR_new_proto_arr (ctx, "__c2m_str_length_p", 1, &ptr_t, 1, vars);
+  str_length_item = MIR_new_import (ctx, "c2m_str_length");
+  move_item_to_module_start (module, str_length_proto);
+  move_item_to_module_start (module, str_length_item);
+
+  /* int64_t c2m_str_empty(const char *s) */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_empty_proto = MIR_new_proto_arr (ctx, "__c2m_str_empty_p", 1, &ptr_t, 1, vars);
+  str_empty_item = MIR_new_import (ctx, "c2m_str_empty");
+  move_item_to_module_start (module, str_empty_proto);
+  move_item_to_module_start (module, str_empty_item);
+
+  /* char *c2m_str_substr(const char *s, int64_t pos, int64_t len) */
+  vars[0].name = "s";   vars[0].type = MIR_T_I64;
+  vars[1].name = "pos"; vars[1].type = MIR_T_I64;
+  vars[2].name = "len"; vars[2].type = MIR_T_I64;
+  str_substr_proto = MIR_new_proto_arr (ctx, "__c2m_str_substr_p", 1, &ptr_t, 3, vars);
+  str_substr_item = MIR_new_import (ctx, "c2m_str_substr");
+  move_item_to_module_start (module, str_substr_proto);
+  move_item_to_module_start (module, str_substr_item);
+
+  /* size_t c2m_str_find(const char *s, const char *needle) */
+  vars[0].name = "s";      vars[0].type = MIR_T_I64;
+  vars[1].name = "needle"; vars[1].type = MIR_T_I64;
+  str_find_proto = MIR_new_proto_arr (ctx, "__c2m_str_find_p", 1, &ptr_t, 2, vars);
+  str_find_item = MIR_new_import (ctx, "c2m_str_find");
+  move_item_to_module_start (module, str_find_proto);
+  move_item_to_module_start (module, str_find_item);
+
+  /* char *c2m_str_replace(const char *s, int64_t pos, int64_t len, const char *repl) */
+  vars[0].name = "s";    vars[0].type = MIR_T_I64;
+  vars[1].name = "pos";  vars[1].type = MIR_T_I64;
+  vars[2].name = "len";  vars[2].type = MIR_T_I64;
+  vars[3].name = "repl"; vars[3].type = MIR_T_I64;
+  str_replace_proto = MIR_new_proto_arr (ctx, "__c2m_str_replace_p", 1, &ptr_t, 4, vars);
+  str_replace_item = MIR_new_import (ctx, "c2m_str_replace");
+  move_item_to_module_start (module, str_replace_proto);
+  move_item_to_module_start (module, str_replace_item);
+
+  /* size_t c2m_str_checkpoint(void) */
+  str_checkpoint_proto = MIR_new_proto_arr (ctx, "__c2m_str_checkpoint_p", 1, &ptr_t, 0, NULL);
+  str_checkpoint_item = MIR_new_import (ctx, "c2m_str_checkpoint");
+  move_item_to_module_start (module, str_checkpoint_proto);
+  move_item_to_module_start (module, str_checkpoint_item);
+
+  /* void c2m_str_release_to(size_t mark) */
+  vars[0].name = "mark"; vars[0].type = MIR_T_I64;
+  str_release_to_proto = MIR_new_proto_arr (ctx, "__c2m_str_release_to_p", 0, NULL, 1, vars);
+  str_release_to_item = MIR_new_import (ctx, "c2m_str_release_to");
+  move_item_to_module_start (module, str_release_to_proto);
+  move_item_to_module_start (module, str_release_to_item);
+
+  /* void *c2m_str_release_keeping(size_t mark, void *keep)  (result ignored) */
+  vars[0].name = "mark"; vars[0].type = MIR_T_I64;
+  vars[1].name = "keep"; vars[1].type = MIR_T_I64;
+  str_release_keeping_proto
+    = MIR_new_proto_arr (ctx, "__c2m_str_release_keeping_p", 0, NULL, 2, vars);
+  str_release_keeping_item = MIR_new_import (ctx, "c2m_str_release_keeping");
+  move_item_to_module_start (module, str_release_keeping_proto);
+  move_item_to_module_start (module, str_release_keeping_item);
+}
+
+/* Emit a call to the String runtime helper for method `sm` with `n` value
+   operands, returning the I64 result register. */
+static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *vals, int n) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_item_t proto = NULL, item = NULL;
+  MIR_op_t args[7];
+  int i;
+
+  string_ensure_imports (c2m_ctx); /* must run before reading the proto/item refs */
+  switch (sm) {
+  case SM_LENGTH:  proto = str_length_proto;  item = str_length_item;  break;
+  case SM_EMPTY:   proto = str_empty_proto;   item = str_empty_item;   break;
+  case SM_SUBSTR:  proto = str_substr_proto;  item = str_substr_item;  break;
+  case SM_FIND:    proto = str_find_proto;    item = str_find_item;    break;
+  case SM_REPLACE: proto = str_replace_proto; item = str_replace_item; break;
+  default: assert (0); break;
+  }
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, proto);
+  args[1] = MIR_new_ref_op (ctx, item);
+  args[2] = res.mir_op;
+  for (i = 0; i < n; i++) args[3 + i] = vals[i];
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, (size_t) (3 + n), args));
+  return res;
+}
+
+/* res = c2m_str_checkpoint() : current allocation high-water mark. */
+static op_t gen_str_checkpoint (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  string_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, str_checkpoint_proto);
+  args[1] = MIR_new_ref_op (ctx, str_checkpoint_item);
+  args[2] = res.mir_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  return res;
+}
+
+/* c2m_str_release_to(mark) : free every String allocated since the mark. */
+static void gen_str_release_to (c2m_ctx_t c2m_ctx, MIR_op_t mark) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  string_ensure_imports (c2m_ctx);
+  args[0] = MIR_new_ref_op (ctx, str_release_to_proto);
+  args[1] = MIR_new_ref_op (ctx, str_release_to_item);
+  args[2] = mark;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+}
+
+/* c2m_str_release_keeping(mark, keep) : free everything since the mark except
+   `keep`, which is retained for the enclosing scope (safe String return). */
+static void gen_str_release_keeping (c2m_ctx_t c2m_ctx, MIR_op_t mark, MIR_op_t keep) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  string_ensure_imports (c2m_ctx);
+  args[0] = MIR_new_ref_op (ctx, str_release_keeping_proto);
+  args[1] = MIR_new_ref_op (ctx, str_release_keeping_item);
+  args[2] = mark;
+  args[3] = keep;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+}
+
+/* True for AST leaf nodes whose `u` union holds a scalar (not an op list), so
+   the generic walker below must not treat `u.ops` as children. */
+static int node_is_leaf_p (node_code_t c) {
+  switch (c) {
+  case N_IGNORE:
+  case N_I: case N_L: case N_LL: case N_U: case N_UL: case N_ULL:
+  case N_F: case N_D: case N_LD:
+  case N_CH: case N_CH16: case N_CH32:
+  case N_STR: case N_STR16: case N_STR32: case N_ID:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
+/* Does this subtree contain a String method call that allocates (substr or
+   replace)?  Used to decide whether a function body needs automatic scope
+   reclamation.  Nested function definitions are not descended into -- their
+   allocations belong to their own scope. */
+static int subtree_allocates_string_p (node_t n) {
+  if (n == NULL || node_is_leaf_p (n->code)) return FALSE;
+  if (n->code == N_CALL) {
+    node_t f = NL_HEAD (n->u.ops);
+    if (f != NULL && (f->code == N_FIELD || f->code == N_DEREF_FIELD)) {
+      node_t obj = NL_HEAD (f->u.ops);
+      node_t m = obj == NULL ? NULL : NL_NEXT (obj);
+      struct expr *oe = obj == NULL ? NULL : obj->attr;
+      if (oe != NULL && builtin_string_type_p (oe->type) && m != NULL && m->code == N_ID) {
+        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+        if (sm == SM_SUBSTR || sm == SM_REPLACE) return TRUE;
+      }
+    }
+  }
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
+    if (c->code == N_FUNC_DEF) continue; /* separate scope */
+    if (subtree_allocates_string_p (c)) return TRUE;
+  }
+  return FALSE;
+}
+
 static void emit_scalar_assign (c2m_ctx_t c2m_ctx, op_t var, op_t *val, MIR_type_t t,
                                 int ignore_others_p) {
   if (var.decl == NULL || var.decl->bit_offset < 0) {
@@ -14056,6 +14462,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_ASSIGN: {
     node_t lhs = NL_HEAD (r->u.ops);
     node_t rhs_node = NL_EL (r->u.ops, 1);
+    /* Dict-literal assignment: d = { "k": v, ... }.  Build a fresh dict object,
+       populate it from the initializer list, then store the pointer into the
+       lhs lvalue. */
+    if (rhs_node->code == N_LIST
+        && ((struct expr *) r->attr)->type->mode == TM_DICT) {
+      var = gen (c2m_ctx, lhs, NULL, NULL, FALSE, NULL, NULL);
+      op_t obj = gen_dict_create_object (c2m_ctx);
+      gen_dict_init_list (c2m_ctx, obj.mir_op, rhs_node);
+      emit2 (c2m_ctx, MIR_MOV, var.mir_op, obj.mir_op);
+      res = obj;
+      break;
+    }
     /* Dict assignment: d.key = val  OR  d["key"] = val */
     if (((struct expr *) r->attr)->type->mode == TM_DICT
         && (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
@@ -14659,6 +15077,53 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
       break;
     }
+    /* Built-in String method call: lower s.method(...) to a UTF-8 runtime call. */
+    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+      node_t mobj = NL_HEAD (func->u.ops);
+      struct expr *obj_e = mobj->attr;
+      if (obj_e != NULL && builtin_string_type_p (obj_e->type)) {
+        node_t method_id = NL_NEXT (mobj);
+        enum str_method sm = get_string_method (method_id->u.s.s, NULL, NULL);
+        if (sm != SM_NONE) {
+          MIR_op_t vals[4];
+          op_t obj_op = val_gen (c2m_ctx, mobj);
+          vals[0] = obj_op.mir_op;
+          switch (sm) {
+          case SM_LENGTH:
+            res = gen_string_call (c2m_ctx, SM_LENGTH, vals, 1);
+            break;
+          case SM_EMPTY:
+            res = gen_string_call (c2m_ctx, SM_EMPTY, vals, 1);
+            break;
+          case SM_FIND:
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_FIND, vals, 2);
+            break;
+          case SM_SUBSTR:
+            vals[1] = promote (c2m_ctx, val_gen (c2m_ctx, NL_HEAD (args->u.ops)), MIR_T_I64, FALSE).mir_op;
+            vals[2] = promote (c2m_ctx, val_gen (c2m_ctx, NL_EL (args->u.ops, 1)), MIR_T_I64, FALSE).mir_op;
+            res = gen_string_call (c2m_ctx, SM_SUBSTR, vals, 3);
+            break;
+          case SM_REPLACE:
+            vals[1] = promote (c2m_ctx, val_gen (c2m_ctx, NL_HEAD (args->u.ops)), MIR_T_I64, FALSE).mir_op;
+            vals[2] = promote (c2m_ctx, val_gen (c2m_ctx, NL_EL (args->u.ops, 1)), MIR_T_I64, FALSE).mir_op;
+            vals[3] = val_gen (c2m_ctx, NL_EL (args->u.ops, 2)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_REPLACE, vals, 4);
+            /* replace mutates in place: write the new pointer back into the
+               receiver when it is a plain assignable lvalue. */
+            {
+              op_t lval = gen (c2m_ctx, mobj, NULL, NULL, FALSE, NULL, NULL);
+              if (lval.mir_op.mode == MIR_OP_REG
+                  || (lval.mir_op.mode == MIR_OP_MEM && lval.mir_op.u.mem.index == 0))
+                emit2 (c2m_ctx, MIR_MOV, lval.mir_op, res.mir_op);
+            }
+            break;
+          default: break;
+          }
+          goto finish;
+        }
+      }
+    }
     first_arg = NL_HEAD (args->u.ops);
     if (jcall_p) {
       func = NL_HEAD (args->u.ops);
@@ -14940,6 +15405,22 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                 emit2(c2m_ctx, tp_mov(mt), dst, init_val.mir_op);
               }
             }
+          }
+          /* Null-initialize uninitialized local String variables, so that
+             `String x;` is a well-defined null String (x == null is true and
+             x.empty() is safe). */
+          if (decl->scope != top_scope && !decl->decl_spec.static_p
+              && builtin_string_type_p (decl->decl_spec.type)) {
+            if (id->attr == NULL) {
+              node_t saved_scope = curr_scope;
+              curr_scope = decl->scope;
+              check (c2m_ctx, id, NULL);
+              curr_scope = saved_scope;
+            }
+            var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+            if (var.mir_op.mode == MIR_OP_REG
+                || (var.mir_op.mode == MIR_OP_MEM && var.mir_op.u.mem.index == 0))
+              emit2 (c2m_ctx, MIR_MOV, var.mir_op, MIR_new_int_op (ctx, 0));
           }
         } else if (initializer->code != N_IGNORE && decl->decl_spec.type->mode == TM_DICT
                    && decl->scope == top_scope) {
@@ -15226,7 +15707,27 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
       dict_init_func_count = 0; /* consumed */
     }
-    gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
+    /* Automatic String scope reclamation: if the body allocates Strings
+       (substr/replace), take an allocation checkpoint here and release back to
+       it at every exit so per-call temporaries don't accumulate.  Returned
+       Strings are protected (see N_RETURN).  Saved/restored for re-entrancy. */
+    {
+      int saved_str_scope_active = str_scope_active;
+      op_t saved_str_scope_mark = str_scope_mark;
+      str_scope_active = FALSE;
+      if (subtree_allocates_string_p (stmt)) {
+        str_scope_mark = gen_str_checkpoint (c2m_ctx);
+        str_scope_active = TRUE;
+      }
+      gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
+      if ((insn = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns)) == NULL
+          || (insn->code != MIR_RET && insn->code != MIR_JRET && insn->code != MIR_JMP)) {
+        /* fall-through exit: reclaim before the synthesized return */
+        if (str_scope_active) gen_str_release_to (c2m_ctx, str_scope_mark.mir_op);
+      }
+      str_scope_active = saved_str_scope_active;
+      str_scope_mark = saved_str_scope_mark;
+    }
     if ((insn = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns)) == NULL
         || (insn->code != MIR_RET && insn->code != MIR_JRET && insn->code != MIR_JMP)) {
       if (VARR_LENGTH (MIR_type_t, proto_info.ret_types) == 0) {
@@ -15690,6 +16191,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
     if (NL_EL (r->u.ops, 1)->code == N_IGNORE) {
+      if (str_scope_active) gen_str_release_to (c2m_ctx, str_scope_mark.mir_op);
       emit_insn (c2m_ctx, MIR_new_ret_insn (ctx, 0));
       break;
     }
@@ -15704,6 +16206,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       t = get_mir_type (c2m_ctx, ret_type);
       t = promote_mir_int_type (t);
       val = promote (c2m_ctx, val, t, FALSE);
+    }
+    /* Reclaim this scope's Strings before returning; protect a returned String
+       so it survives into the caller's scope (no use-after-free). */
+    if (str_scope_active) {
+      if (builtin_string_type_p (ret_type))
+        gen_str_release_keeping (c2m_ctx, str_scope_mark.mir_op, val.mir_op);
+      else
+        gen_str_release_to (c2m_ctx, str_scope_mark.mir_op);
     }
     VARR_TRUNC (MIR_op_t, ret_ops, 0);
     target_add_ret_ops (c2m_ctx, func_type->u.func_type->ret_type, val);
@@ -15904,6 +16414,17 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
       func = NL_HEAD (NL_NEXT (op1)->u.ops);
     else
       func = NL_HEAD (call->u.ops);
+    /* Built-in String method calls (s.length(), s.substr(), ...) are lowered to
+       runtime helper calls in gen and have no user-level C prototype. */
+    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+      node_t sobj = NL_HEAD (func->u.ops);
+      struct expr *sobj_e = sobj->attr;
+      node_t smethod = NL_NEXT (sobj);
+      if (sobj_e != NULL && builtin_string_type_p (sobj_e->type) && smethod != NULL
+          && smethod->code == N_ID
+          && get_string_method (smethod->u.s.s, NULL, NULL) != SM_NONE)
+        continue;
+    }
     type = ((struct expr *) func->attr)->type;
     assert (type->mode == TM_PTR && type->u.ptr_type->mode == TM_FUNC);
     set_type_layout (c2m_ctx, type);
