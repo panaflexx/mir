@@ -8530,6 +8530,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       return member;
     }
 
+    static int init_compatible_string_p (node_t n, struct type *el_type);
+
     static int update_init_object_path (c2m_ctx_t c2m_ctx, size_t mark, struct type *value_type,
                                         int list_p) {
       init_object_t init_object;
@@ -8584,6 +8586,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         VARR_SET (init_object_t, init_object_path, VARR_LENGTH (init_object_t, init_object_path) - 1,
                   init_object);
         if (list_p || scalar_type_p (el_type) || void_type_p (el_type)) return TRUE;
+        /* A string literal initializes a whole char/char16/char32 array element
+           (like a brace-enclosed row), so stop descending at that array level
+           instead of stepping into its first character.  Without this, a string
+           row in a multi-dimensional char array would not advance the outer
+           index, undercounting the array length (e.g. `char a[][6] = {"x","y"}`
+           must have 2 rows). */
+        if (el_type->mode == TM_ARR && value_type != NULL && value_type->pos_node != NULL
+            && init_compatible_string_p (value_type->pos_node, el_type->u.arr_type->el_type))
+          return TRUE;
         assert (el_type->mode == TM_ARR || el_type->mode == TM_STRUCT || el_type->mode == TM_UNION || el_type->mode == TM_CLASS);
         if (el_type->mode != TM_ARR && value_type != NULL
             && el_type->u.tag_type == value_type->u.tag_type)
@@ -8677,10 +8688,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       case N_STR:
       case N_STR16:
       case N_STR32:
+        /* A string literal denotes a static array; its address is always a
+           compile-time constant, regardless of the scope it appears in.  (An
+           earlier `curr_scope == top_scope` restriction here broke constant
+           address initializers such as `char *p = "x" + 1;` and
+           `static char *p = "x";`.) */
         *base = r;
         *offset = 0;
         *deref = 0;
-        return curr_scope == top_scope;
+        return TRUE;
       case N_LABEL_ADDR:
         *base = r;
         *offset = 0;
@@ -8745,11 +8761,18 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         *deref = 1;
         *offset += e->c.i_val * size;
         return TRUE;
+      case N_CONCAT:
+        /* The String `+` extension overloads `string_literal + integer` to
+           N_CONCAT.  In a constant-address context (a static/global
+           initializer) that is ordinary C11 pointer arithmetic on the string
+           literal, so evaluate it as an additive expression below. */
+        /* falls through */
       case N_ADD:
-      case N_SUB:
+      case N_SUB: {
+        int add_p = r->code != N_SUB; /* N_ADD and N_CONCAT are additive */
         if ((op2 = NL_EL (r->u.ops, 1)) == NULL) return FALSE;
         op1 = NL_HEAD (r->u.ops);
-        if (r->code == N_ADD && (e = op1->attr)->const_p) SWAP (op1, op2, temp);
+        if (add_p && (e = op1->attr)->const_p) SWAP (op1, op2, temp);
         if (!check_const_addr_p (c2m_ctx, op1, base, offset, deref)) return FALSE;
         if (*deref != 0 && ((struct expr *) op1->attr)->type->arr_type == NULL) return FALSE;
         if (!(e = op2->attr)->const_p
@@ -8761,11 +8784,12 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                   ? 1
                   : type_size (c2m_ctx, type->u.ptr_type->arr_type != NULL ? type->u.ptr_type->arr_type
                                                                            : type->u.ptr_type));
-        if (r->code == N_ADD)
+        if (add_p)
           *offset += e->c.i_val * size;
         else
           *offset -= e->c.i_val * size;
         return TRUE;
+      }
       case N_CAST:
         decl_spec = NL_HEAD (r->u.ops)->attr;
         if (type_size (c2m_ctx, decl_spec->type) != sizeof (mir_size_t)) return FALSE;
@@ -12216,6 +12240,7 @@ struct gen_ctx {
   MIR_item_t dict_create_string_proto, dict_create_string_item;
   MIR_item_t dict_object_set_proto, dict_object_set_item;
   MIR_item_t dict_object_get_proto, dict_object_get_item;
+  MIR_item_t dict_value_copy_proto, dict_value_copy_item;
   MIR_item_t dict_object_count_proto, dict_object_count_item;
   MIR_item_t dict_object_key_at_proto, dict_object_key_at_item;
   MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
@@ -12284,6 +12309,8 @@ struct gen_ctx {
 #define dict_object_set_item gen_ctx->dict_object_set_item
 #define dict_object_get_proto gen_ctx->dict_object_get_proto
 #define dict_object_get_item gen_ctx->dict_object_get_item
+#define dict_value_copy_proto gen_ctx->dict_value_copy_proto
+#define dict_value_copy_item gen_ctx->dict_value_copy_item
 #define dict_object_count_proto gen_ctx->dict_object_count_proto
 #define dict_object_count_item gen_ctx->dict_object_count_item
 #define dict_object_key_at_proto gen_ctx->dict_object_key_at_proto
@@ -14010,6 +14037,13 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_object_get_proto);
   move_item_to_module_start (module, dict_object_get_item);
 
+  /* dict_value_copy(const DictValue *src) -> DictValue*  (deep clone) */
+  vars[0].name = "src"; vars[0].type = MIR_T_I64;
+  dict_value_copy_proto = MIR_new_proto_arr (ctx, "__dict_value_copy_p", 1, &ptr_t, 1, vars);
+  dict_value_copy_item = MIR_new_import (ctx, "dict_value_copy");
+  move_item_to_module_start (module, dict_value_copy_proto);
+  move_item_to_module_start (module, dict_value_copy_item);
+
   /* dict_object_count(const DictValue *obj) -> size_t */
   MIR_type_t sz_t = MIR_T_I64;
   vars[0].name = "obj"; vars[0].type = MIR_T_I64;
@@ -14150,6 +14184,22 @@ static op_t gen_dict_object_get (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t ke
   return res;
 }
 
+/* Emit: res = dict_value_copy(src_op)  (deep clone of a DictValue*) */
+static op_t gen_dict_value_copy (c2m_ctx_t c2m_ctx, MIR_op_t src_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_value_copy_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_value_copy_item);
+  args[2] = res.mir_op;
+  args[3] = src_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
 /* Emit: res = dict_object_count(obj_op) */
 static op_t gen_dict_object_count (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -14235,6 +14285,11 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
         MIR_item_t si = MIR_new_string_data (ctx, NULL,
                            (MIR_str_t){value->u.s.len, value->u.s.s});
         wrapped = gen_dict_create_string (c2m_ctx, MIR_new_ref_op (ctx, si));
+      } else if (ve != NULL && ve->type->mode == TM_DICT) {
+        /* dict-valued expression: store an owned deep copy, not a borrowed
+           pointer (avoids aliasing / double-free with the source dict). */
+        op_t v = val_gen (c2m_ctx, value);
+        wrapped = gen_dict_value_copy (c2m_ctx, v.mir_op);
       } else {
         /* runtime expression: evaluate then wrap as int64 */
         op_t v = val_gen (c2m_ctx, value);
@@ -15310,8 +15365,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       struct expr *rhs_expr = rhs_node->attr;
       op_t wrapped;
       if (rhs_expr != NULL && rhs_expr->type->mode == TM_DICT) {
-        /* Already a DictValue*, no wrapping needed */
-        wrapped = op2;
+        /* RHS is a borrowed DictValue* (d.k, d["k"], or another dict var).
+           Store an independent deep copy so the destination dict owns its
+           value; otherwise it would alias the source, causing a
+           use-after-free on self-assignment (d["k"] = d["k"]) and a
+           double-free when both dicts are destroyed. */
+        wrapped = gen_dict_value_copy (c2m_ctx, op2.mir_op);
       } else if (rhs_node->code == N_STR || (rhs_expr != NULL && rhs_expr->type->mode == TM_PTR)) {
         /* String literal or char* — wrap as dict string */
         wrapped = gen_dict_create_string (c2m_ctx, op2.mir_op);

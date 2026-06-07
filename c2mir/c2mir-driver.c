@@ -470,6 +470,7 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "dict_create_array") == 0) return (void *) dict_create_array;
     if (strcmp (name, "dict_object_set") == 0) return (void *) dict_object_set;
     if (strcmp (name, "dict_object_get") == 0) return (void *) dict_object_get;
+    if (strcmp (name, "dict_value_copy") == 0) return (void *) dict_value_copy;
     if (strcmp (name, "dict_object_remove") == 0) return (void *) dict_object_remove;
     if (strcmp (name, "dict_serialize_json") == 0) return (void *) dict_serialize_json;
     if (strcmp (name, "dict_deserialize_json") == 0) return (void *) dict_deserialize_json;

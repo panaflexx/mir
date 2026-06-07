@@ -313,6 +313,11 @@ static int dict_object_set(DictValue *obj_val, const char *key, DictValue *new_v
     DictObject *obj = &obj_val->object_value;
     size_t idx = dict_object_find_key(obj, key);
     if (idx != (size_t)-1) {
+        /* Guard against storing a value back into the same slot it already
+         * occupies (e.g. d["k"] = d["k"]).  Freeing first and then storing the
+         * same pointer would leave a dangling value (use-after-free). */
+        if (obj->pairs[idx].value == new_val)
+            return 1;
         dict_value_free(obj->pairs[idx].value);
         free(obj->pairs[idx].value);
         obj->pairs[idx].value = new_val;
@@ -565,6 +570,51 @@ static void dict_destroy(DictValue *val) {
     if (!val) return;
     dict_value_free(val);
     free(val);
+}
+
+/* Deep-copy a DictValue onto the heap (recursive).  Returns a fully
+ * independent clone that the caller owns, or NULL on failure / NULL input.
+ *
+ * This is used when a dict value is stored into another dict slot (e.g.
+ * d2.k = d1.j, or d["a"] = d["b"]).  Without an owned copy the destination
+ * would alias the source's DictValue*, which leads to a use-after-free on
+ * self-assignment and a double-free when both dicts are destroyed. */
+static DictValue *dict_value_copy(const DictValue *src) {
+    if (!src) return NULL;
+    switch (src->type) {
+        case DICT_NULL:   return dict_create_null();
+        case DICT_BOOL:   return dict_create_bool(src->bool_value);
+        case DICT_NUMBER: return dict_create_number(src->number_value);
+        case DICT_INT64:  return dict_create_int64(src->int64_value);
+        case DICT_STRING: return dict_create_string(src->string_value);
+        case DICT_ARRAY: {
+            DictValue *arr = dict_create_array();
+            if (!arr) return NULL;
+            for (size_t i = 0; i < src->array_value.length; i++) {
+                DictValue *item = dict_value_copy(src->array_value.items[i]);
+                if (!item || !dict_array_append(arr, item)) {
+                    dict_destroy(item);
+                    dict_destroy(arr);
+                    return NULL;
+                }
+            }
+            return arr;
+        }
+        case DICT_OBJECT: {
+            DictValue *obj = dict_create_object();
+            if (!obj) return NULL;
+            for (size_t i = 0; i < src->object_value.count; i++) {
+                DictValue *child = dict_value_copy(src->object_value.pairs[i].value);
+                if (!child || !dict_object_set(obj, src->object_value.pairs[i].key, child)) {
+                    dict_destroy(child);
+                    dict_destroy(obj);
+                    return NULL;
+                }
+            }
+            return obj;
+        }
+    }
+    return NULL;
 }
 
 /* JSON parser (unchanged from original for brevity, but arena variants could be added similarly) */
