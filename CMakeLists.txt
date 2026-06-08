@@ -87,6 +87,18 @@ add_executable (b2ctab "mir-utils/b2ctab.c")
 target_include_directories(b2ctab PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(b2ctab mir)
 
+# ------------------ b2obj / b2objmac --------------------------
+# b2obj (ELF) is for Linux/Unix; b2objmac (Mach-O) is for macOS.
+if(APPLE)
+  add_executable (b2objmac b2objmac.c)
+  target_include_directories(b2objmac PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(b2objmac mir ${CMAKE_DL_LIBS})
+else()
+  add_executable (b2obj b2obj.c)
+  target_include_directories(b2obj PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(b2obj mir ${CMAKE_DL_LIBS})
+endif()
+
 # ------------------ L2M --------------------------
 find_package(LLVM)
 if(LLVM_FOUND)
