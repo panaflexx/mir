@@ -51,6 +51,7 @@ run_example classy8.c
 run_example classy-classes.c
 run_example classy-defer.c
 run_example classy-dict.c
+run_example classy-dict-arena.c
 run_example classy-file.c
 run_example classy-file2.c
 run_example classy-strings.c
