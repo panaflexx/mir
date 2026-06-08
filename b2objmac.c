@@ -364,6 +364,7 @@ static int elf_reloc_to_macho (int elf_type) {
   switch (elf_type) {
   case R_X86_64_PC32: return X86_64_RELOC_SIGNED;
   case R_X86_64_64:   return X86_64_RELOC_UNSIGNED;
+  case 4: return 2; /* R_X86_64_PLT32 -> X86_64_RELOC_BRANCH */
   default:
     fprintf (stderr, "warning: unknown ELF reloc type %d, treating as SIGNED\n", elf_type);
     return X86_64_RELOC_SIGNED;
@@ -552,15 +553,6 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     bss_size += bsses[i].len;
   }
 
-  /* Build __text data buffer */
-  uint8_t *text_buf = calloc (1, text_size ? text_size : 1);
-  for (size_t i = 0; i < n_funcs; i++)
-    memcpy (text_buf + funcs[i].text_offset, funcs[i].code, funcs[i].code_len);
-
-  /* Build __data data buffer */
-  uint8_t *data_buf = calloc (1, data_size ? data_size : 1);
-  for (size_t i = 0; i < n_datas; i++)
-    if (datas[i].size) memcpy (data_buf + datas[i].data_offset, datas[i].bytes, datas[i].size);
 
   /* ----- Phase 2b: collect relocations from the code generator ----- */
   DBG ("phase 2b: collecting relocations from generator");
@@ -604,6 +596,95 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
 
   DBG ("phase 2b done: %zu relocations", n_relocs);
 
+
+  /* ----- Phase 2c: generate stubs for external symbols to avoid text relocations ----- */
+  typedef struct { const char *name; size_t stub_offset; } stub_t;
+  stub_t *stubs = NULL;
+  size_t n_stubs = 0, cap_stubs = 0;
+
+  name_set_t defined_names = {0};
+  for (size_t i = 0; i < n_funcs; i++) name_set_find_or_add (&defined_names, macho_mangle (funcs[i].name));
+  for (size_t i = 0; i < n_datas; i++) if (datas[i].name) name_set_find_or_add (&defined_names, macho_mangle (datas[i].name));
+  for (size_t i = 0; i < n_bsses; i++) if (bsses[i].name) name_set_find_or_add (&defined_names, macho_mangle (bsses[i].name));
+
+  size_t orig_n_relocs = n_relocs;
+  for (size_t i = 0; i < orig_n_relocs; i++) {
+    if (relocs[i].in_data) continue; /* data relocations are fine */
+    size_t dummy;
+    if (!name_set_find (&defined_names, relocs[i].symbol, &dummy)) {
+      /* It's an external symbol referenced from __text. We need a stub. */
+      int found = 0;
+      for (size_t j = 0; j < n_stubs; j++) {
+        if (strcmp (stubs[j].name, relocs[i].symbol) == 0) { found = 1; break; }
+      }
+      if (!found) {
+        if (n_stubs >= cap_stubs) {
+          cap_stubs = cap_stubs ? cap_stubs * 2 : 16;
+          stubs = realloc (stubs, cap_stubs * sizeof (stub_t));
+        }
+        stubs[n_stubs].name = relocs[i].symbol;
+        stubs[n_stubs].stub_offset = text_size;
+        text_size += 5; /* jmp rel32 */
+        n_stubs++;
+      }
+    }
+  }
+
+  /* Now update the original relocations to point to the stubs! */
+  for (size_t i = 0; i < orig_n_relocs; i++) {
+    if (relocs[i].in_data) continue;
+    size_t dummy;
+    if (!name_set_find (&defined_names, relocs[i].symbol, &dummy)) {
+      for (size_t j = 0; j < n_stubs; j++) {
+        if (strcmp (stubs[j].name, relocs[i].symbol) == 0) {
+          char stub_sym[256];
+          snprintf (stub_sym, sizeof(stub_sym), "__mir_stub_%s", stubs[j].name);
+          relocs[i].symbol = strdup (stub_sym);
+          break;
+        }
+      }
+    }
+  }
+  /* Build __text data buffer */
+  uint8_t *text_buf = calloc (1, text_size ? text_size : 1);
+  for (size_t i = 0; i < n_funcs; i++)
+    memcpy (text_buf + funcs[i].text_offset, funcs[i].code, funcs[i].code_len);
+
+  /* Build __data data buffer */
+  uint8_t *data_buf = calloc (1, data_size ? data_size : 1);
+  for (size_t i = 0; i < n_datas; i++)
+    if (datas[i].size) memcpy (data_buf + datas[i].data_offset, datas[i].bytes, datas[i].size);
+
+  /* Write addends into section data for Mach-O (which uses REL, not RELA) */
+  for (size_t i = 0; i < orig_n_relocs; i++) {
+    mach_reloc_t *mr = &relocs[i];
+    uint8_t *buf = mr->in_data ? data_buf : text_buf;
+    if (mr->type == R_X86_64_64) {
+      int64_t addend = mr->addend;
+      memcpy (buf + mr->offset, &addend, 8);
+    } else if (mr->type == R_X86_64_PC32) {
+      int32_t addend = (int32_t) mr->addend;
+      memcpy (buf + mr->offset, &addend, 4);
+    }
+  }
+
+  /* Write stubs and add branch relocations for them */
+  for (size_t i = 0; i < n_stubs; i++) {
+    size_t off = stubs[i].stub_offset;
+    text_buf[off] = 0xE9; /* jmp rel32 */
+    memset (text_buf + off + 1, 0, 4);
+
+    if (n_relocs >= cap_relocs) {
+      cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
+      relocs = realloc (relocs, cap_relocs * sizeof (mach_reloc_t));
+    }
+    mach_reloc_t *mr = &relocs[n_relocs++];
+    mr->offset  = off + 1;
+    mr->symbol  = stubs[i].name;
+    mr->type    = 4; /* R_X86_64_PLT32 -> X86_64_RELOC_BRANCH */
+    mr->addend  = 0; 
+    mr->in_data = 0;
+  }
   /* ----- Phase 3: build symbol table and string table ----- */
   DBG ("phase 3: building symbol table and string table");
 
@@ -720,6 +801,20 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   }
 
   size_t n_local_syms = n_syms; /* 3 section symbols */
+
+  /* --- Defined local symbols: stubs --- */
+  for (size_t i = 0; i < n_stubs; i++) {
+    char stub_sym[256];
+    snprintf (stub_sym, sizeof(stub_sym), "__mir_stub_%s", stubs[i].name);
+    struct nlist_64 s = {0};
+    s.n_un.n_strx = STRTAB_ADD (stub_sym);
+    s.n_type = N_SECT; /* local symbol */
+    s.n_sect = MACH_SECT_TEXT;
+    s.n_desc = 0;
+    s.n_value = stubs[i].stub_offset;
+    SYM_MAP_ADD (strdup(stub_sym), n_syms);
+    SYMTAB_PUSH (s);
+  }
 
   /* --- Defined external symbols: functions --- */
   for (size_t i = 0; i < n_funcs; i++) {
@@ -907,7 +1002,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     ri.r_extern = 1;
     ri.r_type = mach_type;
     ri.r_length = (mach_type == X86_64_RELOC_UNSIGNED) ? 3 : 2; /* 3=8byte, 2=4byte */
-    ri.r_pcrel = (mach_type == X86_64_RELOC_SIGNED) ? 1 : 0;
+    ri.r_pcrel = (mach_type == X86_64_RELOC_SIGNED || mach_type == 2) ? 1 : 0;
 
     if (relocs[i].in_data)
       reloc_data[rd_idx++] = ri;
