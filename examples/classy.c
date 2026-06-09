@@ -1,4 +1,4 @@
-#include <inc/exception.h>
+#include <include/exception.h>
 
 //String myString = (String)"classy string\0";
 //string newString = myString;

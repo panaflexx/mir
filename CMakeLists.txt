@@ -93,14 +93,21 @@ target_link_libraries(b2ctab mir)
 # ------------------ b2obj / b2objmac --------------------------
 # b2obj (ELF) is for Linux/Unix; b2objmac (Mach-O) is for macOS.
 if(APPLE)
-  add_executable (b2objmac b2objmac.c)
+  add_executable(b2objmac b2objmac.c)
   target_include_directories(b2objmac PRIVATE ${PROJECT_SOURCE_DIR})
-  target_link_libraries(b2objmac mir ${CMAKE_DL_LIBS})
-else()
-  add_executable (b2obj b2obj.c)
+  target_link_libraries(b2objmac PRIVATE mir ${CMAKE_DL_LIBS})
+  add_dependencies(b2objmac mir)
+
+elseif(UNIX)
+  add_executable(b2obj b2obj.c)
   target_include_directories(b2obj PRIVATE ${PROJECT_SOURCE_DIR})
-  target_link_libraries(b2obj mir ${CMAKE_DL_LIBS})
+  target_link_libraries(b2obj PRIVATE mir ${CMAKE_DL_LIBS})
+  add_dependencies(b2obj mir)
+
+else()
+  message(WARNING "b2obj / b2objmac is not configured for this platform")
 endif()
+
 
 # ------------------ L2M --------------------------
 find_package(LLVM)
@@ -275,3 +282,4 @@ add_test(mir2c-test mir2c_test)
 # ------------------ c2m tests --------------------------
 
 add_test(c2mir-simple-test c2m -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
+
