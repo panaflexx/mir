@@ -1,11 +1,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* dict runtime helpers */
-dict dict_object_get(dict obj, char *key);
-int dict_object_set(dict obj, char *key, dict val);
-dict dict_create_object();
-
 class Fruit {
     /* UNIFIED declarative definition: one dict, one source of truth.
        Keys are the variant names.

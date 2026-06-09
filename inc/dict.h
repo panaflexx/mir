@@ -4,6 +4,10 @@
 #ifndef DICT_H
 #define DICT_H
 
+#ifndef C2M_DICT_API
+#define C2M_DICT_API static
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -29,18 +33,18 @@ typedef struct {
     size_t  used;    /* bytes consumed */
 } DictArena;
 
-static void dict_arena_init(DictArena *a, void *buffer, size_t size) {
+C2M_DICT_API void dict_arena_init(DictArena *a, void *buffer, size_t size) {
     if (!a) return;
     a->buf = (char*)buffer;
     a->size = size;
     a->used = 0;
 }
 
-static void dict_arena_reset(DictArena *a) { if (a) a->used = 0; }
-static size_t dict_arena_used(const DictArena *a) { return a ? a->used : 0; }
+C2M_DICT_API void dict_arena_reset(DictArena *a) { if (a) a->used = 0; }
+C2M_DICT_API size_t dict_arena_used(const DictArena *a) { return a ? a->used : 0; }
 
 /* Internal allocator helper */
-static void *dict_alloc(DictArena *arena, size_t sz) {
+C2M_DICT_API void *dict_alloc(DictArena *arena, size_t sz) {
     if (!arena) return calloc(1, sz); /* zero-init so owned_arena starts NULL */
     if (arena->used + sz > arena->size) return NULL; /* OOM in arena */
     void *p = arena->buf + arena->used;
@@ -49,7 +53,7 @@ static void *dict_alloc(DictArena *arena, size_t sz) {
 }
 
 /* Arena-aware strdup */
-static char *dict_strdup_arena(DictArena *arena, const char *src) {
+C2M_DICT_API char *dict_strdup_arena(DictArena *arena, const char *src) {
     if (!src) return NULL;
     size_t len = strlen(src) + 1;
     char *dst = (char*)dict_alloc(arena, len);
@@ -102,7 +106,7 @@ struct DictValue {
     DictArena *owned_arena;
 };
 
-static char *dict_strdup(const char *src) {
+C2M_DICT_API char *dict_strdup(const char *src) {
     if (!src) return NULL;
     size_t len = strlen(src);
     char *dst = (char *)malloc(len + 1);
@@ -110,9 +114,9 @@ static char *dict_strdup(const char *src) {
     return dst;
 }
 
-static void dict_value_free(DictValue *val);
+C2M_DICT_API void dict_value_free(DictValue *val);
 
-static void dict_object_init(DictObject *obj) {
+C2M_DICT_API void dict_object_init(DictObject *obj) {
     if (!obj) return;
     obj->count = 0;
     obj->capacity = 4;
@@ -122,7 +126,7 @@ static void dict_object_init(DictObject *obj) {
     }
 }
 
-static void dict_object_clear(DictObject *obj) {
+C2M_DICT_API void dict_object_clear(DictObject *obj) {
     if (!obj) return;
     for (size_t i = 0; i < obj->count; i++) {
         free(obj->pairs[i].key);
@@ -135,7 +139,7 @@ static void dict_object_clear(DictObject *obj) {
     obj->capacity = 0;
 }
 
-static int dict_object_ensure_capacity(DictObject *obj, size_t new_capacity) {
+C2M_DICT_API int dict_object_ensure_capacity(DictObject *obj, size_t new_capacity) {
     if (new_capacity <= obj->capacity)
         return 1; // already enough
 
@@ -162,25 +166,25 @@ static int dict_object_ensure_capacity(DictObject *obj, size_t new_capacity) {
 }
 
 /* ===== Arena-aware creation (internal) ===== */
-static DictValue *dict_create_object_arena(DictArena *arena);
-static DictValue *dict_create_null_arena(DictArena *arena);
-static DictValue *dict_create_bool_arena(DictArena *arena, int b);
-static DictValue *dict_create_number_arena(DictArena *arena, double n);
-static DictValue *dict_create_int64_arena(DictArena *arena, int64_t n);
-static DictValue *dict_create_string_arena(DictArena *arena, const char *s);
-static DictValue *dict_create_array_arena(DictArena *arena);
+C2M_DICT_API DictValue *dict_create_object_arena(DictArena *arena);
+C2M_DICT_API DictValue *dict_create_null_arena(DictArena *arena);
+C2M_DICT_API DictValue *dict_create_bool_arena(DictArena *arena, int b);
+C2M_DICT_API DictValue *dict_create_number_arena(DictArena *arena, double n);
+C2M_DICT_API DictValue *dict_create_int64_arena(DictArena *arena, int64_t n);
+C2M_DICT_API DictValue *dict_create_string_arena(DictArena *arena, const char *s);
+C2M_DICT_API DictValue *dict_create_array_arena(DictArena *arena);
 
 /* ===== Public (heap) wrappers ===== */
-static DictValue *dict_create_object() { return dict_create_object_arena(NULL); }
-static DictValue *dict_create_null()   { return dict_create_null_arena(NULL); }
-static DictValue *dict_create_bool(int b){ return dict_create_bool_arena(NULL, b); }
-static DictValue *dict_create_number(double n){ return dict_create_number_arena(NULL, n); }
-static DictValue *dict_create_int64(int64_t n){ return dict_create_int64_arena(NULL, n); }
-static DictValue *dict_create_string(const char *s){ return dict_create_string_arena(NULL, s); }
-static DictValue *dict_create_array(){ return dict_create_array_arena(NULL); }
+C2M_DICT_API DictValue *dict_create_object() { return dict_create_object_arena(NULL); }
+C2M_DICT_API DictValue *dict_create_null()   { return dict_create_null_arena(NULL); }
+C2M_DICT_API DictValue *dict_create_bool(int b){ return dict_create_bool_arena(NULL, b); }
+C2M_DICT_API DictValue *dict_create_number(double n){ return dict_create_number_arena(NULL, n); }
+C2M_DICT_API DictValue *dict_create_int64(int64_t n){ return dict_create_int64_arena(NULL, n); }
+C2M_DICT_API DictValue *dict_create_string(const char *s){ return dict_create_string_arena(NULL, s); }
+C2M_DICT_API DictValue *dict_create_array(){ return dict_create_array_arena(NULL); }
 
 /* ===== Arena implementations ===== */
-static DictValue *dict_create_object_arena(DictArena *arena) {
+C2M_DICT_API DictValue *dict_create_object_arena(DictArena *arena) {
     DictValue *val = (DictValue *)dict_alloc(arena, sizeof(DictValue));
     if (!val) return NULL;
     val->type = DICT_OBJECT;
@@ -192,14 +196,14 @@ static DictValue *dict_create_object_arena(DictArena *arena) {
     return val;
 }
 
-static DictValue *dict_create_null_arena(DictArena *arena) {
+C2M_DICT_API DictValue *dict_create_null_arena(DictArena *arena) {
     DictValue *val = (DictValue *)dict_alloc(arena, sizeof(DictValue));
     if (!val) return NULL;
     val->type = DICT_NULL;
     return val;
 }
 
-static DictValue *dict_create_bool_arena(DictArena *arena, int b) {
+C2M_DICT_API DictValue *dict_create_bool_arena(DictArena *arena, int b) {
     DictValue *val = (DictValue *)dict_alloc(arena, sizeof(DictValue));
     if (!val) return NULL;
     val->type = DICT_BOOL;
@@ -207,7 +211,7 @@ static DictValue *dict_create_bool_arena(DictArena *arena, int b) {
     return val;
 }
 
-static DictValue *dict_create_number_arena(DictArena *arena, double n) {
+C2M_DICT_API DictValue *dict_create_number_arena(DictArena *arena, double n) {
     DictValue *val = (DictValue *)dict_alloc(arena, sizeof(DictValue));
     if (!val) return NULL;
     val->type = DICT_NUMBER;
@@ -215,7 +219,7 @@ static DictValue *dict_create_number_arena(DictArena *arena, double n) {
     return val;
 }
 
-static DictValue *dict_create_int64_arena(DictArena *arena, int64_t n) {
+C2M_DICT_API DictValue *dict_create_int64_arena(DictArena *arena, int64_t n) {
     DictValue *val = (DictValue *)dict_alloc(arena, sizeof(DictValue));
     if (!val) return NULL;
     val->type = DICT_INT64;
@@ -223,7 +227,7 @@ static DictValue *dict_create_int64_arena(DictArena *arena, int64_t n) {
     return val;
 }
 
-static DictValue *dict_create_string_arena(DictArena *arena, const char *s) {
+C2M_DICT_API DictValue *dict_create_string_arena(DictArena *arena, const char *s) {
     if (!s) return NULL;
     size_t len = strnlen(s, MAX_VALUE_LEN);
     if (len == 0 || len >= MAX_VALUE_LEN) {
@@ -241,7 +245,7 @@ static DictValue *dict_create_string_arena(DictArena *arena, const char *s) {
     return val;
 }
 
-static DictValue *dict_create_array_arena(DictArena *arena) {
+C2M_DICT_API DictValue *dict_create_array_arena(DictArena *arena) {
     DictValue *val = (DictValue *)dict_alloc(arena, sizeof(DictValue));
     if (!val) return NULL;
     val->type = DICT_ARRAY;
@@ -253,7 +257,7 @@ static DictValue *dict_create_array_arena(DictArena *arena) {
 /* Heap wrappers (defined via arena functions above) */
 
 /* Resize array items if needed */
-static int dict_array_ensure_capacity(DictArray *arr, size_t new_capacity) {
+C2M_DICT_API int dict_array_ensure_capacity(DictArray *arr, size_t new_capacity) {
     if (new_capacity <= arr->length)
         return 1;
     size_t new_cap = arr->length == 0 ? 4 : arr->length * 2;
@@ -264,7 +268,7 @@ static int dict_array_ensure_capacity(DictArray *arr, size_t new_capacity) {
     return 1;
 }
 
-static int dict_array_append(DictValue *array_val, DictValue *new_val) {
+C2M_DICT_API int dict_array_append(DictValue *array_val, DictValue *new_val) {
     if (!array_val || array_val->type != DICT_ARRAY || !new_val) return 0;
 
     DictArray *array = &array_val->array_value;
@@ -279,7 +283,7 @@ static int dict_array_append(DictValue *array_val, DictValue *new_val) {
 }
 
 /* Free a DictValue recursively */
-static void dict_value_free(DictValue *val) {
+C2M_DICT_API void dict_value_free(DictValue *val) {
     if (!val) return;
     switch (val->type) {
         case DICT_STRING:
@@ -301,7 +305,7 @@ static void dict_value_free(DictValue *val) {
 }
 
 /* Find key index in object */
-static size_t dict_object_find_key(const DictObject *obj, const char *key) {
+C2M_DICT_API size_t dict_object_find_key(const DictObject *obj, const char *key) {
     if (!obj || !key) return (size_t)-1;
     for (size_t i = 0; i < obj->count; i++) {
         if (strcmp(obj->pairs[i].key, key) == 0) return i;
@@ -310,7 +314,7 @@ static size_t dict_object_find_key(const DictObject *obj, const char *key) {
 }
 
 /* Set or insert a key-value pair */
-static int dict_object_set(DictValue *obj_val, const char *key, DictValue *new_val) {
+C2M_DICT_API int dict_object_set(DictValue *obj_val, const char *key, DictValue *new_val) {
     if (!obj_val || obj_val->type != DICT_OBJECT || !key || !new_val) return 0;
     size_t key_len = strnlen(key, MAX_KEY_LEN);
     if (key_len == 0 || key_len >= MAX_KEY_LEN) return 0;
@@ -342,7 +346,7 @@ static int dict_object_set(DictValue *obj_val, const char *key, DictValue *new_v
 }
 
 /* Get value by key */
-static DictValue *dict_object_get(const DictValue *obj_val, const char *key) {
+C2M_DICT_API DictValue *dict_object_get(const DictValue *obj_val, const char *key) {
     if (!obj_val || obj_val->type != DICT_OBJECT || !key) return NULL;
     const DictObject *obj = &obj_val->object_value;
     size_t idx = dict_object_find_key(obj, key);
@@ -351,7 +355,7 @@ static DictValue *dict_object_get(const DictValue *obj_val, const char *key) {
 }
 
 /* Remove key-value pair */
-static int dict_object_remove(DictValue *obj_val, const char *key) {
+C2M_DICT_API int dict_object_remove(DictValue *obj_val, const char *key) {
     if (!obj_val || obj_val->type != DICT_OBJECT || !key) return 0;
     DictObject *obj = &obj_val->object_value;
     size_t idx = dict_object_find_key(obj, key);
@@ -366,19 +370,19 @@ static int dict_object_remove(DictValue *obj_val, const char *key) {
     return 1;
 }
 
-static int dict_key_compare(const void *a, const void *b) {
+C2M_DICT_API int dict_key_compare(const void *a, const void *b) {
     const DictKeyValuePair *pa = (const DictKeyValuePair *)a;
     const DictKeyValuePair *pb = (const DictKeyValuePair *)b;
     return strcmp(pa->key, pb->key);
 }
 
-static void dict_object_sort_keys(DictObject *obj) {
+C2M_DICT_API void dict_object_sort_keys(DictObject *obj) {
     if (!obj || obj->count < 2) return;
     qsort(obj->pairs, obj->count, sizeof(DictKeyValuePair), dict_key_compare);
 }
 
 /* JSON serialization helpers (unchanged) */
-static int dict_append_to_buffer(char **cursor, size_t *remaining, const char *s, size_t len) {
+C2M_DICT_API int dict_append_to_buffer(char **cursor, size_t *remaining, const char *s, size_t len) {
     if (len >= *remaining) return 0;
     memcpy(*cursor, s, len);
     *cursor += len;
@@ -386,7 +390,7 @@ static int dict_append_to_buffer(char **cursor, size_t *remaining, const char *s
     return 1;
 }
 
-static int dict_append_char(char **cursor, size_t *remaining, char c) {
+C2M_DICT_API int dict_append_char(char **cursor, size_t *remaining, char c) {
     if (*remaining < 1) return 0;
     **cursor = c;
     (*cursor)++;
@@ -394,7 +398,7 @@ static int dict_append_char(char **cursor, size_t *remaining, char c) {
     return 1;
 }
 
-static int dict_append_escaped_string(char **cursor, size_t *remaining, const char *s) {
+C2M_DICT_API int dict_append_escaped_string(char **cursor, size_t *remaining, const char *s) {
     if (!dict_append_char(cursor, remaining, '"')) return 0;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         unsigned char c = *p;
@@ -423,7 +427,7 @@ static int dict_append_escaped_string(char **cursor, size_t *remaining, const ch
     return 1;
 }
 
-static int dict_serialize_value_pretty(const DictValue *val, char **cursor, size_t *remaining,
+C2M_DICT_API int dict_serialize_value_pretty(const DictValue *val, char **cursor, size_t *remaining,
                                         int indent_level, int pretty) {
     if (!val) return dict_append_to_buffer(cursor, remaining, "null", 4);
 
@@ -502,7 +506,7 @@ static int dict_serialize_value_pretty(const DictValue *val, char **cursor, size
     #undef APPEND_NEWLINE_AND_INDENT
 }
 
-static char *dict_serialize_json(const DictValue *val, char *buffer, size_t buf_len, int pretty) {
+C2M_DICT_API char *dict_serialize_json(const DictValue *val, char *buffer, size_t buf_len, int pretty) {
     if (!buffer || buf_len == 0) return NULL;
 
     char *cursor = buffer;
@@ -522,7 +526,7 @@ static char *dict_serialize_json(const DictValue *val, char *buffer, size_t buf_
 }
 
 /* Path lookup */
-static DictValue *dict_find_path(const DictValue *root, const char *path) {
+C2M_DICT_API DictValue *dict_find_path(const DictValue *root, const char *path) {
     if (!root || root->type != DICT_OBJECT || !path || *path == '\0') return NULL;
 
     const DictValue *current = root;
@@ -558,20 +562,20 @@ static DictValue *dict_find_path(const DictValue *root, const char *path) {
 
 /* Destroy entire DictValue */
 /* Iteration helpers for for-in loops */
-static size_t dict_object_count(const DictValue *obj) {
+C2M_DICT_API size_t dict_object_count(const DictValue *obj) {
     if (!obj || obj->type != DICT_OBJECT) return 0;
     return obj->object_value.count;
 }
-static const char *dict_object_key_at(const DictValue *obj, size_t index) {
+C2M_DICT_API const char *dict_object_key_at(const DictValue *obj, size_t index) {
     if (!obj || obj->type != DICT_OBJECT || index >= obj->object_value.count) return NULL;
     return obj->object_value.pairs[index].key;
 }
-static DictValue *dict_object_value_at(const DictValue *obj, size_t index) {
+C2M_DICT_API DictValue *dict_object_value_at(const DictValue *obj, size_t index) {
     if (!obj || obj->type != DICT_OBJECT || index >= obj->object_value.count) return NULL;
     return obj->object_value.pairs[index].value;
 }
 
-static void dict_destroy(DictValue *val) {
+C2M_DICT_API void dict_destroy(DictValue *val) {
     if (!val) return;
     DictArena *arena = val->owned_arena;
     /* Always free the heap-allocated contents (keys, pair arrays, nested
@@ -604,7 +608,7 @@ static void dict_destroy(DictValue *val) {
  *   dict d = dict_create_heap_arena(256 * 1024);
  *   defer_delete(d);           // dict_destroy(d) frees everything cleanly
  */
-static DictValue *dict_create_heap_arena(size_t bytes) {
+C2M_DICT_API DictValue *dict_create_heap_arena(size_t bytes) {
     if (bytes == 0) bytes = 256 * 1024; /* 256 KB default */
     /* Single allocation: [DictArena header][arena buffer] */
     size_t total = sizeof(DictArena) + bytes;
@@ -627,7 +631,7 @@ static DictValue *dict_create_heap_arena(size_t bytes) {
  * d2.k = d1.j, or d["a"] = d["b"]).  Without an owned copy the destination
  * would alias the source's DictValue*, which leads to a use-after-free on
  * self-assignment and a double-free when both dicts are destroyed. */
-static DictValue *dict_value_copy(const DictValue *src) {
+C2M_DICT_API DictValue *dict_value_copy(const DictValue *src) {
     if (!src) return NULL;
     switch (src->type) {
         case DICT_NULL:   return dict_create_null();
@@ -674,27 +678,27 @@ typedef struct {
     size_t error_str_len;
 } DictJsonParser;
 
-static DictValue *dict_parse_value(DictJsonParser *p);
+C2M_DICT_API DictValue *dict_parse_value(DictJsonParser *p);
 
-static void dict_parser_error(DictJsonParser *p, const char *msg) {
+C2M_DICT_API void dict_parser_error(DictJsonParser *p, const char *msg) {
     if (p->error_str && p->error_str_len > 0) {
         strncpy(p->error_str, msg, p->error_str_len - 1);
         p->error_str[p->error_str_len - 1] = '\0';
     }
 }
 
-static int dict_parser_peek(DictJsonParser *p) {
+C2M_DICT_API int dict_parser_peek(DictJsonParser *p) {
     if (p->pos >= p->buffer_len) return 0;
     return (unsigned char)p->buffer[p->pos];
 }
 
-static int dict_parser_consume(DictJsonParser *p, char expected) {
+C2M_DICT_API int dict_parser_consume(DictJsonParser *p, char expected) {
     if (dict_parser_peek(p) != expected) return 0;
     p->pos++;
     return 1;
 }
 
-static void dict_parser_skip_whitespace(DictJsonParser *p) {
+C2M_DICT_API void dict_parser_skip_whitespace(DictJsonParser *p) {
     while (p->pos < p->buffer_len) {
         char c = p->buffer[p->pos];
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
@@ -705,7 +709,7 @@ static void dict_parser_skip_whitespace(DictJsonParser *p) {
     }
 }
 
-static int dict_parse_literal(DictJsonParser *p, const char *lit) {
+C2M_DICT_API int dict_parse_literal(DictJsonParser *p, const char *lit) {
     size_t len = strlen(lit);
     if (p->pos + len > p->buffer_len) return 0;
     if (strncmp(p->buffer + p->pos, lit, len) != 0) return 0;
@@ -713,7 +717,7 @@ static int dict_parse_literal(DictJsonParser *p, const char *lit) {
     return 1;
 }
 
-static char *dict_parse_json_string(DictJsonParser *p) {
+C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
     if (!dict_parser_consume(p, '"')) {
         dict_parser_error(p, "Expected '\"' for string");
         return NULL;
@@ -806,7 +810,7 @@ static char *dict_parse_json_string(DictJsonParser *p) {
     return NULL;
 }
 
-static int dict_parse_number(DictJsonParser *p, double *out) {
+C2M_DICT_API int dict_parse_number(DictJsonParser *p, double *out) {
     size_t start_pos = p->pos;
     if (dict_parser_peek(p) == '-') p->pos++;
     while (p->pos < p->buffer_len) {
@@ -831,10 +835,10 @@ static int dict_parse_number(DictJsonParser *p, double *out) {
     return 1;
 }
 
-static DictValue *dict_parse_array(DictJsonParser *p);
-static DictValue *dict_parse_object(DictJsonParser *p);
+C2M_DICT_API DictValue *dict_parse_array(DictJsonParser *p);
+C2M_DICT_API DictValue *dict_parse_object(DictJsonParser *p);
 
-static DictValue *dict_parse_value(DictJsonParser *p) {
+C2M_DICT_API DictValue *dict_parse_value(DictJsonParser *p) {
     dict_parser_skip_whitespace(p);
     if (p->pos >= p->buffer_len) {
         dict_parser_error(p, "Unexpected end of input");
@@ -867,7 +871,7 @@ static DictValue *dict_parse_value(DictJsonParser *p) {
     }
 }
 
-static DictValue *dict_parse_array(DictJsonParser *p) {
+C2M_DICT_API DictValue *dict_parse_array(DictJsonParser *p) {
     if (!dict_parser_consume(p, '[')) {
         dict_parser_error(p, "Expected '[' for array");
         return NULL;
@@ -940,7 +944,7 @@ static DictValue *dict_parse_array(DictJsonParser *p) {
     return array;
 }
 
-static DictValue *dict_parse_object(DictJsonParser *p) {
+C2M_DICT_API DictValue *dict_parse_object(DictJsonParser *p) {
     if (!dict_parser_consume(p, '{')) {
         dict_parser_error(p, "Expected '{' for object");
         return NULL;
@@ -998,7 +1002,7 @@ static DictValue *dict_parse_object(DictJsonParser *p) {
     return obj;
 }
 
-static DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t err_len) {
+C2M_DICT_API DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t err_len) {
     DictJsonParser parser = {json, strlen(json), 0, err_buf, err_len};
     DictValue *result = dict_parse_value(&parser);
     dict_parser_skip_whitespace(&parser);
@@ -1019,17 +1023,17 @@ static DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t 
 #define BSON_TYPE_NULL      0x0A
 #define BSON_TYPE_INT64     0x12
 
-static void bson_write_int32_le(uint8_t *buf, int32_t v) { memcpy(buf, &v, 4); }
-static int32_t bson_read_int32_le(const uint8_t *buf) { int32_t v; memcpy(&v, buf, 4); return v; }
-static void bson_write_int64_le(uint8_t *buf, int64_t v) { memcpy(buf, &v, 8); }
-static int64_t bson_read_int64_le(const uint8_t *buf) { int64_t v; memcpy(&v, buf, 8); return v; }
+C2M_DICT_API void bson_write_int32_le(uint8_t *buf, int32_t v) { memcpy(buf, &v, 4); }
+C2M_DICT_API int32_t bson_read_int32_le(const uint8_t *buf) { int32_t v; memcpy(&v, buf, 4); return v; }
+C2M_DICT_API void bson_write_int64_le(uint8_t *buf, int64_t v) { memcpy(buf, &v, 8); }
+C2M_DICT_API int64_t bson_read_int64_le(const uint8_t *buf) { int64_t v; memcpy(&v, buf, 8); return v; }
 
-static int bson_serialize_document(const DictValue *doc, uint8_t *buf, size_t buf_len);
+C2M_DICT_API int bson_serialize_document(const DictValue *doc, uint8_t *buf, size_t buf_len);
 
-static int bson_serialize_value(uint8_t *buf, size_t buf_len, size_t *written,
+C2M_DICT_API int bson_serialize_value(uint8_t *buf, size_t buf_len, size_t *written,
                                  const char *key, const DictValue *val);
 
-static int bson_serialize_document(const DictValue *doc, uint8_t *buf, size_t buf_len) {
+C2M_DICT_API int bson_serialize_document(const DictValue *doc, uint8_t *buf, size_t buf_len) {
     if (!doc || (doc->type != DICT_OBJECT && doc->type != DICT_ARRAY)) return 0;
     size_t pos = 4;
     size_t count = (doc->type == DICT_OBJECT) ? doc->object_value.count : doc->array_value.length;
@@ -1056,7 +1060,7 @@ static int bson_serialize_document(const DictValue *doc, uint8_t *buf, size_t bu
     return (int)pos;
 }
 
-static int bson_serialize_value(uint8_t *buf, size_t buf_len, size_t *written,
+C2M_DICT_API int bson_serialize_value(uint8_t *buf, size_t buf_len, size_t *written,
                                  const char *key, const DictValue *val) {
     size_t pos = 0;
     size_t key_len = strlen(key);
@@ -1115,18 +1119,18 @@ static int bson_serialize_value(uint8_t *buf, size_t buf_len, size_t *written,
     return 1;
 }
 
-static DictValue *bson_deserialize_document_internal(const uint8_t *buf, size_t buf_len,
+C2M_DICT_API DictValue *bson_deserialize_document_internal(const uint8_t *buf, size_t buf_len,
                                                       size_t *read_bytes, int is_array);
 
-static size_t dict_serialize_bson(const DictValue *val, uint8_t *buf, size_t buf_len) {
+C2M_DICT_API size_t dict_serialize_bson(const DictValue *val, uint8_t *buf, size_t buf_len) {
     return bson_serialize_document(val, buf, buf_len);
 }
 
-static DictValue *dict_deserialize_bson(const uint8_t *buf, size_t buf_len, size_t *read_bytes) {
+C2M_DICT_API DictValue *dict_deserialize_bson(const uint8_t *buf, size_t buf_len, size_t *read_bytes) {
     return bson_deserialize_document_internal(buf, buf_len, read_bytes, 0);
 }
 
-static DictValue *bson_deserialize_document_internal(const uint8_t *buf, size_t buf_len,
+C2M_DICT_API DictValue *bson_deserialize_document_internal(const uint8_t *buf, size_t buf_len,
                                                       size_t *read_bytes, int is_array) {
     if (!buf || buf_len < 5 || !read_bytes) return NULL;
 

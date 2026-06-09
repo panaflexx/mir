@@ -634,11 +634,11 @@ const char *MIR_item_name (MIR_context_t ctx MIR_UNUSED, MIR_item_t item) {
   case MIR_import_item: return item->u.import_id;
   case MIR_export_item: return item->u.export_id;
   case MIR_forward_item: return item->u.forward_id;
-  case MIR_bss_item: return item->u.bss->name;
-  case MIR_data_item: return item->u.data->name;
-  case MIR_ref_data_item: return item->u.ref_data->name;
-  case MIR_lref_data_item: return item->u.lref_data->name;
-  case MIR_expr_data_item: return item->u.expr_data->name;
+  case MIR_bss_item: return item->u.bss->name ? item->u.bss->name : "";
+  case MIR_data_item: return item->u.data->name ? item->u.data->name : "";
+  case MIR_ref_data_item: return item->u.ref_data->name ? item->u.ref_data->name : "";
+  case MIR_lref_data_item: return item->u.lref_data->name ? item->u.lref_data->name : "";
+  case MIR_expr_data_item: return item->u.expr_data->name ? item->u.expr_data->name : "";
   default: mir_assert (FALSE); return NULL;
   }
 }

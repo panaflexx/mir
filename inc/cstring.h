@@ -38,6 +38,10 @@
 #ifndef C2M_CSTRING_H
 #define C2M_CSTRING_H
 
+#ifndef C2M_STR_API
+#define C2M_STR_API static
+#endif
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -74,13 +78,13 @@ extern "C" {
  * use should guard these calls or move to per-thread registries.
  * ========================================================================== */
 
-static void **c2m__str_registry = NULL;
-static size_t c2m__str_reg_len = 0;
-static size_t c2m__str_reg_cap = 0;
-static int c2m__str_atexit_registered = 0;
+C2M_STR_API void **c2m__str_registry = NULL;
+C2M_STR_API size_t c2m__str_reg_len = 0;
+C2M_STR_API size_t c2m__str_reg_cap = 0;
+C2M_STR_API int c2m__str_atexit_registered = 0;
 
 /* Free every tracked String allocation and reset the registry. */
-static void c2m_str_cleanup (void) {
+C2M_STR_API void c2m_str_cleanup (void) {
   size_t i;
   for (i = 0; i < c2m__str_reg_len; i++) free (c2m__str_registry[i]);
   free (c2m__str_registry);
@@ -89,7 +93,7 @@ static void c2m_str_cleanup (void) {
 }
 
 /* Record a heap allocation so it can be reclaimed later.  Returns p. */
-static void *c2m__str_track (void *p) {
+C2M_STR_API void *c2m__str_track (void *p) {
   if (p == NULL) return NULL;
   if (!c2m__str_atexit_registered) {
     c2m__str_atexit_registered = 1;
@@ -107,15 +111,15 @@ static void *c2m__str_track (void *p) {
 }
 
 /* malloc + track in one step. */
-static void *c2m__str_alloc (size_t n) { return c2m__str_track (malloc (n)); }
+C2M_STR_API void *c2m__str_alloc (size_t n) { return c2m__str_track (malloc (n)); }
 
 /* Opaque checkpoint of the current allocation high-water mark. */
-static size_t c2m_str_checkpoint (void) { return c2m__str_reg_len; }
+C2M_STR_API size_t c2m_str_checkpoint (void) { return c2m__str_reg_len; }
 
 /* Free every String allocated after checkpoint `mark`.
    Shrinks the backing array when reg_len drops well below reg_cap so a
    long-running server does not permanently hold peak allocation memory. */
-static void c2m_str_release_to (size_t mark) {
+C2M_STR_API void c2m_str_release_to (size_t mark) {
   size_t i;
   if (mark > c2m__str_reg_len) return;
   for (i = mark; i < c2m__str_reg_len; i++) free (c2m__str_registry[i]);
@@ -135,7 +139,7 @@ static void c2m_str_release_to (size_t mark) {
    and will be reclaimed when an outer scope releases, by atexit, or by being
    kept again if returned further up).  This is what makes returning a String
    from a function safe under automatic scope reclamation.  Returns `keep`. */
-static void *c2m_str_release_keeping (size_t mark, void *keep) {
+C2M_STR_API void *c2m_str_release_keeping (size_t mark, void *keep) {
   size_t i, w;
   if (mark > c2m__str_reg_len) return keep;
   w = mark;
@@ -154,7 +158,7 @@ static void *c2m_str_release_keeping (size_t mark, void *keep) {
 /* Number of bytes in the UTF-8 sequence whose lead byte is c.
    An invalid lead byte is treated as a 1-byte sequence so iteration always
    makes forward progress (safe degradation on malformed input). */
-static size_t c2m__u8_seqlen (unsigned char c) {
+C2M_STR_API size_t c2m__u8_seqlen (unsigned char c) {
   if (c < 0x80) return 1;          /* 0xxxxxxx */
   if ((c & 0xE0) == 0xC0) return 2; /* 110xxxxx */
   if ((c & 0xF0) == 0xE0) return 3; /* 1110xxxx */
@@ -163,7 +167,7 @@ static size_t c2m__u8_seqlen (unsigned char c) {
 }
 
 /* Byte length of a NUL-terminated string (NULL -> 0). */
-static size_t c2m__bytelen (const char *s) {
+C2M_STR_API size_t c2m__bytelen (const char *s) {
   size_t n = 0;
   if (s != NULL)
     while (s[n] != '\0') n++;
@@ -172,7 +176,7 @@ static size_t c2m__bytelen (const char *s) {
 
 /* Advance from s by up to `cp` code points, stopping at the terminating NUL.
    Returns a pointer into s (never NULL when s != NULL). */
-static const char *c2m__u8_advance (const char *s, size_t cp) {
+C2M_STR_API const char *c2m__u8_advance (const char *s, size_t cp) {
   const unsigned char *p = (const unsigned char *) s;
   size_t i;
 
@@ -193,14 +197,14 @@ static const char *c2m__u8_advance (const char *s, size_t cp) {
 }
 
 /* Allocate and return an empty (length-0) String; never returns NULL unless OOM. */
-static char *c2m__empty_string (void) {
+C2M_STR_API char *c2m__empty_string (void) {
   char *r = (char *) c2m__str_alloc (1);
   if (r != NULL) r[0] = '\0';
   return r;
 }
 
 /* Copy `n` bytes from src to dst (no libc memcpy dependency). */
-static void c2m__copy (char *dst, const char *src, size_t n) {
+C2M_STR_API void c2m__copy (char *dst, const char *src, size_t n) {
   size_t i;
   for (i = 0; i < n; i++) dst[i] = src[i];
 }
@@ -208,7 +212,7 @@ static void c2m__copy (char *dst, const char *src, size_t n) {
 /* ---- public String runtime API (imported by generated MIR code) ---- */
 
 /* Number of Unicode code points in s (NULL -> 0). */
-static size_t c2m_str_length (const char *s) {
+C2M_STR_API size_t c2m_str_length (const char *s) {
   const unsigned char *p = (const unsigned char *) s;
   size_t count = 0;
 
@@ -230,13 +234,13 @@ static size_t c2m_str_length (const char *s) {
 }
 
 /* 1 if s is NULL or has no bytes, else 0. */
-static int64_t c2m_str_empty (const char *s) {
+C2M_STR_API int64_t c2m_str_empty (const char *s) {
   return (s == NULL || s[0] == '\0') ? 1 : 0;
 }
 
 /* Return a fresh String containing up to `len` code points starting at code
    point `pos`.  Out-of-range positions/lengths are clamped.  Never aliases s. */
-static char *c2m_str_substr (const char *s, int64_t pos, int64_t len) {
+C2M_STR_API char *c2m_str_substr (const char *s, int64_t pos, int64_t len) {
   const char *start, *end;
   size_t bytes;
   char *r;
@@ -255,7 +259,7 @@ static char *c2m_str_substr (const char *s, int64_t pos, int64_t len) {
 
 /* Code-point index of the first occurrence of `needle` in s, or (size_t)-1 if
    not present.  Empty needle matches at index 0.  NULL-safe. */
-static size_t c2m_str_find (const char *s, const char *needle) {
+C2M_STR_API size_t c2m_str_find (const char *s, const char *needle) {
   size_t sl, nl, i, j;
 
   if (s == NULL || needle == NULL) return (size_t) -1;
@@ -294,7 +298,7 @@ static size_t c2m_str_find (const char *s, const char *needle) {
 /* Return a fresh String equal to s with the `len` code points starting at code
    point `pos` replaced by `repl`.  Positions/lengths are clamped; a NULL repl
    acts as deletion.  Never aliases s. */
-static char *c2m_str_replace (const char *s, int64_t pos, int64_t len, const char *repl) {
+C2M_STR_API char *c2m_str_replace (const char *s, int64_t pos, int64_t len, const char *repl) {
   const char *region_start, *region_end;
   size_t pre, post, rl, total;
   char *r;
@@ -330,7 +334,7 @@ static char *c2m_str_replace (const char *s, int64_t pos, int64_t len, const cha
 	/* Return a fresh upper-cased copy of s.  Only ASCII a-z become A-Z; all other
    bytes (including UTF-8 multi-byte sequences) are passed through unchanged.
    NULL s acts as the empty string.  Never aliases its input. */
-static char *c2m_str_upper (const char *s) {
+C2M_STR_API char *c2m_str_upper (const char *s) {
   size_t n = c2m__bytelen (s);
   char *r = (char *) c2m__str_alloc (n + 1);
   size_t i;
@@ -352,7 +356,7 @@ static char *c2m_str_upper (const char *s) {
    not code-point).  Clamps negative len to 0.  NULL p or len<=0 yields the
    empty string.  The result is always NUL-terminated and tracked for
    lifetime management.  This backs the static `String.copy(raw, len)`. */
-static char *c2m_str_copy (const char *p, int64_t len) {
+C2M_STR_API char *c2m_str_copy (const char *p, int64_t len) {
   char *r;
   size_t n;
   if (p == NULL || len <= 0) return c2m__empty_string ();
@@ -370,7 +374,7 @@ static char *c2m_str_copy (const char *p, int64_t len) {
    struct fields, globals, etc.) that need to outlive the creating scope.
    If `s` is not found in the tracker (e.g. a string literal), it is returned
    unchanged without modification. */
-static char *c2m_str_detach (const char *s) {
+C2M_STR_API char *c2m_str_detach (const char *s) {
   size_t i;
   for (i = 0; i < c2m__str_reg_len; i++) {
     if (c2m__str_registry[i] == (void *) s) {
@@ -391,7 +395,7 @@ static char *c2m_str_detach (const char *s) {
    externally (e.g. strdup, stb_ds key retrieved before shfree, etc.).
    Returns `s` cast to char* so callers can use it as a String immediately.
    Passing NULL is a no-op that returns NULL. */
-static char *c2m_str_attach (const char *s) {
+C2M_STR_API char *c2m_str_attach (const char *s) {
   if (s == NULL) return NULL;
   return (char *) c2m__str_track ((void *) s);
 }
@@ -399,7 +403,7 @@ static char *c2m_str_attach (const char *s) {
 /* Return a fresh lower-cased copy of s.  Only ASCII A-Z become a-z; all other
    bytes (including UTF-8 multi-byte sequences) are passed through unchanged.
    NULL s acts as the empty string.  Never aliases its input. */
-static char *c2m_str_lower (const char *s) {
+C2M_STR_API char *c2m_str_lower (const char *s) {
   size_t n = c2m__bytelen (s);
   char *r = (char *) c2m__str_alloc (n + 1);
   size_t i;
@@ -424,7 +428,7 @@ static char *c2m_str_lower (const char *s) {
 /* Return 1 if s starts with the given prefix (byte-exact, not code-point),
    0 otherwise.  NULL or empty prefix always returns 1.  NULL s returns 0
    (unless prefix is also NULL/empty). */
-static int64_t c2m_str_starts_with (const char *s, const char *prefix) {
+C2M_STR_API int64_t c2m_str_starts_with (const char *s, const char *prefix) {
   size_t i, pl;
   if (prefix == NULL || prefix[0] == '\0') return 1;
   if (s == NULL) return 0;
@@ -436,7 +440,7 @@ static int64_t c2m_str_starts_with (const char *s, const char *prefix) {
 }
 
 /* Return 1 if s ends with the given suffix (byte-exact), 0 otherwise. */
-static int64_t c2m_str_ends_with (const char *s, const char *suffix) {
+C2M_STR_API int64_t c2m_str_ends_with (const char *s, const char *suffix) {
   size_t sl, sfl, i;
   const char *tail;
   if (suffix == NULL || suffix[0] == '\0') return 1;
@@ -453,7 +457,7 @@ static int64_t c2m_str_ends_with (const char *s, const char *suffix) {
 /* Return 1 if needle appears anywhere in s as a substring, 0 otherwise.
    Uses a naive byte search (appropriate for short HTTP header values and
    ASCII paths).  NULL needle or empty needle always returns 1. */
-static int64_t c2m_str_contains (const char *s, const char *needle) {
+C2M_STR_API int64_t c2m_str_contains (const char *s, const char *needle) {
   size_t sl, nl, i, j;
   if (needle == NULL || needle[0] == '\0') return 1;
   if (s == NULL) return 0;
@@ -470,7 +474,7 @@ static int64_t c2m_str_contains (const char *s, const char *needle) {
 
 /* Return a fresh tracked String with leading and trailing ASCII whitespace
    (any byte <= ' ') stripped.  NULL input yields the empty string. */
-static char *c2m_str_trim (const char *s) {
+C2M_STR_API char *c2m_str_trim (const char *s) {
   size_t n, start, end;
   char *r;
   if (s == NULL) return c2m__empty_string ();
@@ -501,7 +505,7 @@ static char *c2m_str_trim (const char *s) {
 
 /* Concatenate two Strings into a fresh tracked buffer.  A NULL operand is
    treated as the empty string.  Never aliases its inputs. */
-static char *c2m_str_concat (const char *a, const char *b) {
+C2M_STR_API char *c2m_str_concat (const char *a, const char *b) {
   size_t la = c2m__bytelen (a), lb = c2m__bytelen (b);
   char *r = (char *) c2m__str_alloc (la + lb + 1);
   if (r == NULL) return NULL;
@@ -512,7 +516,7 @@ static char *c2m_str_concat (const char *a, const char *b) {
 }
 
 /* Render a signed 64-bit integer as a decimal String. */
-static char *c2m_str_from_int (int64_t v) {
+C2M_STR_API char *c2m_str_from_int (int64_t v) {
   char tmp[24];
   int i = 0, neg = 0;
   uint64_t u;
@@ -531,7 +535,7 @@ static char *c2m_str_from_int (int64_t v) {
 }
 
 /* Render an unsigned 64-bit integer as a decimal String. */
-static char *c2m_str_from_uint (uint64_t u) {
+C2M_STR_API char *c2m_str_from_uint (uint64_t u) {
   char tmp[24];
   int i = 0;
   char *r;
@@ -547,7 +551,7 @@ static char *c2m_str_from_uint (uint64_t u) {
 }
 
 /* Render a bool as "true"/"false". */
-static char *c2m_str_from_bool (int64_t v) {
+C2M_STR_API char *c2m_str_from_bool (int64_t v) {
   const char *s = v ? "true" : "false";
   size_t n = c2m__bytelen (s);
   char *r = (char *) c2m__str_alloc (n + 1);
@@ -558,7 +562,7 @@ static char *c2m_str_from_bool (int64_t v) {
 }
 
 /* Render a single character (low byte of c) as a 1-character String. */
-static char *c2m_str_from_char (int64_t c) {
+C2M_STR_API char *c2m_str_from_char (int64_t c) {
   char *r = (char *) c2m__str_alloc (2);
   if (r == NULL) return NULL;
   r[0] = (char) (c & 0xff);
@@ -567,7 +571,7 @@ static char *c2m_str_from_char (int64_t c) {
 }
 
 /* Render a floating-point value as a String ("%g"). */
-static char *c2m_str_from_double (double v) {
+C2M_STR_API char *c2m_str_from_double (double v) {
   char tmp[64];
   int n = snprintf (tmp, sizeof tmp, "%g", v);
   size_t len;

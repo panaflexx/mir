@@ -14,6 +14,11 @@
  */
 #include <stdint.h>
 
+#define C2M_STR_API
+#include "inc/cstring.h"
+#define C2M_DICT_API
+#include "inc/dict.h"
+
 float       mir_aot_ui2f  (uint64_t i)    { return (float) i; }
 double      mir_aot_ui2d  (uint64_t i)    { return (double) i; }
 long double mir_aot_ui2ld (uint64_t i)    { return (long double) i; }

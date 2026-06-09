@@ -48,13 +48,13 @@ set_source_files_properties(c2mir/c2mir.c PROPERTIES COMPILE_FLAGS "-Wunused-fun
 if(Threads_FOUND)
   target_compile_definitions(mir PUBLIC "MIR_PARALLEL_GEN")
 endif()
-if(UNIX)
-  target_link_libraries(mir m)
-endif()
 
 # ------------------ LIBMIR -----------------------
 add_library(mir_static STATIC)
 target_link_libraries(mir_static PRIVATE mir)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(mir_static PRIVATE m)
+endif()
 
 # ------------------ LIBMIR SO --------------------
 add_library(mir_shared SHARED)
@@ -62,6 +62,9 @@ if(WIN32)
   set_target_properties(mir_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 endif()
 target_link_libraries(mir_shared PRIVATE mir)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(mir_shared PRIVATE m)
+endif()
 
 # ------------------ C2M --------------------------
 add_executable (c2m "c2mir/c2mir-driver.c")

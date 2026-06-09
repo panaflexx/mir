@@ -5181,7 +5181,9 @@ D (class_member_declaration) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t list, r;
 
-  printf("class_member_list: class %s\n", parse_ctx->curr_class->u.s.s);
+#ifdef C2MIR_PREPRO_DEBUG
+  fprintf(stderr, "class_member_list: class %s\n", parse_ctx->curr_class->u.s.s);
+#endif
 
   list = new_node(c2m_ctx, N_LIST);
 
@@ -11695,7 +11697,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       }
     }
     if (init && init ->code != N_IGNORE) {
-        printf("N_MEMBER: got init\n");
+#ifdef C2MIR_PREPRO_DEBUG
+        fprintf(stderr, "N_MEMBER: got init\n");
+#endif
         check (c2m_ctx, init, r);
         check_initializer (c2m_ctx, NULL, &type, init,
                            curr_scope == top_scope || decl_spec.static_p || decl_spec.thread_local_p,
@@ -14543,6 +14547,22 @@ static op_t gen_dict_object_value_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op
   return res;
 }
 
+/* Create a named (uniquely-named) string-data item holding a dict key, returning
+   a ref operand to it.  The data item is given a real name and moved to the
+   module start so that it survives binary (.bmir) serialization: an anonymous
+   (NULL-named) data item referenced by a ref operand would be written with an
+   empty name and fail to resolve on read-back. */
+static MIR_op_t gen_dict_key_op (c2m_ctx_t c2m_ctx, const char *key_str, size_t len) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t module = DLIST_TAIL (MIR_module_t, *MIR_get_module_list (ctx));
+  char buff[50];
+
+  _MIR_get_temp_item_name (ctx, module, buff, sizeof (buff));
+  MIR_item_t str_item = MIR_new_string_data (ctx, buff, (MIR_str_t){len, key_str});
+  move_item_to_module_start (module, str_item);
+  return MIR_new_ref_op (ctx, str_item);
+}
+
 /* Recursively generate dict initializer code.
    obj_op is the MIR register holding the parent dict object pointer.
    initializer is the N_LIST node containing N_INIT children. */
@@ -14560,9 +14580,7 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
     node_t key_node = NL_HEAD (des->u.ops);
     /* key_node is N_STR (string key like "timeout") or N_ID (.field style) */
     const char *key_str = key_node->u.s.s;
-    MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
-                              (MIR_str_t){strlen (key_str) + 1, key_str});
-    MIR_op_t key_op = MIR_new_ref_op (ctx, str_item);
+    MIR_op_t key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
 
     if (value->code == N_LIST) {
       /* nested object: { "key": { ... } } */
@@ -14578,9 +14596,8 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
       } else if (ve != NULL && ve->const_p && floating_type_p (ve->type)) {
         wrapped = gen_dict_create_number (c2m_ctx, MIR_new_double_op (ctx, ve->c.d_val));
       } else if (value->code == N_STR) {
-        MIR_item_t si = MIR_new_string_data (ctx, NULL,
-                           (MIR_str_t){value->u.s.len, value->u.s.s});
-        wrapped = gen_dict_create_string (c2m_ctx, MIR_new_ref_op (ctx, si));
+        MIR_op_t si_op = gen_dict_key_op (c2m_ctx, value->u.s.s, value->u.s.len);
+        wrapped = gen_dict_create_string (c2m_ctx, si_op);
       } else if (ve != NULL && ve->type->mode == TM_DICT) {
         /* dict-valued expression: store an owned deep copy, not a borrowed
            pointer (avoids aliasing / double-free with the source dict). */
@@ -15709,9 +15726,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           node_t key_id = NL_NEXT (parent_node);
           op1 = val_gen (c2m_ctx, parent_node);
           const char *key_str = key_id->u.s.s;
-          MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
-                                    (MIR_str_t){strlen (key_str) + 1, key_str});
-          key_op = MIR_new_ref_op (ctx, str_item);
+          key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
         }
         gen_dict_object_set (c2m_ctx, op1.mir_op, key_op, obj.mir_op);
       } else {
@@ -15741,9 +15756,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         assert (key_id->code == N_ID);
         op1 = val_gen (c2m_ctx, parent_node);
         const char *key_str = key_id->u.s.s;
-        MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
-                                  (MIR_str_t){strlen (key_str) + 1, key_str});
-        key_op = MIR_new_ref_op (ctx, str_item);
+        key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
       }
       op2 = val_gen (c2m_ctx, rhs_node);
       struct expr *rhs_expr = rhs_node->attr;
@@ -16051,9 +16064,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           break;
         }
         op1 = val_gen (c2m_ctx, obj_node);
-        MIR_item_t str_item = MIR_new_string_data (ctx, NULL,
-                                  (MIR_str_t){strlen (key_str) + 1, key_str});
-        MIR_op_t key_op = MIR_new_ref_op (ctx, str_item);
+        MIR_op_t key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
         op_t got = gen_dict_object_get (c2m_ctx, op1.mir_op, key_op);
         /* A nested dict stays a DictValue* (for chaining); a scalar/string
            result is unwrapped to its union payload. */
@@ -16947,7 +16958,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_ST_ASSERT: /* do nothing */ break;
   case N_INIT: break;  // ???
   case N_CLASS: {
+#ifdef C2MIR_PREPRO_DEBUG
     printf("gen processing N_CLASS\n");
+#endif
     node_t id = NL_HEAD(r->u.ops);
     node_t decl_list = NL_NEXT(id);
 

@@ -360,6 +360,17 @@ static const char *map_symbol (const char *name) {
  * For absolute 64-bit, X86_64_RELOC_UNSIGNED with r_extern=1 for
  * external symbols, or r_extern=0 + section symbol for local.
  */
+
+static const char *macho_mangle (const char *name) {
+  if (name == NULL) return name;
+  if (name[0] == '.') return name;
+  size_t len = strlen (name);
+  char *mangled = malloc (len + 2);
+  mangled[0] = '_';
+  memcpy (mangled + 1, name, len + 1);
+  return mangled;
+}
+
 static int elf_reloc_to_macho (int elf_type) {
   switch (elf_type) {
   case R_X86_64_PC32: return X86_64_RELOC_SIGNED;
@@ -570,7 +581,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       }
       mach_reloc_t *mr = &relocs[n_relocs++];
       mr->offset  = funcs[fi].text_offset + cr.offset;
-      mr->symbol  = map_symbol (cr.symbol);
+      mr->symbol  = macho_mangle (map_symbol (cr.symbol));
       mr->type    = cr.type;
       mr->addend  = cr.addend;
       mr->in_data = 0;
@@ -580,7 +591,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   /* __data relocations from ref_data items */
   for (size_t i = 0; i < n_datas; i++) {
     if (!datas[i].is_ref_data) continue;
-    const char *target_name = map_symbol (MIR_item_name (ctx, datas[i].ref_item));
+    const char *target_name = macho_mangle (map_symbol (MIR_item_name (ctx, datas[i].ref_item)));
     if (!target_name) continue;
     if (n_relocs >= cap_relocs) {
       cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
@@ -759,48 +770,67 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
    * Mach-O n_sect is 1-based.
    */
   enum {
-    SECT_TEXT = 1,
-    SECT_DATA = 2,
-    SECT_BSS  = 3,
+    MACH_SECT_TEXT = 1,
+    MACH_SECT_DATA = 2,
+    MACH_SECT_BSS  = 3,
   };
 
-  /* --- Local symbols (section symbols) --- */
-  /* Mach-O doesn't require section symbols like ELF, but the linker
-   * uses them for section-relative relocations. We add them for
-   * completeness and for r_extern=0 relocations. */
+  size_t n_local_syms = n_syms;
 
-  /* __text section symbol */
-  {
+  for (size_t i = 0; i < n_funcs; i++) {
+    const char *fname = funcs[i].name;
+    size_t dummy;
+    int is_exported = name_set_find (&exports, fname, &dummy);
     struct nlist_64 s = {0};
-    s.n_strx = 0; /* empty name for section symbol */
-    s.n_type = N_SECT;
-    s.n_sect = SECT_TEXT;
+    const char *mname = macho_mangle (fname);
+    s.n_un.n_strx = STRTAB_ADD (mname);
+    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
+    s.n_sect = MACH_SECT_TEXT;
     s.n_desc = 0;
-    s.n_value = 0;
-    SYMTAB_PUSH (s);
-  }
-  /* __data section symbol */
-  {
-    struct nlist_64 s = {0};
-    s.n_strx = 0;
-    s.n_type = N_SECT;
-    s.n_sect = SECT_DATA;
-    s.n_desc = 0;
-    s.n_value = 0;
-    SYMTAB_PUSH (s);
-  }
-  /* __bss section symbol */
-  {
-    struct nlist_64 s = {0};
-    s.n_strx = 0;
-    s.n_type = N_SECT;
-    s.n_sect = SECT_BSS;
-    s.n_desc = 0;
-    s.n_value = 0;
+    s.n_value = funcs[i].text_offset;
+    SYM_MAP_ADD (mname, n_syms);
     SYMTAB_PUSH (s);
   }
 
-  size_t n_local_syms = n_syms; /* 3 section symbols */
+  /* --- Defined external symbols: named data items --- */
+  for (size_t i = 0; i < n_datas; i++) {
+    if (!datas[i].name) continue;
+    int found = 0;
+    for (size_t j = 0; j < n_sym_map; j++)
+      if (strcmp (sym_map[j].name, datas[i].name) == 0) { found = 1; break; }
+    if (found) continue;
+    size_t dummy;
+    int is_exported = name_set_find (&exports, datas[i].name, &dummy);
+    struct nlist_64 s = {0};
+    const char *mname = macho_mangle (datas[i].name);
+    s.n_un.n_strx = STRTAB_ADD (mname);
+    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
+    s.n_sect = MACH_SECT_DATA;
+    s.n_desc = 0;
+    s.n_value = text_size + datas[i].data_offset;
+    SYM_MAP_ADD (mname, n_syms);
+    SYMTAB_PUSH (s);
+  }
+
+  /* --- Defined external symbols: named BSS items --- */
+  for (size_t i = 0; i < n_bsses; i++) {
+    if (!bsses[i].name) continue;
+    int found = 0;
+    for (size_t j = 0; j < n_sym_map; j++)
+      if (strcmp (sym_map[j].name, bsses[i].name) == 0) { found = 1; break; }
+    if (found) continue;
+    size_t dummy;
+    int is_exported = name_set_find (&exports, bsses[i].name, &dummy);
+    struct nlist_64 s = {0};
+    const char *mname = macho_mangle (bsses[i].name);
+    s.n_un.n_strx = STRTAB_ADD (mname);
+    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
+    s.n_sect = MACH_SECT_BSS;
+    s.n_desc = 0;
+    s.n_value = text_size + data_size + bsses[i].bss_offset;
+    SYM_MAP_ADD (mname, n_syms);
+    SYMTAB_PUSH (s);
+  }
 
   /* --- Defined local symbols: stubs --- */
   for (size_t i = 0; i < n_stubs; i++) {
@@ -815,60 +845,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     SYM_MAP_ADD (strdup(stub_sym), n_syms);
     SYMTAB_PUSH (s);
   }
-
   /* --- Defined external symbols: functions --- */
-  for (size_t i = 0; i < n_funcs; i++) {
-    const char *fname = funcs[i].name;
-    size_t dummy;
-    int is_exported = name_set_find (&exports, fname, &dummy);
-    struct nlist_64 s = {0};
-    s.n_strx = STRTAB_ADD (fname);
-    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
-    s.n_sect = SECT_TEXT;
-    s.n_desc = 0;
-    s.n_value = funcs[i].text_offset;
-    SYM_MAP_ADD (fname, n_syms);
-    SYMTAB_PUSH (s);
-  }
-
-  /* --- Defined external symbols: named data items --- */
-  for (size_t i = 0; i < n_datas; i++) {
-    if (!datas[i].name) continue;
-    int found = 0;
-    for (size_t j = 0; j < n_sym_map; j++)
-      if (strcmp (sym_map[j].name, datas[i].name) == 0) { found = 1; break; }
-    if (found) continue;
-    size_t dummy;
-    int is_exported = name_set_find (&exports, datas[i].name, &dummy);
-    struct nlist_64 s = {0};
-    s.n_strx = STRTAB_ADD (datas[i].name);
-    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
-    s.n_sect = SECT_DATA;
-    s.n_desc = 0;
-    s.n_value = datas[i].data_offset;
-    SYM_MAP_ADD (datas[i].name, n_syms);
-    SYMTAB_PUSH (s);
-  }
-
-  /* --- Defined external symbols: named BSS items --- */
-  for (size_t i = 0; i < n_bsses; i++) {
-    if (!bsses[i].name) continue;
-    int found = 0;
-    for (size_t j = 0; j < n_sym_map; j++)
-      if (strcmp (sym_map[j].name, bsses[i].name) == 0) { found = 1; break; }
-    if (found) continue;
-    size_t dummy;
-    int is_exported = name_set_find (&exports, bsses[i].name, &dummy);
-    struct nlist_64 s = {0};
-    s.n_strx = STRTAB_ADD (bsses[i].name);
-    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
-    s.n_sect = SECT_BSS;
-    s.n_desc = 0;
-    s.n_value = bsses[i].bss_offset;
-    SYM_MAP_ADD (bsses[i].name, n_syms);
-    SYMTAB_PUSH (s);
-  }
-
   size_t n_extdef_syms = n_syms - n_local_syms;
 
   /* --- Undefined external symbols (imports) --- */
@@ -878,7 +855,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       if (strcmp (sym_map[j].name, imports.names[i]) == 0) { found = 1; break; }
     if (found) continue;
     struct nlist_64 s = {0};
-    s.n_strx = STRTAB_ADD (imports.names[i]);
+    s.n_un.n_strx = STRTAB_ADD (imports.names[i]);
     s.n_type = N_UNDF | N_EXT;
     s.n_sect = NO_SECT;
     s.n_desc = 0;
@@ -895,7 +872,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       if (strcmp (sym_map[j].name, rname) == 0) { found = 1; break; }
     if (found) continue;
     struct nlist_64 s = {0};
-    s.n_strx = STRTAB_ADD (rname);
+    s.n_un.n_strx = STRTAB_ADD (rname);
     s.n_type = N_UNDF | N_EXT;
     s.n_sect = NO_SECT;
     s.n_desc = 0;
@@ -1068,9 +1045,9 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   seg_cmd.cmdsize = sizeof (struct segment_command_64) + 3 * sizeof (struct section_64);
   strncpy (seg_cmd.segname, "__TEXT", 16);
   seg_cmd.vmaddr = 0;
-  seg_cmd.vmsize = 0; /* MH_OBJECT: vmsize/filesize can be 0 */
-  seg_cmd.fileoff = 0;
-  seg_cmd.filesize = 0;
+  seg_cmd.vmsize = text_size + data_size + bss_size;
+  seg_cmd.fileoff = text_file_off;
+  seg_cmd.filesize = text_size + data_size;
   seg_cmd.maxprot = 7;  /* rwx */
   seg_cmd.initprot = 7; /* rwx */
   seg_cmd.nsects = 3;
@@ -1097,7 +1074,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   memset (&sec_data, 0, sizeof (sec_data));
   strncpy (sec_data.sectname, "__data", 16);
   strncpy (sec_data.segname, "__DATA", 16);
-  sec_data.addr = 0;
+  sec_data.addr = text_size;
   sec_data.size = data_size;
   sec_data.offset = (uint32_t)(data_size > 0 ? data_file_off : 0);
   sec_data.align = 3; /* 2^3 = 8-byte alignment */
@@ -1113,7 +1090,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   memset (&sec_bss, 0, sizeof (sec_bss));
   strncpy (sec_bss.sectname, "__bss", 16);
   strncpy (sec_bss.segname, "__DATA", 16);
-  sec_bss.addr = 0;
+  sec_bss.addr = text_size + data_size;
   sec_bss.size = bss_size;
   sec_bss.offset = 0; /* S_NO_DATA */
   sec_bss.align = 3;  /* 2^3 = 8-byte alignment */
