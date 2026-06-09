@@ -92,7 +92,12 @@ target_link_libraries(b2ctab mir)
 
 # ------------------ b2obj / b2objmac --------------------------
 # b2obj (ELF) is for Linux/Unix; b2objmac (Mach-O) is for macOS.
-if(APPLE)
+# When this MIR tree is built as part of the classyc project, the top-level
+# project provides its own b2obj / b2objmac (from ./src), so skip these to
+# avoid duplicate target names.
+if(CLASSYC_TOPLEVEL_B2OBJ)
+  # b2obj / b2objmac provided by the parent project.
+elseif(APPLE)
   add_executable(b2objmac b2objmac.c)
   target_include_directories(b2objmac PRIVATE ${PROJECT_SOURCE_DIR})
   target_link_libraries(b2objmac PRIVATE mir ${CMAKE_DL_LIBS})
@@ -282,4 +287,3 @@ add_test(mir2c-test mir2c_test)
 # ------------------ c2m tests --------------------------
 
 add_test(c2mir-simple-test c2m -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
-
