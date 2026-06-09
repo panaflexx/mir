@@ -27,7 +27,7 @@ ifeq ($(OS),Windows_NT)
   ifeq ($(CC),gcc)
     CFLAGS += -fPIC -g -std=gnu11 -Wno-abi -fsigned-char
     CFLAGS += -fno-tree-sra
-    COPTFLAGS = -O3 -DNDEBUG
+    COPTFLAGS = -DNDEBUG
     CDEBFLAGS =
     CDEB2FLAGS = -Wall -Wextra -g3 -dwarf4 -fsanitize=address -fsanitize=undefined -fno-sanitize=alignment
     CFLAGS += $(COPTFLAGS)
@@ -73,7 +73,7 @@ else
   endif
 
   MIR_LIBS=-lm -ldl
-  COPTFLAGS = -O3 -DNDEBUG
+  COPTFLAGS =  -DNDEBUG
   CDEBFLAGS =
   CDEB2FLAGS = -Wall -Wextra -Wshadow -g3 -fsanitize=address -fsanitize=undefined -fno-sanitize=alignment
   LD2FLAGS =  -fsanitize=address -fsanitize=undefined  -fno-sanitize=alignment

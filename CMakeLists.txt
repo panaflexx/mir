@@ -43,16 +43,18 @@ include(CTest)
 
 add_library(mir OBJECT mir.c mir-gen.c c2mir/c2mir.c mir.h mir-gen.h c2mir/c2mir.h)
 target_include_directories(mir PRIVATE ${PROJECT_SOURCE_DIR})
+# Report unused functions to help keep c2mir.c clean of dead code:
+set_source_files_properties(c2mir/c2mir.c PROPERTIES COMPILE_FLAGS "-Wunused-function")
 if(Threads_FOUND)
   target_compile_definitions(mir PUBLIC "MIR_PARALLEL_GEN")
-endif()
-if(UNIX)
-	target_link_libraries(mir m)
 endif()
 
 # ------------------ LIBMIR -----------------------
 add_library(mir_static STATIC)
 target_link_libraries(mir_static PRIVATE mir)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(mir_static PRIVATE m)
+endif()
 
 # ------------------ LIBMIR SO --------------------
 add_library(mir_shared SHARED)
@@ -60,6 +62,9 @@ if(WIN32)
   set_target_properties(mir_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 endif()
 target_link_libraries(mir_shared PRIVATE mir)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(mir_shared PRIVATE m)
+endif()
 
 # ------------------ C2M --------------------------
 add_executable (c2m "c2mir/c2mir-driver.c")
@@ -84,6 +89,18 @@ target_link_libraries(b2m mir)
 add_executable (b2ctab "mir-utils/b2ctab.c")
 target_include_directories(b2ctab PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(b2ctab mir)
+
+# ------------------ b2obj / b2objmac --------------------------
+# b2obj (ELF) is for Linux/Unix; b2objmac (Mach-O) is for macOS.
+if(APPLE)
+  add_executable (b2objmac b2objmac.c)
+  target_include_directories(b2objmac PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(b2objmac mir ${CMAKE_DL_LIBS})
+else()
+  add_executable (b2obj b2obj.c)
+  target_include_directories(b2obj PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(b2obj mir ${CMAKE_DL_LIBS})
+endif()
 
 # ------------------ L2M --------------------------
 find_package(LLVM)
@@ -258,4 +275,3 @@ add_test(mir2c-test mir2c_test)
 # ------------------ c2m tests --------------------------
 
 add_test(c2mir-simple-test c2m -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
-

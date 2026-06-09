@@ -24,7 +24,10 @@ static const char mirc[]
     "#define __signed signed\n"
     "#define __signed__ signed\n"
     "#define __volatile volatile\n"
-    "#define __volatile__ volatile\n";
+    "#define __volatile__ volatile\n"
+    "\n"
+    "/* Built-in null pointer literal (used for String/dict/pointer comparisons): */\n"
+    "#define null ((void*)0)\n";
 
 #include "mirc_iso646.h"
 #include "mirc_stdalign.h"
