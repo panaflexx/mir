@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* fuzz-string-valid.c — String edge-case tests that should all compile & pass
  *
  * Exercises unusual but valid String patterns:

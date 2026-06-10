@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* fuzz-class-valid.c — class edge-case tests that should all compile & pass
  *
  * Exercises valid class patterns:

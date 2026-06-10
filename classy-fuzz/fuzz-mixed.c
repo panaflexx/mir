@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <string.h>
 /* fuzz-mixed.c — tests interactions between dict, class, and String
  *
  * Exercises cross-feature patterns:
