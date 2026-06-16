@@ -22,6 +22,7 @@ extern "C" {
 #include "mir-htab.h"
 #include "mir-alloc.h"
 #include "mir-code-alloc.h"
+#include "mir-dbinfo.h"
 
 #define MIR_API_VERSION 0.2
 
@@ -283,6 +284,10 @@ struct MIR_insn {
   DLIST_LINK (MIR_insn_t) insn_link;
   MIR_insn_code_t code : 32;
   unsigned int nops : 32; /* number of operands */
+  /* Source location for debug info (0 = no info): */
+  uint32_t source_line;
+  uint16_t source_col;
+  uint16_t source_file_id; /* index into module source_files, 0 = none */
   MIR_op_t ops[1];
 };
 
@@ -332,6 +337,9 @@ typedef struct MIR_func {
   void *internal;  /* internal data structure */
   struct MIR_lref_data *first_lref; /* label addr data of the func: defined by module load */
   VARR (MIR_code_reloc_t) * relocs; /* Relocations for object file */
+#if !MIR_NO_DBINFO
+  MIR_dbinfo_t *dbinfo;              /* debug info (vars), NULL when -g not used */
+#endif
 } *MIR_func_t;
 
 typedef struct MIR_proto {
@@ -441,6 +449,12 @@ struct MIR_module {
   DLIST (MIR_item_t) items; /* module items */
   DLIST_LINK (MIR_module_t) module_link;
   uint32_t last_temp_item_num; /* Used only internally */
+  /* Debug source file table: index 0 is reserved (no file). */
+  uint32_t num_source_files;
+  const char **source_files; /* array of interned file name strings, NULL-terminated */
+#if !MIR_NO_DBINFO
+  MIR_dbtype_table_t *dbtypes; /* debug type table, NULL when -g not used */
+#endif
 };
 
 /* Definition of double list of MIR_item_t type elements */
@@ -642,6 +656,12 @@ extern void MIR_load_module (MIR_context_t ctx, MIR_module_t m);
 extern void MIR_load_external (MIR_context_t ctx, const char *name, void *addr);
 extern void MIR_link (MIR_context_t ctx, void (*set_interface) (MIR_context_t ctx, MIR_item_t item),
                       void *(*import_resolver) (const char *) );
+
+/* Source location API for debug info */
+extern uint16_t MIR_module_add_source_file (MIR_context_t ctx, MIR_module_t module,
+                                             const char *filename);
+extern void MIR_insn_set_source_loc (MIR_insn_t insn, uint16_t file_id, uint32_t line,
+                                      uint16_t col);
 
 /* Interpreter: */
 typedef union {

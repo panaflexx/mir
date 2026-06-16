@@ -215,6 +215,9 @@ struct gen_ctx {
   int addr_insn_p;    /* true if we have address insns in the input func */
   bitmap_t tied_regs; /* regs tied to hard reg */
   bitmap_t addr_regs; /* regs in addr insns as 2nd op */
+#if !MIR_NO_DBINFO
+  bitmap_t debug_home_regs; /* -g: source-named regs forced to a stack home */
+#endif
   bitmap_t insn_to_consider, temp_bitmap, temp_bitmap2, temp_bitmap3;
   bitmap_t call_used_hard_regs[MIR_T_BOUND];
   bitmap_t func_used_hard_regs; /* before prolog: used hard regs except global var hard regs */
@@ -256,6 +259,9 @@ struct gen_ctx {
 #define addr_insn_p gen_ctx->addr_insn_p
 #define tied_regs gen_ctx->tied_regs
 #define addr_regs gen_ctx->addr_regs
+#if !MIR_NO_DBINFO
+#define debug_home_regs gen_ctx->debug_home_regs
+#endif
 #define insn_to_consider gen_ctx->insn_to_consider
 #define temp_bitmap gen_ctx->temp_bitmap
 #define temp_bitmap2 gen_ctx->temp_bitmap2
@@ -7703,7 +7709,14 @@ static void assign (gen_ctx_t gen_ctx) {
   for (reg = MAX_HARD_REG + 1; reg <= max_var; reg++) {
     allocno_info.reg = reg;
     allocno_info.tied_reg_p = bitmap_bit_p (tied_regs, reg);
-    if (bitmap_bit_p (addr_regs, reg)) {
+    if (bitmap_bit_p (addr_regs, reg)
+#if !MIR_NO_DBINFO
+        /* -g: keep source-named variables in a fixed stack home so they have a
+           stable, addressable location for the debugger (see record_dbvar
+           locations and target_machinize's forced frame pointer). */
+        || bitmap_bit_p (debug_home_regs, reg)
+#endif
+    ) {
       type = MIR_reg_type (gen_ctx->ctx, reg - MAX_HARD_REG, func);
       best_loc = get_new_stack_slot (gen_ctx, type, &slots_num);
       VARR_SET (MIR_reg_t, reg_renumber, reg, best_loc);
@@ -9398,6 +9411,116 @@ static void *print_and_execute_wrapper (gen_ctx_t gen_ctx, MIR_item_t called_fun
 
 static const int collect_bb_stat_p = FALSE;
 
+#if !MIR_NO_DBINFO
+/* The ssa pass aliases `reg_name` to a gen_ctx field via a macro; it is no
+   longer needed here and would clobber MIR_dbvar's `loc.reg_name`. */
+#undef reg_name
+/* Look up the MIR register for NAME without aborting when it is absent.
+   Returns MIR_NON_VAR (0) when NAME is not a declared register of FUNC. */
+static MIR_reg_t gen_safe_reg_lookup (MIR_context_t ctx, MIR_func_t func, const char *name) {
+  if (name == NULL || name[0] == '\0') return MIR_NON_VAR;
+  for (size_t i = 0; i < VARR_LENGTH (MIR_var_t, func->vars); i++)
+    if (strcmp (VARR_GET (MIR_var_t, func->vars, i).name, name) == 0)
+      return MIR_reg (ctx, name, func);
+  return MIR_NON_VAR;
+}
+
+/* -g keystone (part 1): before register allocation, mark every source-named
+   variable's MIR register so assign() gives it a dedicated stack home.  This
+   keeps the variable at a stable, debugger-addressable location instead of an
+   ephemeral hard register. */
+static void setup_debug_home_regs (gen_ctx_t gen_ctx) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  MIR_func_t func = curr_func_item->u.func;
+  bitmap_clear (debug_home_regs);
+  if (func->dbinfo == NULL || func->dbinfo->num_vars == 0) return;
+  MIR_reg_t max_var = get_max_var (gen_ctx);
+  for (uint32_t i = 0; i < func->dbinfo->num_vars; i++) {
+    MIR_dbvar_t *v = &func->dbinfo->vars[i];
+    if (v->loc_kind != MIR_DBLOC_REG) continue;
+    MIR_reg_t reg = gen_safe_reg_lookup (ctx, func, v->loc.reg_name);
+    if (reg == MIR_NON_VAR) continue;
+    reg += MAX_HARD_REG;
+    if (reg > max_var) continue;
+    /* Do not override regs tied to a fixed hard register. */
+    if (bitmap_bit_p (tied_regs, reg)) continue;
+    bitmap_set_bit_p (debug_home_regs, reg);
+  }
+}
+
+/* -g keystone (part 2): after register allocation, resolve each source-named
+   variable to its concrete machine location and write it back into dbinfo so a
+   DWARF emitter (b2obj) can produce a real DW_OP location.  Mirrors the way the
+   line map is captured during target_translate. */
+static void record_dbvar_locations (gen_ctx_t gen_ctx) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  MIR_func_t func = curr_func_item->u.func;
+  if (func->dbinfo == NULL || func->dbinfo->num_vars == 0) return;
+  MIR_reg_t max_var = get_max_var (gen_ctx);
+  MIR_reg_t base_hard_reg = target_get_stack_slot_base_reg (gen_ctx);
+  int base_dwarf_reg = target_dwarf_reg_num (base_hard_reg);
+  /* The MIR "fp" register holds the base of the alloca'd frame area that backs
+     aggregate/address-taken locals (see classyc's FP_NAME).  Resolve it once so
+     frame variables can be expressed relative to its final machine location. */
+  MIR_reg_t fp_loc = MIR_NON_VAR;
+  MIR_type_t fp_type = MIR_T_I64;
+  {
+    MIR_reg_t fpreg = gen_safe_reg_lookup (ctx, func, "fp");
+    if (fpreg != MIR_NON_VAR && (fpreg += MAX_HARD_REG) <= max_var) {
+      fp_loc = VARR_GET (MIR_reg_t, reg_renumber, fpreg);
+      fp_type = MIR_reg_type (ctx, fpreg - MAX_HARD_REG, func);
+    }
+  }
+  for (uint32_t i = 0; i < func->dbinfo->num_vars; i++) {
+    MIR_dbvar_t *v = &func->dbinfo->vars[i];
+    v->mach_kind = MIR_DBMACH_NONE;
+    v->mach_deref = 0;
+    if (v->loc_kind == MIR_DBLOC_REG) {
+      MIR_reg_t reg = gen_safe_reg_lookup (ctx, func, v->loc.reg_name);
+      if (reg == MIR_NON_VAR) continue;
+      reg += MAX_HARD_REG;
+      if (reg > max_var) continue;
+      MIR_reg_t loc = VARR_GET (MIR_reg_t, reg_renumber, reg);
+      if (loc == MIR_NON_VAR) continue; /* unallocated (e.g. never used) */
+      MIR_type_t type = MIR_reg_type (ctx, reg - MAX_HARD_REG, func);
+      if (loc <= MAX_HARD_REG) {
+        int dwarf = target_dwarf_reg_num (loc);
+        if (dwarf < 0) continue;
+        v->mach_kind = MIR_DBMACH_REG;
+        v->mach_reg = (uint16_t) dwarf;
+      } else {
+        MIR_disp_t offset = target_get_stack_slot_offset (gen_ctx, type, loc - MAX_HARD_REG - 1);
+        if (base_dwarf_reg < 0) continue;
+        v->mach_kind = MIR_DBMACH_MEM;
+        v->mach_reg = (uint16_t) base_dwarf_reg;
+        v->mach_offset = (int32_t) offset;
+      }
+    } else if (v->loc_kind == MIR_DBLOC_FRAME) {
+      /* Address = value-of(fp) + frame_offset.  fp may be in a hard register
+         (then the variable is at [fp_reg + off]) or spilled to a stack slot
+         (then it is at [[rbp + slot] + off], needing a deref). */
+      if (fp_loc == MIR_NON_VAR) continue; /* leave fbreg fallback to b2obj */
+      if (fp_loc <= MAX_HARD_REG) {
+        int dwarf = target_dwarf_reg_num (fp_loc);
+        if (dwarf < 0) continue;
+        v->mach_kind = MIR_DBMACH_MEM;
+        v->mach_reg = (uint16_t) dwarf;
+        v->mach_offset = (int32_t) v->loc.frame_offset;
+      } else {
+        MIR_disp_t slot_off
+          = target_get_stack_slot_offset (gen_ctx, fp_type, fp_loc - MAX_HARD_REG - 1);
+        if (base_dwarf_reg < 0) continue;
+        v->mach_kind = MIR_DBMACH_MEM;
+        v->mach_reg = (uint16_t) base_dwarf_reg;
+        v->mach_offset = (int32_t) slot_off;
+        v->mach_deref = 1;
+        v->mach_offset2 = (int32_t) v->loc.frame_offset;
+      }
+    }
+  }
+}
+#endif /* !MIR_NO_DBINFO */
+
 static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int machine_code_p) {
   gen_ctx_t gen_ctx = *gen_ctx_loc (ctx);
   uint8_t *code;
@@ -9575,7 +9698,13 @@ static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int ma
   consider_all_live_vars (gen_ctx);
   calculate_func_cfg_live_info (gen_ctx, TRUE);
   print_live_info (gen_ctx, "Live info before RA", optimize_level > 0, TRUE);
+#if !MIR_NO_DBINFO
+  setup_debug_home_regs (gen_ctx);
+#endif
   reg_alloc (gen_ctx);
+#if !MIR_NO_DBINFO
+  record_dbvar_locations (gen_ctx);
+#endif
   DEBUG (2, {
     fprintf (debug_file, "+++++++++++++MIR after RA:\n");
     print_CFG (gen_ctx, TRUE, FALSE, TRUE, FALSE, NULL);
@@ -9861,6 +9990,9 @@ void MIR_gen_init (MIR_context_t ctx) {
   }
   tied_regs = bitmap_create2 (alloc, 256);
   addr_regs = bitmap_create2 (alloc, 256);
+#if !MIR_NO_DBINFO
+  debug_home_regs = bitmap_create2 (alloc, 256);
+#endif
   insn_to_consider = bitmap_create2 (alloc, 1024);
   func_used_hard_regs = bitmap_create2 (alloc, MAX_HARD_REG + 1);
   bb_wrapper = _MIR_get_bb_wrapper (ctx, gen_ctx, bb_version_generator);
@@ -9885,6 +10017,9 @@ void MIR_gen_finish (MIR_context_t ctx) {
     bitmap_destroy (call_used_hard_regs[type]);
   bitmap_destroy (tied_regs);
   bitmap_destroy (addr_regs);
+#if !MIR_NO_DBINFO
+  bitmap_destroy (debug_home_regs);
+#endif
   bitmap_destroy (insn_to_consider);
   bitmap_destroy (func_used_hard_regs);
   target_finish (gen_ctx);

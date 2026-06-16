@@ -6,7 +6,7 @@
 # Valid tests should compile, run, and exit 0 (all checks pass).
 # Bad tests should fail at compile time (non-zero exit).
 
-C2M="${1:-./c2m}"
+C2M="${1:-./bin/classyc}"
 DIR="$(dirname "$0")"
 PASS=0
 FAIL=0

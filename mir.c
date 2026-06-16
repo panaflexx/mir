@@ -749,6 +749,11 @@ static void init_module (MIR_context_t ctx, MIR_module_t m, const char *name) {
   m->last_temp_item_num = 0;
   m->name = get_ctx_str (ctx, name);
   DLIST_INIT (MIR_item_t, m->items);
+  m->num_source_files = 0;
+  m->source_files = NULL;
+#if !MIR_NO_DBINFO
+  m->dbtypes = NULL;
+#endif
 }
 
 static void code_init (MIR_context_t ctx);
@@ -853,6 +858,9 @@ static void remove_item (MIR_context_t ctx, MIR_item_t item) {
     if (item->u.func->vars != NULL) VARR_DESTROY (MIR_var_t, item->u.func->vars);
     if (item->u.func->global_vars != NULL) VARR_DESTROY (MIR_var_t, item->u.func->global_vars);
     if (item->u.func->internal != NULL) func_regs_finish (ctx, item->u.func);
+#if !MIR_NO_DBINFO
+    MIR_dbinfo_free_func (ctx, item->u.func);
+#endif
     MIR_free (ctx->alloc, item->u.func);
     break;
   case MIR_proto_item:
@@ -904,6 +912,11 @@ static void remove_module (MIR_context_t ctx, MIR_module_t module, int free_modu
   }
   if (module->data != NULL)
     bitmap_destroy (module->data);
+  if (module->source_files != NULL)
+    MIR_free (ctx->alloc, module->source_files);
+#if !MIR_NO_DBINFO
+  MIR_dbinfo_free_module (ctx, module);
+#endif
   if (free_module_p)
     MIR_free (ctx->alloc, module);
 }
@@ -1463,6 +1476,9 @@ static MIR_item_t new_func_arr (MIR_context_t ctx, const char *name, size_t nres
   func->machine_code_len = 0;
   func->relocs = NULL;
   func->first_lref = NULL;
+#if !MIR_NO_DBINFO
+  func->dbinfo = NULL;
+#endif
   func_regs_init (ctx, func);
   for (size_t i = 0; i < nargs; i++) {
     char *stored_name;
@@ -2009,6 +2025,113 @@ void MIR_load_external (MIR_context_t ctx, const char *name, void *addr) {
   setup_global (ctx, name, addr, NULL);
 }
 
+/* Source location API for debug info */
+uint16_t MIR_module_add_source_file (MIR_context_t ctx, MIR_module_t module,
+                                      const char *filename) {
+  const char *interned = _MIR_uniq_string (ctx, filename);
+  /* Check if already in the table */
+  for (uint32_t i = 1; i <= module->num_source_files; i++)
+    if (module->source_files[i] == interned) return (uint16_t) i;
+  /* Add new entry */
+  uint32_t old_count = module->num_source_files;
+  module->num_source_files++;
+  module->source_files
+    = MIR_realloc (ctx->alloc, module->source_files,
+                   sizeof (const char *) * (old_count + 1),
+                   sizeof (const char *) * (module->num_source_files + 1));
+  if (module->source_files == NULL)
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for source file table");
+  module->source_files[0] = NULL; /* index 0 = no file */
+  module->source_files[module->num_source_files] = interned;
+  return (uint16_t) module->num_source_files;
+}
+
+void MIR_insn_set_source_loc (MIR_insn_t insn, uint16_t file_id, uint32_t line, uint16_t col) {
+  insn->source_file_id = file_id;
+  insn->source_line = line;
+  insn->source_col = col;
+}
+
+/* ---- Debug info table API (mir-dbinfo.h) ---- */
+#if !MIR_NO_DBINFO
+
+MIR_dbtype_id_t MIR_dbinfo_add_type (MIR_context_t ctx, MIR_module_t module,
+                                      const MIR_dbtype_t *type) {
+  MIR_dbtype_table_t *tbl = module->dbtypes;
+  if (tbl == NULL) {
+    tbl = MIR_malloc (ctx->alloc, sizeof (MIR_dbtype_table_t));
+    if (tbl == NULL)
+      MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for debug type table");
+    tbl->num_types = 1; /* slot 0 = void */
+    tbl->types = MIR_malloc (ctx->alloc, sizeof (MIR_dbtype_t));
+    if (tbl->types == NULL)
+      MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for debug type table");
+    tbl->types[0] = (MIR_dbtype_t){.id = 0, .kind = MIR_DBT_VOID, .name = "void"};
+    module->dbtypes = tbl;
+  }
+  MIR_dbtype_id_t new_id = tbl->num_types;
+  tbl->num_types++;
+  tbl->types = MIR_realloc (ctx->alloc, tbl->types,
+                            sizeof (MIR_dbtype_t) * (new_id),
+                            sizeof (MIR_dbtype_t) * tbl->num_types);
+  if (tbl->types == NULL)
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for debug type");
+  tbl->types[new_id] = *type;
+  tbl->types[new_id].id = new_id;
+  return new_id;
+}
+
+MIR_dbtype_t *MIR_dbinfo_get_type (MIR_module_t module, MIR_dbtype_id_t id) {
+  if (module->dbtypes == NULL || id >= module->dbtypes->num_types) return NULL;
+  return &module->dbtypes->types[id];
+}
+
+void MIR_dbinfo_add_var (MIR_context_t ctx, MIR_func_t func, const MIR_dbvar_t *var) {
+  MIR_dbinfo_t *di = func->dbinfo;
+  if (di == NULL) {
+    di = MIR_malloc (ctx->alloc, sizeof (MIR_dbinfo_t));
+    if (di == NULL)
+      MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for debug info");
+    di->num_vars = 0;
+    di->vars = NULL;
+    di->line_map = NULL;
+    func->dbinfo = di;
+  }
+  uint32_t old_n = di->num_vars;
+  di->num_vars++;
+  di->vars = MIR_realloc (ctx->alloc, di->vars,
+                          sizeof (MIR_dbvar_t) * old_n,
+                          sizeof (MIR_dbvar_t) * di->num_vars);
+  if (di->vars == NULL)
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for debug var");
+  di->vars[old_n] = *var;
+}
+
+void MIR_dbinfo_free_func (MIR_context_t ctx, MIR_func_t func) {
+  if (func->dbinfo == NULL) return;
+  if (func->dbinfo->vars != NULL) MIR_free (ctx->alloc, func->dbinfo->vars);
+  if (func->dbinfo->line_map != NULL) {
+    if (func->dbinfo->line_map->entries != NULL) free (func->dbinfo->line_map->entries);
+    free (func->dbinfo->line_map);
+  }
+  MIR_free (ctx->alloc, func->dbinfo);
+  func->dbinfo = NULL;
+}
+
+void MIR_dbinfo_free_module (MIR_context_t ctx, MIR_module_t module) {
+  MIR_dbtype_table_t *tbl = module->dbtypes;
+  if (tbl == NULL) return;
+  /* Note: member/enumerator/param arrays inside types may have been allocated
+     by the front-end's own allocator (e.g. reg_malloc) rather than MIR_malloc.
+     We only free the outer containers that MIR_dbinfo_add_type allocated. */
+  if (tbl->types != NULL)
+    MIR_free (ctx->alloc, tbl->types);
+  MIR_free (ctx->alloc, tbl);
+  module->dbtypes = NULL;
+}
+
+#endif /* !MIR_NO_DBINFO */
+
 static void simplify_module_init (MIR_context_t ctx);
 static int simplify_func (MIR_context_t ctx, MIR_item_t func_item, int mem_float_p);
 static void process_inlines (MIR_context_t ctx, MIR_item_t func_item);
@@ -2249,6 +2372,9 @@ static MIR_insn_t create_insn (MIR_context_t ctx, size_t nops, MIR_insn_code_t c
 #endif
   insn->code = code;
   insn->data = NULL;
+  insn->source_line = 0;
+  insn->source_col = 0;
+  insn->source_file_id = 0;
   return insn;
 }
 
@@ -3061,6 +3187,18 @@ void MIR_output_insn (MIR_context_t ctx, FILE *f, MIR_insn_t insn, MIR_func_t fu
   }
   if (insn->code == MIR_UNSPEC)
     fprintf (f, " # %s", VARR_GET (MIR_proto_t, unspec_protos, insn->ops[0].u.u)->name);
+  /* Append source location as a comment when present */
+  if (insn->source_line != 0 && insn->source_file_id != 0 && func->func_item != NULL
+      && func->func_item->module != NULL) {
+    MIR_module_t mod = func->func_item->module;
+    const char *fname = (insn->source_file_id <= mod->num_source_files && mod->source_files != NULL)
+                          ? mod->source_files[insn->source_file_id]
+                          : "?";
+    if (insn->source_col != 0)
+      fprintf (f, " # %s:%u:%u", fname, insn->source_line, insn->source_col);
+    else
+      fprintf (f, " # %s:%u", fname, insn->source_line);
+  }
   if (newline_p) fprintf (f, "\n");
 }
 
@@ -3212,12 +3350,77 @@ void MIR_output_item (MIR_context_t ctx, FILE *f, MIR_item_t item) {
   for (insn = DLIST_HEAD (MIR_insn_t, func->insns); insn != NULL;
        insn = DLIST_NEXT (MIR_insn_t, insn))
     MIR_output_insn (ctx, f, insn, func, TRUE);
+#if !MIR_NO_DBINFO
+  if (func->dbinfo != NULL && func->dbinfo->num_vars > 0) {
+    fprintf (f, "# debug vars (%u):\n", func->dbinfo->num_vars);
+    for (uint32_t i = 0; i < func->dbinfo->num_vars; i++) {
+      MIR_dbvar_t *v = &func->dbinfo->vars[i];
+      fprintf (f, "#   %s \"%s\" type=%u", v->is_param ? "param" : "var",
+               v->source_name ? v->source_name : "?", v->type_id);
+      switch (v->loc_kind) {
+      case MIR_DBLOC_REG: fprintf (f, " reg=%s", v->loc.reg_name); break;
+      case MIR_DBLOC_FRAME: fprintf (f, " frame=%+" PRId64, v->loc.frame_offset); break;
+      case MIR_DBLOC_STATIC: fprintf (f, " static=%s", v->loc.item_name); break;
+      default: break;
+      }
+      if (v->scope_num != 0) fprintf (f, " scope=%u", v->scope_num);
+      if (v->decl_line != 0) fprintf (f, " line=%u", v->decl_line);
+      fprintf (f, "\n");
+    }
+  }
+#endif
   fprintf (f, "\tendfunc\n");
 }
 
 void MIR_output_module (MIR_context_t ctx, FILE *f, MIR_module_t module) {
   mir_assert (f != NULL && module != NULL);
   fprintf (f, "%s:\tmodule\n", module->name);
+  if (module->num_source_files > 0 && module->source_files != NULL) {
+    fprintf (f, "# source files:\n");
+    for (uint32_t i = 1; i <= module->num_source_files; i++)
+      fprintf (f, "#   [%u] %s\n", i, module->source_files[i]);
+  }
+#if !MIR_NO_DBINFO
+  if (module->dbtypes != NULL && module->dbtypes->num_types > 1) {
+    static const char *kind_names[] = {
+      "void", "base", "ptr", "array", "struct", "union", "enum",
+      "func", "typedef", "const", "volatile", "restrict"};
+    fprintf (f, "# debug types (%u):\n", module->dbtypes->num_types - 1);
+    for (uint32_t i = 1; i < module->dbtypes->num_types; i++) {
+      MIR_dbtype_t *t = &module->dbtypes->types[i];
+      const char *kn = (t->kind < sizeof (kind_names) / sizeof (kind_names[0]))
+                          ? kind_names[t->kind] : "?";
+      fprintf (f, "#   [%u] %s", i, kn);
+      if (t->name != NULL) fprintf (f, " \"%s\"", t->name);
+      if (t->byte_size != 0) fprintf (f, " size=%u", t->byte_size);
+      switch (t->kind) {
+      case MIR_DBT_BASE: fprintf (f, " enc=%u", t->u.base.encoding); break;
+      case MIR_DBT_PTR: case MIR_DBT_CONST: case MIR_DBT_VOLATILE:
+      case MIR_DBT_RESTRICT: case MIR_DBT_TYPEDEF:
+        fprintf (f, " -> %u", t->u.ref.target_id); break;
+      case MIR_DBT_ARRAY:
+        fprintf (f, " el=%u count=%" PRId64, t->u.array.element_id, t->u.array.count); break;
+      case MIR_DBT_STRUCT: case MIR_DBT_UNION:
+        fprintf (f, " members=%u", t->u.aggregate.num_members);
+        for (uint32_t mi = 0; mi < t->u.aggregate.num_members; mi++) {
+          MIR_dbmember_t *mb = &t->u.aggregate.members[mi];
+          fprintf (f, "\n#     .%s type=%u off=%u",
+                   mb->name ? mb->name : "?", mb->type_id, mb->byte_offset);
+        }
+        break;
+      case MIR_DBT_ENUM:
+        fprintf (f, " underlying=%u enumerators=%u",
+                 t->u.enumeration.underlying_id, t->u.enumeration.num_enumerators); break;
+      case MIR_DBT_FUNC:
+        fprintf (f, " ret=%u params=%u%s",
+                 t->u.func.return_id, t->u.func.num_params,
+                 t->u.func.variadic ? " variadic" : ""); break;
+      default: break;
+      }
+      fprintf (f, "\n");
+    }
+  }
+#endif
   for (MIR_item_t item = DLIST_HEAD (MIR_item_t, module->items); item != NULL;
        item = DLIST_NEXT (MIR_item_t, item))
     MIR_output_item (ctx, f, item);
@@ -4606,6 +4809,7 @@ typedef enum {
   REP4 (TAG_EL, ALIAS_MEM_DISP, ALIAS_MEM_BASE, ALIAS_MEM_INDEX, ALIAS_MEM_DISP_BASE),
   REP3 (TAG_EL, ALIAS_MEM_DISP_INDEX, ALIAS_MEM_BASE_INDEX, ALIAS_MEM_DISP_BASE_INDEX),
   TAG_EL (LAST) = TAG_EL (ALIAS_MEM_DISP_BASE_INDEX),
+  TAG_EL (SRCLOC), /* v2: source location annotation: NAME(file) UINT(line) UINT(col) */
   /* unsigned integer 0..127 is kept in one byte.  The most significant bit of the byte is 1: */
   U0_MASK = 0x7f,
   U0_FLAG = 0x80,
@@ -4617,7 +4821,8 @@ typedef enum {
    VERSION
    NSTR
    (string)*
-   ( ((label)* (insn code) (operand)* | STRN=(func|global|local|import|export|forward|<data>) ...)
+   ( (TAG_SRCLOC NAME(file) UINT(line) UINT(col))?
+     (label)* (insn code) (operand)* | STRN=(func|global|local|import|export|forward|<data>) ...)
      EOI?
    )* EOF
 
@@ -4627,9 +4832,10 @@ typedef enum {
    o string is string number tokens
    o operand is unsigned, signed, float, double, string, label, memory tokens
    o EOI, EOF - tokens for end of insn (optional for most insns) and end of file
+   o TAG_SRCLOC is an optional source location annotation (v2+)
 */
 
-static const int CURR_BIN_VERSION = 1;
+static const int CURR_BIN_VERSION = 2;
 
 DEF_VARR (MIR_str_t);
 DEF_VARR (uint64_t);
@@ -4913,14 +5119,26 @@ static size_t write_insn (MIR_context_t ctx, writer_func_t writer, MIR_func_t fu
                           MIR_insn_t insn) {
   size_t i, nops;
   MIR_insn_code_t code = insn->code;
-  size_t len;
+  size_t len = 0;
 
   if (code == MIR_UNSPEC || code == MIR_USE || code == MIR_PHI)
     MIR_get_error_func (ctx) (MIR_binary_io_error,
                               "UNSPEC, USE, or PHI is not portable and can not be output");
   if (code == MIR_LABEL) return write_lab (ctx, writer, insn);
+  /* Emit source location annotation before the instruction (v2+) */
+  if (insn->source_line != 0 && insn->source_file_id != 0 && func->func_item != NULL
+      && func->func_item->module != NULL) {
+    MIR_module_t mod = func->func_item->module;
+    if (insn->source_file_id <= mod->num_source_files && mod->source_files != NULL) {
+      put_byte (ctx, writer, TAG_SRCLOC);
+      len++;
+      len += write_name (ctx, writer, mod->source_files[insn->source_file_id]);
+      len += write_uint (ctx, writer, insn->source_line);
+      len += write_uint (ctx, writer, insn->source_col);
+    }
+  }
   nops = MIR_insn_nops (ctx, insn);
-  len = write_uint (ctx, writer, code);
+  len += write_uint (ctx, writer, code);
   for (i = 0; i < nops; i++) len += write_op (ctx, writer, func, insn->ops[i]);
   if (insn_descs[code].op_modes[0] == MIR_OP_BOUND) {
     /* first operand mode is undefined if it is a variable operand insn */
@@ -4951,6 +5169,97 @@ static size_t write_vars (MIR_context_t ctx, writer_func_t writer, MIR_func_t fu
   len += put_byte (ctx, writer, TAG_EOI);
   return len;
 }
+
+#if !MIR_NO_DBINFO
+static size_t write_dbvars (MIR_context_t ctx, writer_func_t writer, MIR_func_t func) {
+  if (func->dbinfo == NULL || func->dbinfo->num_vars == 0) return 0;
+  MIR_dbinfo_t *di = func->dbinfo;
+  size_t len = write_name (ctx, writer, "dbvars");
+  len += write_uint (ctx, writer, di->num_vars);
+  for (uint32_t i = 0; i < di->num_vars; i++) {
+    MIR_dbvar_t *v = &di->vars[i];
+    len += write_name (ctx, writer, v->source_name ? v->source_name : "");
+    len += write_uint (ctx, writer, v->type_id);
+    len += write_uint (ctx, writer, v->loc_kind);
+    switch (v->loc_kind) {
+    case MIR_DBLOC_REG:
+      len += write_name (ctx, writer, v->loc.reg_name ? v->loc.reg_name : "");
+      break;
+    case MIR_DBLOC_FRAME:
+      len += write_int (ctx, writer, v->loc.frame_offset);
+      break;
+    case MIR_DBLOC_STATIC:
+      len += write_name (ctx, writer, v->loc.item_name ? v->loc.item_name : "");
+      break;
+    default:
+      break;
+    }
+    len += write_uint (ctx, writer, v->scope_num);
+    len += write_uint (ctx, writer, v->decl_line);
+    len += write_uint (ctx, writer, v->decl_col);
+    len += write_uint (ctx, writer, v->decl_file_id);
+    len += write_uint (ctx, writer, v->is_param);
+  }
+  return len;
+}
+
+static size_t write_dbtypes (MIR_context_t ctx, writer_func_t writer, MIR_module_t module) {
+  if (module->dbtypes == NULL || module->dbtypes->num_types <= 1) return 0;
+  MIR_dbtype_table_t *tbl = module->dbtypes;
+  size_t len = write_name (ctx, writer, "dbtypes");
+  len += write_uint (ctx, writer, tbl->num_types);
+  for (uint32_t i = 0; i < tbl->num_types; i++) {
+    MIR_dbtype_t *t = &tbl->types[i];
+    len += write_uint (ctx, writer, t->kind);
+    len += write_name (ctx, writer, t->name ? t->name : "");
+    len += write_uint (ctx, writer, t->byte_size);
+    len += write_uint (ctx, writer, t->align);
+    switch (t->kind) {
+    case MIR_DBT_BASE:
+      len += write_uint (ctx, writer, t->u.base.encoding);
+      break;
+    case MIR_DBT_PTR: case MIR_DBT_CONST: case MIR_DBT_VOLATILE:
+    case MIR_DBT_RESTRICT: case MIR_DBT_TYPEDEF:
+      len += write_uint (ctx, writer, t->u.ref.target_id);
+      break;
+    case MIR_DBT_ARRAY:
+      len += write_uint (ctx, writer, t->u.array.element_id);
+      len += write_int (ctx, writer, t->u.array.count);
+      break;
+    case MIR_DBT_STRUCT: case MIR_DBT_UNION:
+      len += write_uint (ctx, writer, t->u.aggregate.num_members);
+      for (uint32_t mi = 0; mi < t->u.aggregate.num_members; mi++) {
+        MIR_dbmember_t *mb = &t->u.aggregate.members[mi];
+        len += write_name (ctx, writer, mb->name ? mb->name : "");
+        len += write_uint (ctx, writer, mb->type_id);
+        len += write_uint (ctx, writer, mb->byte_offset);
+        len += write_uint (ctx, writer, mb->byte_size);
+        len += write_int (ctx, writer, mb->bit_offset);
+        len += write_int (ctx, writer, mb->bit_size);
+      }
+      break;
+    case MIR_DBT_ENUM:
+      len += write_uint (ctx, writer, t->u.enumeration.underlying_id);
+      len += write_uint (ctx, writer, t->u.enumeration.num_enumerators);
+      for (uint32_t ei = 0; ei < t->u.enumeration.num_enumerators; ei++) {
+        len += write_name (ctx, writer, t->u.enumeration.enumerators[ei].name);
+        len += write_int (ctx, writer, t->u.enumeration.enumerators[ei].value);
+      }
+      break;
+    case MIR_DBT_FUNC:
+      len += write_uint (ctx, writer, t->u.func.return_id);
+      len += write_uint (ctx, writer, t->u.func.num_params);
+      for (uint32_t pi = 0; pi < t->u.func.num_params; pi++)
+        len += write_uint (ctx, writer, t->u.func.param_ids[pi]);
+      len += write_uint (ctx, writer, t->u.func.variadic);
+      break;
+    default:
+      break;
+    }
+  }
+  return len;
+}
+#endif
 
 static size_t write_item (MIR_context_t ctx, writer_func_t writer, MIR_item_t item) {
   MIR_insn_t insn;
@@ -5095,6 +5404,9 @@ static size_t write_item (MIR_context_t ctx, writer_func_t writer, MIR_item_t it
   for (insn = DLIST_HEAD (MIR_insn_t, func->insns); insn != NULL;
        insn = DLIST_NEXT (MIR_insn_t, insn))
     len += write_insn (ctx, writer, func, insn);
+#if !MIR_NO_DBINFO
+  len += write_dbvars (ctx, writer, func);
+#endif
   len += write_name (ctx, writer, "endfunc");
   return len;
 }
@@ -5106,6 +5418,9 @@ static size_t write_module (MIR_context_t ctx, writer_func_t writer, MIR_module_
   for (MIR_item_t item = DLIST_HEAD (MIR_item_t, module->items); item != NULL;
        item = DLIST_NEXT (MIR_item_t, item))
     len += write_item (ctx, writer, item);
+#if !MIR_NO_DBINFO
+  len += write_dbtypes (ctx, writer, module);
+#endif
   len += write_name (ctx, writer, "endmodule");
   return len;
 }
@@ -5365,6 +5680,7 @@ static bin_tag_t read_token (MIR_context_t ctx, token_attr_t *attr) {
     REP3 (TAG_CASE, MEM_DISP_BASE_INDEX, EOI, EOFILE)
     REP4 (TAG_CASE, ALIAS_MEM_DISP, ALIAS_MEM_BASE, ALIAS_MEM_INDEX, ALIAS_MEM_DISP_BASE)
     REP3 (TAG_CASE, ALIAS_MEM_DISP_INDEX, ALIAS_MEM_BASE_INDEX, ALIAS_MEM_DISP_BASE_INDEX)
+    TAG_CASE (SRCLOC)
     break;
     REP8 (TAG_CASE, TI8, TU8, TI16, TU16, TI32, TU32, TI64, TU64)
     REP5 (TAG_CASE, TF, TD, TP, TV, TRBLOCK)
@@ -5540,6 +5856,10 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
   const char *name, *item_name;
   MIR_module_t module;
   MIR_item_t func, item;
+  /* Pending source location from TAG_SRCLOC (v2+) */
+  const char *pending_src_file = NULL;
+  uint32_t pending_src_line = 0;
+  uint16_t pending_src_col = 0;
 
   io_reader = reader;
 #ifndef MIR_NO_BIN_COMPRESSION
@@ -5558,6 +5878,7 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
   func = NULL;
   for (;;) {
     VARR_TRUNC (uint64_t, insn_label_string_nums, 0);
+  read_after_labels: /* re-entry after TAG_SRCLOC to preserve already-collected labels */
     tag = read_token (ctx, &attr);
     while (TAG_LAB1 <= tag && tag <= TAG_LAB4) {
       VARR_PUSH (uint64_t, insn_label_string_nums, attr.u);
@@ -5573,6 +5894,79 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
         if (module != NULL)
           MIR_get_error_func (ctx) (MIR_binary_io_error, "nested module %s", name);
         module = MIR_new_module (ctx, name);
+#if !MIR_NO_DBINFO
+      } else if (strcmp (name, "dbtypes") == 0) {
+        if (module == NULL)
+          MIR_get_error_func (ctx) (MIR_binary_io_error, "dbtypes outside module");
+        uint32_t ntypes = (uint32_t) read_uint (ctx, "wrong dbtypes count");
+        for (uint32_t dti = 0; dti < ntypes; dti++) {
+          MIR_dbtype_t dt;
+          memset (&dt, 0, sizeof (dt));
+          dt.kind = (MIR_dbtype_kind_t) read_uint (ctx, "wrong dbtype kind");
+          const char *tn = read_name (ctx, module, "wrong dbtype name");
+          dt.name = (tn[0] != '\0') ? tn : NULL;
+          dt.byte_size = (uint32_t) read_uint (ctx, "wrong dbtype byte_size");
+          dt.align = (uint32_t) read_uint (ctx, "wrong dbtype align");
+          switch (dt.kind) {
+          case MIR_DBT_BASE:
+            dt.u.base.encoding = (MIR_dbencoding_t) read_uint (ctx, "wrong dbtype encoding");
+            break;
+          case MIR_DBT_PTR: case MIR_DBT_CONST: case MIR_DBT_VOLATILE:
+          case MIR_DBT_RESTRICT: case MIR_DBT_TYPEDEF:
+            dt.u.ref.target_id = (uint32_t) read_uint (ctx, "wrong dbtype target_id");
+            break;
+          case MIR_DBT_ARRAY:
+            dt.u.array.element_id = (uint32_t) read_uint (ctx, "wrong dbtype element_id");
+            dt.u.array.count = read_int (ctx, "wrong dbtype count");
+            break;
+          case MIR_DBT_STRUCT: case MIR_DBT_UNION: {
+            uint32_t nm = (uint32_t) read_uint (ctx, "wrong dbtype num_members");
+            dt.u.aggregate.num_members = nm;
+            dt.u.aggregate.members = nm > 0
+              ? MIR_malloc (ctx->alloc, sizeof (MIR_dbmember_t) * nm) : NULL;
+            for (uint32_t mi = 0; mi < nm; mi++) {
+              const char *mn = read_name (ctx, module, "wrong dbmember name");
+              dt.u.aggregate.members[mi].name = (mn[0] != '\0') ? mn : NULL;
+              dt.u.aggregate.members[mi].type_id = (uint32_t) read_uint (ctx, "wrong dbmember type_id");
+              dt.u.aggregate.members[mi].byte_offset = (uint32_t) read_uint (ctx, "wrong dbmember byte_offset");
+              dt.u.aggregate.members[mi].byte_size = (uint32_t) read_uint (ctx, "wrong dbmember byte_size");
+              dt.u.aggregate.members[mi].bit_offset = (int16_t) read_int (ctx, "wrong dbmember bit_offset");
+              dt.u.aggregate.members[mi].bit_size = (int16_t) read_int (ctx, "wrong dbmember bit_size");
+            }
+            break;
+          }
+          case MIR_DBT_ENUM: {
+            dt.u.enumeration.underlying_id = (uint32_t) read_uint (ctx, "wrong dbenum underlying_id");
+            uint32_t ne = (uint32_t) read_uint (ctx, "wrong dbenum num_enumerators");
+            dt.u.enumeration.num_enumerators = ne;
+            dt.u.enumeration.enumerators = ne > 0
+              ? MIR_malloc (ctx->alloc, sizeof (MIR_dbenumerator_t) * ne) : NULL;
+            for (uint32_t ei = 0; ei < ne; ei++) {
+              dt.u.enumeration.enumerators[ei].name = read_name (ctx, module, "wrong dbenum name");
+              dt.u.enumeration.enumerators[ei].value = read_int (ctx, "wrong dbenum value");
+            }
+            break;
+          }
+          case MIR_DBT_FUNC: {
+            dt.u.func.return_id = (uint32_t) read_uint (ctx, "wrong dbfunc return_id");
+            uint32_t np = (uint32_t) read_uint (ctx, "wrong dbfunc num_params");
+            dt.u.func.num_params = np;
+            dt.u.func.param_ids = np > 0
+              ? MIR_malloc (ctx->alloc, sizeof (MIR_dbtype_id_t) * np) : NULL;
+            for (uint32_t pi = 0; pi < np; pi++)
+              dt.u.func.param_ids[pi] = (uint32_t) read_uint (ctx, "wrong dbfunc param_id");
+            dt.u.func.variadic = (int) read_uint (ctx, "wrong dbfunc variadic");
+            break;
+          }
+          default: break;
+          }
+          /* Index 0 is the reserved void slot, which MIR_dbinfo_add_type
+             recreates automatically on the first real add.  Skipping it keeps
+             type ids identical to those the writer assigned (otherwise every
+             type, and every id referencing it, would shift by one). */
+          if (dti != 0) MIR_dbinfo_add_type (ctx, module, &dt);
+        }
+#endif
       } else if (strcmp (name, "endmodule") == 0) {
         if (VARR_LENGTH (uint64_t, insn_label_string_nums) != 0)
           MIR_get_error_func (ctx) (MIR_binary_io_error, "endmodule should have no labels");
@@ -5610,6 +6004,42 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
                                    VARR_LENGTH (MIR_var_t, proto_vars),
                                    VARR_ADDR (MIR_var_t, proto_vars));
         VARR_TRUNC (MIR_label_t, func_labels, 0);
+#if !MIR_NO_DBINFO
+      } else if (strcmp (name, "dbvars") == 0) {
+        if (func == NULL)
+          MIR_get_error_func (ctx) (MIR_binary_io_error, "dbvars outside func");
+        uint32_t nvars = (uint32_t) read_uint (ctx, "wrong dbvars count");
+        for (uint32_t dvi = 0; dvi < nvars; dvi++) {
+          MIR_dbvar_t dv;
+          memset (&dv, 0, sizeof (dv));
+          const char *sn = read_name (ctx, module, "wrong dbvar source_name");
+          dv.source_name = (sn[0] != '\0') ? sn : NULL;
+          dv.type_id = (uint32_t) read_uint (ctx, "wrong dbvar type_id");
+          dv.loc_kind = (MIR_dbloc_kind_t) read_uint (ctx, "wrong dbvar loc_kind");
+          switch (dv.loc_kind) {
+          case MIR_DBLOC_REG: {
+            const char *rn = read_name (ctx, module, "wrong dbvar reg_name");
+            dv.loc.reg_name = (rn[0] != '\0') ? rn : NULL;
+            break;
+          }
+          case MIR_DBLOC_FRAME:
+            dv.loc.frame_offset = read_int (ctx, "wrong dbvar frame_offset");
+            break;
+          case MIR_DBLOC_STATIC: {
+            const char *in = read_name (ctx, module, "wrong dbvar item_name");
+            dv.loc.item_name = (in[0] != '\0') ? in : NULL;
+            break;
+          }
+          default: break;
+          }
+          dv.scope_num = (uint32_t) read_uint (ctx, "wrong dbvar scope_num");
+          dv.decl_line = (uint32_t) read_uint (ctx, "wrong dbvar decl_line");
+          dv.decl_col = (uint16_t) read_uint (ctx, "wrong dbvar decl_col");
+          dv.decl_file_id = (uint16_t) read_uint (ctx, "wrong dbvar decl_file_id");
+          dv.is_param = (int) read_uint (ctx, "wrong dbvar is_param");
+          MIR_dbinfo_add_var (ctx, func->u.func, &dv);
+        }
+#endif
       } else if (strcmp (name, "endfunc") == 0) {
         if (VARR_LENGTH (uint64_t, insn_label_string_nums) != 0)
           MIR_get_error_func (ctx) (MIR_binary_io_error, "endfunc should have no labels");
@@ -5816,8 +6246,14 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
       } else {
         MIR_get_error_func (ctx) (MIR_binary_io_error, "unknown insn name %s", name);
       }
+    } else if (tag == TAG_SRCLOC) { /* v2+ source location annotation */
+      pending_src_file = read_name (ctx, module, "wrong srcloc file name");
+      pending_src_line = (uint32_t) read_uint (ctx, "wrong srcloc line");
+      pending_src_col = (uint16_t) read_uint (ctx, "wrong srcloc col");
+      goto read_after_labels; /* preserve any labels already collected */
     } else if (TAG_U0 <= tag && tag <= TAG_U8) { /* insn code */
       MIR_insn_code_t insn_code = attr.u;
+      MIR_insn_t new_insn;
 
       if (insn_code >= MIR_LABEL)
         MIR_get_error_func (ctx) (MIR_binary_io_error, "wrong insn code %d", insn_code);
@@ -5836,8 +6272,15 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
       if (nop != 0 && n < nop)
         MIR_get_error_func (ctx) (MIR_binary_io_error, "wrong number of operands of insn %s",
                                   insn_name (insn_code));
-      MIR_append_insn (ctx, func,
-                       MIR_new_insn_arr (ctx, insn_code, n, VARR_ADDR (MIR_op_t, read_insn_ops)));
+      new_insn = MIR_new_insn_arr (ctx, insn_code, n, VARR_ADDR (MIR_op_t, read_insn_ops));
+      if (pending_src_file != NULL && module != NULL) {
+        uint16_t fid = MIR_module_add_source_file (ctx, module, pending_src_file);
+        MIR_insn_set_source_loc (new_insn, fid, pending_src_line, pending_src_col);
+        pending_src_file = NULL;
+        pending_src_line = 0;
+        pending_src_col = 0;
+      }
+      MIR_append_insn (ctx, func, new_insn);
     } else if (tag == TAG_EOFILE) {
       break;
     } else {

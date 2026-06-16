@@ -8,6 +8,38 @@
 
 static const MIR_reg_t FP_HARD_REG = BP_HARD_REG;
 
+#if !MIR_NO_DBINFO
+/* Map a MIR hard register number to its System V x86-64 DWARF register
+   number (used by debug-info emitters via the MIR_dbvar machine location).
+   Returns -1 for registers that have no meaningful DWARF mapping. */
+static int target_dwarf_reg_num (MIR_reg_t hard_reg) {
+  switch (hard_reg) {
+  case AX_HARD_REG: return 0;  /* rax */
+  case DX_HARD_REG: return 1;  /* rdx */
+  case CX_HARD_REG: return 2;  /* rcx */
+  case BX_HARD_REG: return 3;  /* rbx */
+  case SI_HARD_REG: return 4;  /* rsi */
+  case DI_HARD_REG: return 5;  /* rdi */
+  case BP_HARD_REG: return 6;  /* rbp */
+  case SP_HARD_REG: return 7;  /* rsp */
+  case R8_HARD_REG: return 8;
+  case R9_HARD_REG: return 9;
+  case R10_HARD_REG: return 10;
+  case R11_HARD_REG: return 11;
+  case R12_HARD_REG: return 12;
+  case R13_HARD_REG: return 13;
+  case R14_HARD_REG: return 14;
+  case R15_HARD_REG: return 15;
+  default: break;
+  }
+  if (hard_reg >= XMM0_HARD_REG && hard_reg <= XMM15_HARD_REG) /* DWARF xmm0..15 = 17..32 */
+    return 17 + (int) (hard_reg - XMM0_HARD_REG);
+  if (hard_reg == ST0_HARD_REG) return 33;
+  if (hard_reg == ST1_HARD_REG) return 34;
+  return -1;
+}
+#endif
+
 static inline MIR_reg_t target_nth_loc (MIR_reg_t loc, MIR_type_t type MIR_UNUSED, int n) {
   return loc + n;
 }
@@ -703,6 +735,13 @@ static void target_machinize (gen_ctx_t gen_ctx) {
   block_arg_func_p = FALSE;
   start_sp_from_bp_offset = 8;
   keep_fp_p = func->vararg_p;
+#if !MIR_NO_DBINFO
+  /* Under -g (the front-end populated source-level variable debug info), force
+     a frame-pointer-based frame.  This gives every named variable a stable,
+     rbp-relative home (see assign()) and yields a uniform CFA = rbp + 16 for
+     .eh_frame, instead of per-function rsp-relative frames. */
+  if (func->dbinfo != NULL && func->dbinfo->num_vars > 0) keep_fp_p = TRUE;
+#endif
   for (i = 0; i < func->nargs; i++) {
     /* Argument extensions is already done in simplify */
     /* Prologue: generate arg_var = hard_reg|stack mem|stack addr ... */
@@ -3001,6 +3040,10 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
       if (MIR_branch_code_p (insn->code)) /* possible replacement change */
         ind = find_insn_pattern (gen_ctx, insn, NULL);
       gen_assert (ind >= 0);
+#if !MIR_NO_DBINFO
+      /* Capture PC offset for source-level line mapping */
+      size_t pc_before = VARR_LENGTH (uint8_t, result_code);
+#endif
 #ifndef NDEBUG
       size_t len_before = VARR_LENGTH (uint8_t, result_code);
 #endif
@@ -3011,6 +3054,31 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
         fprintf (stderr, "\"%s\" max size(%d) < real size(%d)\n", patterns[ind].replacement,
                  patterns[ind].max_insn_size, (int) insn_len);
         gen_assert (FALSE);
+      }
+#endif
+#if !MIR_NO_DBINFO
+      /* Record line map entry if this insn has source location */
+      if (insn->source_line != 0 && insn->source_file_id != 0) {
+        MIR_func_t func = curr_func_item->u.func;
+        if (func->dbinfo == NULL) {
+          func->dbinfo = malloc (sizeof (MIR_dbinfo_t));
+          func->dbinfo->num_vars = 0;
+          func->dbinfo->vars = NULL;
+          func->dbinfo->line_map = NULL;
+        }
+        if (func->dbinfo->line_map == NULL) {
+          func->dbinfo->line_map = malloc (sizeof (MIR_line_map_t));
+          func->dbinfo->line_map->num_entries = 0;
+          func->dbinfo->line_map->entries = NULL;
+        }
+        MIR_line_map_t *lm = func->dbinfo->line_map;
+        lm->num_entries++;
+        lm->entries = realloc (lm->entries, lm->num_entries * sizeof (MIR_line_map_entry_t));
+        MIR_line_map_entry_t *e = &lm->entries[lm->num_entries - 1];
+        e->pc_offset = (uint32_t) pc_before;
+        e->source_line = insn->source_line;
+        e->source_col = insn->source_col;
+        e->source_file_id = insn->source_file_id;
       }
 #endif
     }
