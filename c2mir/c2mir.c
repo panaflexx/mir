@@ -6663,7 +6663,7 @@ static int string_type_p (const struct type *type) {
     if (type->mode == TM_PTR && type->pos_node && type->pos_node->code == N_STR)
         return 1;
     return (type->mode == TM_BASIC || type->mode == TM_PTR)
-        && (type->u.basic_type == TP_STRING || type->u.basic_type == TM_PTR);
+        && (type->u.basic_type == TP_STRING || type->mode == TM_PTR);
 }
 
 /* True only for the built-in String basic type (TP_STRING), not arbitrary
@@ -6717,16 +6717,17 @@ static enum str_method get_string_method (const char *name, int *nargs,
   else if (strcmp (name, "substr") == 0)  { m = SM_SUBSTR;  n = 2; rt = "c2m_str_substr"; }
   else if (strcmp (name, "find") == 0)    { m = SM_FIND;    n = 1; rt = "c2m_str_find"; }
   else if (strcmp (name, "replace") == 0) { m = SM_REPLACE; n = 3; rt = "c2m_str_replace"; }
-	  else if (strcmp (name, "upper") == 0)   { m = SM_UPPER;   n = 0; rt = "c2m_str_upper"; }
-	  else if (strcmp (name, "lower") == 0)   { m = SM_LOWER;   n = 0; rt = "c2m_str_lower"; }
-	  else if (strcmp (name, "copy") == 0)     { m = SM_COPY;    n = 2; rt = "c2m_str_copy"; }
-		  else if (strcmp (name, "detach") == 0)  { m = SM_DETACH;  n = 0; rt = "c2m_str_detach"; }
-			  else if (strcmp (name, "attach") == 0)      { m = SM_ATTACH;      n = 1; rt = "c2m_str_attach"; }
-			  else if (strcmp (name, "starts_with") == 0) { m = SM_STARTS_WITH; n = 1; rt = "c2m_str_starts_with"; }
-			  else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
-			  else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
-			  else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
-			  else                                        { m = SM_NONE;        n = 0; rt = NULL; }
+  else if (strcmp (name, "upper") == 0)   { m = SM_UPPER;   n = 0; rt = "c2m_str_upper"; }
+  else if (strcmp (name, "lower") == 0)   { m = SM_LOWER;   n = 0; rt = "c2m_str_lower"; }
+  else if (strcmp (name, "copy") == 0)     { m = SM_COPY;    n = 2; rt = "c2m_str_copy"; }
+  else if (strcmp (name, "detach") == 0)  { m = SM_DETACH;  n = 0; rt = "c2m_str_detach"; }
+  else if (strcmp (name, "attach") == 0)      { m = SM_ATTACH;      n = 1; rt = "c2m_str_attach"; }
+  else if (strcmp (name, "starts_with") == 0) { m = SM_STARTS_WITH; n = 1; rt = "c2m_str_starts_with"; }
+  else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
+  else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
+  else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
+  else                                        { m = SM_NONE;        n = 0; rt = NULL; }
+
   if (nargs != NULL) *nargs = n;
   if (rt_name != NULL) *rt_name = rt;
   return m;
