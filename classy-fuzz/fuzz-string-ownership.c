@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* fuzz-string-ownership.c - String ownership / lifetime tests
  *
  * Exercises the three ownership tiers introduced alongside String.copy:

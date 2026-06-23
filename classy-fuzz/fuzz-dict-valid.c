@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* fuzz-dict-valid.c — dict edge-case tests that should all compile & pass
  *
  * Exercises unusual but valid dict patterns to stress the compiler:

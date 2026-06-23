@@ -3808,6 +3808,35 @@ static void make_one_ret (MIR_context_t ctx, MIR_item_t func_item) {
     MIR_insert_insn_before (ctx, func_item, last_ret_insn, ret_label);
   }
   for (i = 0; i < func->nres; i++) { /* generate ext insn before last ret */
+    /* Every other ret is rewritten into `mov <canonical_i>, <val_i>; jmp
+       ret_label`, and the last ret returns the canonical operands.  Each
+       canonical (last-ret) result operand must therefore be (a) a writable
+       register and (b) distinct from the other canonical operands; otherwise
+       the rewritten moves clobber each other and a multi-register aggregate
+       return collapses onto a single value.  Two cases break this:
+         - a non-register operand (e.g. an immediate from a `ret 0`) has no
+           writable location; and
+         - a duplicated register: value numbering collapses identical operands
+           so a `ret 0, 0` simplifies to `ret tX, tX`, and the rewrites
+           `mov tX, r0; mov tX, r1` leave both results equal to r1.
+       In either case materialize a fresh temp for result i and initialise it
+       from the original operand.  The init move sets the fall-through path's
+       value, so it must precede ret_label (the merge point): the other rets
+       jump to ret_label and must not re-execute it. */
+    if (VARR_LENGTH (MIR_insn_t, ret_insns) > 1) {
+      int need_temp = last_ret_insn->ops[i].mode != MIR_OP_REG;
+      for (j = 0; !need_temp && j < i; j++)
+        if (MIR_op_eq_p (ctx, last_ret_insn->ops[i], VARR_GET (MIR_op_t, ret_ops, j)))
+          need_temp = TRUE;
+      if (need_temp) {
+        mov_code = get_type_move_code (res_types[i]);
+        ret_reg = _MIR_new_temp_reg (ctx, mov_code == MIR_MOV ? MIR_T_I64 : res_types[i], func);
+        ret_reg_op = MIR_new_reg_op (ctx, ret_reg);
+        MIR_insert_insn_before (ctx, func_item, ret_label,
+                                MIR_new_insn (ctx, mov_code, ret_reg_op, last_ret_insn->ops[i]));
+        last_ret_insn->ops[i] = ret_reg_op;
+      }
+    }
     ret_reg_op = last_ret_insn->ops[i];
     VARR_PUSH (MIR_op_t, ret_ops, ret_reg_op);
     switch (res_types[i]) {
