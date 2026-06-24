@@ -9448,6 +9448,17 @@ static void setup_debug_home_regs (gen_ctx_t gen_ctx) {
   }
 }
 
+/* target_dwarf_reg_num: maps a MIR hard register to its DWARF register number
+   for the current ABI.  Only the x86_64 target currently implements this; on
+   every other architecture we substitute a -1-returning stub so dbvar location
+   resolution simply omits variable locations (the call sites already treat a
+   negative return as "skip this variable"). When an aarch64 / ppc64 / s390x /
+   riscv64 implementation lands in the matching mir-gen-<arch>.c file, drop the
+   stub from that arch's branch below. */
+#if !defined(__x86_64__) && !defined(_M_AMD64) && !defined(_M_X64)
+static int target_dwarf_reg_num (MIR_reg_t hard_reg MIR_UNUSED) { return -1; }
+#endif
+
 /* -g keystone (part 2): after register allocation, resolve each source-named
    variable to its concrete machine location and write it back into dbinfo so a
    DWARF emitter (b2obj) can produce a real DW_OP location.  Mirrors the way the
