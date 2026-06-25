@@ -1,4 +1,4 @@
 # ! /bin/sh
 compiler=$1
 shift
-$compiler -fno-exceptions -O3 $* -eg
+$compiler -fno-exceptions -O3 $* -eg 

@@ -592,6 +592,7 @@ C2M_DICT_API DictValue *dict_value_at(const DictValue *obj, size_t index) {
     return NULL;
 }
 
+
 /* Tag predicate: 1 iff `d` is a DICT_ARRAY.  Used by `for-in` codegen to
  * dispatch between object iteration (key, value pairs) and array iteration
  * (index, element). */
