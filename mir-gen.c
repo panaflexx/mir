@@ -5725,11 +5725,17 @@ static int get_int_const (gen_ctx_t gen_ctx, MIR_op_t *op_ref, int64_t *c) {
 }
 
 static int cycle_phi_p (bb_insn_t bb_insn) { /* we are not in pure SSA at this stage */
-  ssa_edge_t se;
-  if (bb_insn->insn->code != MIR_PHI) return FALSE;
-  for (size_t i = 1; i < bb_insn->insn->nops; i++)
-    if ((se = bb_insn->insn->ops[i].data) != NULL && se->def->bb == bb_insn->bb) return TRUE;
-  return FALSE;
+  /* After make_conventional_ssa every phi destination register is multiply-defined:
+     copies at the tails of ALL predecessor blocks redefine it.  Tracing an address
+     chain through any phi into a use in another block can therefore cross such a
+     redefinition (e.g. a loop-latch copy on the path header->latch->use block),
+     folding the wrong iteration's value into a mem operand.  The previous check
+     (a phi operand defined in the phi's own block) only caught single-block
+     (self-loop) loops and miscompiled multi-block loop bodies, e.g.
+     `while (j + 1 < n && !(s[j] == '\r' && s[j + 1] == '\n')) j++;`
+     (see classyc bugs/001).  Treat every phi as a barrier: only same-block uses
+     are provably safe, and callers already permit those via the from_bb test. */
+  return bb_insn->insn->code == MIR_PHI;
 }
 
 static int var_plus_const (gen_ctx_t gen_ctx, ssa_edge_t se, bb_t from_bb, MIR_op_t **var_op_ref,
