@@ -22,6 +22,33 @@ void MIR_set_interp_interface (MIR_context_t ctx, MIR_item_t func_item) {}
 #define MIR_INTERP_TRACE 0
 #endif
 
+/* ── ClassyC interp debugger hook ────────────────────────────────────
+   When non-NULL, called for every MIR insn that has source_line !=0.
+   Set by mir-bridge.c: jit_interp_set_hook().  Zero cost when NULL.
+   Signature: hook(func_item, insn_ptr, user_data)
+   If hook returns 1, interpreter should pause (future: single-step).
+   For now hook blocks internally (pipe wait) and returns 0 to continue.
+   ────────────────────────────────────────────────────────────────── */
+typedef int (*MIR_interp_debug_hook_t)(MIR_item_t func_item, void *insn_ptr, void *user_data);
+MIR_interp_debug_hook_t _mir_interp_debug_hook = NULL;
+void *_mir_interp_debug_hook_user = NULL;
+int _mir_interp_debug_step_mode = 0; /* 1 = call hook on every line */
+MIR_item_t _mir_interp_debug_curr_func = NULL;
+/* Optional call-depth tracker for step-over (set by mir-bridge). delta=+1 enter call, -1 leave. */
+typedef void (*MIR_interp_call_depth_hook_t)(int delta, void *user);
+MIR_interp_call_depth_hook_t _mir_interp_call_depth_hook = NULL;
+void *_mir_interp_call_depth_user = NULL;
+
+void _mir_interp_set_debug_hook(void *hook, void *user) {
+  _mir_interp_debug_hook = (MIR_interp_debug_hook_t)hook;
+  _mir_interp_debug_hook_user = user;
+}
+void _mir_interp_set_step_mode(int on) { _mir_interp_debug_step_mode = on; }
+void _mir_interp_set_call_depth_hook(void *hook, void *user) {
+  _mir_interp_call_depth_hook = (MIR_interp_call_depth_hook_t)hook;
+  _mir_interp_call_depth_user = user;
+}
+
 #if !defined(MIR_DIRECT_DISPATCH) && defined(__GNUC__)
 #define DIRECT_THREADED_DISPATCH 1
 #else
@@ -66,7 +93,7 @@ typedef enum {
   REP7 (IC_EL, STI8, STU8, STI16, STU16, STI32, STU32, STI64),
   REP8 (IC_EL, STF, STD, STLD, MOVI, MOVP, MOVF, MOVD, MOVLD),
   REP6 (IC_EL, IMM_CALL, IMM_JCALL, MOVFG, FMOVFG, DMOVFG, LDMOVFG),
-  REP5 (IC_EL, MOVTG, FMOVTG, DMOVTG, LDMOVTG, INSN_BOUND),
+  REP6 (IC_EL, MOVTG, FMOVTG, DMOVTG, LDMOVTG, LINE, INSN_BOUND),
 } MIR_full_insn_code_t;
 #undef REP_SEP
 
@@ -108,6 +135,9 @@ struct interp_ctx {
 
 #define dispatch_label_tab interp_ctx->dispatch_label_tab
 #define global_regs interp_ctx->global_regs
+
+/* forward decl for max */
+static MIR_insn_t _mir_debug_next_line_insn = NULL;
 #define code_varr interp_ctx->code_varr
 #define branches interp_ctx->branches
 #define jret_addr interp_ctx->jret_addr
@@ -188,6 +218,15 @@ static void generate_icode (MIR_context_t ctx, MIR_item_t func_item) {
   VARR_TRUNC (MIR_val_t, code_varr, 0);
   for (insn = DLIST_HEAD (MIR_insn_t, func->insns); insn != NULL;
        insn = DLIST_NEXT (MIR_insn_t, insn)) {
+    if (getenv ("CLASSYC_DEBUG_ICODE") != NULL)
+      fprintf (stderr, "ICODE %s line=%u code=%d\n", func->name,
+               insn->source_line, (int) insn->code);
+    /* Emit debug line marker before each sourced insn */
+    if (insn->source_line != 0) {
+      push_insn_start (interp_ctx, IC_LINE, insn);
+      v.a = insn;
+      VARR_PUSH (MIR_val_t, code_varr, v);
+    }
     MIR_insn_code_t code = insn->code;
     size_t nops = MIR_insn_nops (ctx, insn);
     MIR_op_t *ops = insn->ops;
@@ -1022,6 +1061,7 @@ static void OPTIMIZE eval (MIR_context_t ctx, func_desc_t func_desc, MIR_val_t *
     REP3 (LAB_EL, IC_MOVLD, IC_IMM_CALL, IC_IMM_JCALL);
     REP4 (LAB_EL, IC_MOVFG, IC_FMOVFG, IC_DMOVFG, IC_LDMOVFG);
     REP4 (LAB_EL, IC_MOVTG, IC_FMOVTG, IC_DMOVTG, IC_LDMOVTG);
+    LAB_EL (IC_LINE);
     return;
   }
 #undef REP_SEP
@@ -1059,6 +1099,7 @@ static void OPTIMIZE eval (MIR_context_t ctx, func_desc_t func_desc, MIR_val_t *
 
   code = func_desc->code;
   pc = code;
+  _mir_interp_debug_curr_func = func_desc->func_item;
 
 #if DIRECT_THREADED_DISPATCH
   goto * pc->a;
@@ -1073,6 +1114,16 @@ static void OPTIMIZE eval (MIR_context_t ctx, func_desc_t func_desc, MIR_val_t *
 #endif
   { /* jmpi thunk return */
     pc = jmpi_val;
+    END_INSN;
+  }
+
+  CASE (IC_LINE, 1) {
+    if (_mir_interp_debug_hook != NULL) {
+      MIR_insn_t li = (MIR_insn_t) get_a (ops);
+      /* step mode: always hit, or only if hook says it's a BP */
+      int is_bp = _mir_interp_debug_hook(_mir_interp_debug_curr_func ? _mir_interp_debug_curr_func : func_desc->func_item, li, _mir_interp_debug_hook_user);
+      (void)is_bp;
+    }
     END_INSN;
   }
 
@@ -1542,7 +1593,9 @@ common_addr:;
     int (*func_addr) (void *buf) = *get_aop (bp, ops + 4);
 
     if (func_addr != setjmp_addr) {
+      if (_mir_interp_call_depth_hook) _mir_interp_call_depth_hook (1, _mir_interp_call_depth_user);
       pc = call_insn_execute (ctx, pc, bp, ops, FALSE);
+      if (_mir_interp_call_depth_hook) _mir_interp_call_depth_hook (-1, _mir_interp_call_depth_user);
     } else {
       int res;
       int64_t nops = get_i (ops); /* #args w/o nop, insn, and ff interface address */
@@ -1561,7 +1614,9 @@ common_addr:;
     int (*func_addr) (void *buf) = get_a (ops + 4);
 
     if (func_addr != setjmp_addr) {
+      if (_mir_interp_call_depth_hook) _mir_interp_call_depth_hook (1, _mir_interp_call_depth_user);
       pc = call_insn_execute (ctx, pc, bp, ops, TRUE);
+      if (_mir_interp_call_depth_hook) _mir_interp_call_depth_hook (-1, _mir_interp_call_depth_user);
     } else {
       int res;
       int64_t nops = get_i (ops); /* #args w/o nop, insn, and ff interface address */

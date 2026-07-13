@@ -2136,6 +2136,11 @@ static void simplify_module_init (MIR_context_t ctx);
 static int simplify_func (MIR_context_t ctx, MIR_item_t func_item, int mem_float_p);
 static void process_inlines (MIR_context_t ctx, MIR_item_t func_item);
 
+/* When non-zero, MIR_link skips process_inlines so callees stay real CALL/RET pairs.
+   Required for cooperative step-over debugging (ClassyC jitrunner). */
+int MIR_no_inlines = 0;
+void MIR_set_no_inlines (int on) { MIR_no_inlines = on ? 1 : 0; }
+
 void MIR_link (MIR_context_t ctx, void (*set_interface) (MIR_context_t ctx, MIR_item_t item),
                void *import_resolver (const char *)) {
   MIR_item_t item, tab_item, expr_item;
@@ -2192,7 +2197,7 @@ void MIR_link (MIR_context_t ctx, void (*set_interface) (MIR_context_t ctx, MIR_
     for (item = DLIST_HEAD (MIR_item_t, m->items); item != NULL;
          item = DLIST_NEXT (MIR_item_t, item)) {
       if (item->item_type == MIR_func_item && item->data != NULL) {
-        process_inlines (ctx, item);
+        if (!MIR_no_inlines) process_inlines (ctx, item);
         item->data = NULL;
 #if 0
         fprintf (stderr, "+++++ Function after inlining:\n");
