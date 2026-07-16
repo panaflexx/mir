@@ -931,6 +931,47 @@ void MIR_remove_module (MIR_context_t ctx, MIR_module_t module) {
   remove_module (ctx, module, TRUE);
 }
 
+/* Unload a module that was MIR_load_module'd: also drop it from modules_to_link
+   (MIR_remove_module does not).  Frees IR; published code must be managed
+   separately via isolation / _MIR_free_code.  Item table cleanup is done by
+   remove_module (same as MIR_remove_module). */
+void MIR_unload_module (MIR_context_t ctx, MIR_module_t m) {
+  if (m == NULL) return;
+  if (m == curr_module)
+    MIR_get_error_func (ctx) (MIR_finish_error, "unload when module %s is not finished", m->name);
+  if (m == &environment_module)
+    MIR_get_error_func (ctx) (MIR_wrong_param_value_error, "MIR_unload_module: environment module");
+  /* Remove from modules_to_link (loaded-but-not-yet-linked or leftover slots) */
+  for (size_t i = 0; i < VARR_LENGTH (MIR_module_t, modules_to_link); i++) {
+    if (VARR_GET (MIR_module_t, modules_to_link, i) == m) {
+      size_t last = VARR_LENGTH (MIR_module_t, modules_to_link) - 1;
+      if (i != last)
+        VARR_SET (MIR_module_t, modules_to_link, i, VARR_GET (MIR_module_t, modules_to_link, last));
+      VARR_POP (MIR_module_t, modules_to_link);
+      break;
+    }
+  }
+  DLIST_REMOVE (MIR_module_t, all_modules, m);
+  remove_module (ctx, m, TRUE);
+}
+
+void _MIR_compact_item_tab (MIR_context_t ctx) {
+  MIR_item_t item, tab_item;
+  MIR_module_t m;
+
+  HTAB_CLEAR (MIR_item_t, module_item_tab);
+  for (item = DLIST_HEAD (MIR_item_t, environment_module.items); item != NULL;
+       item = DLIST_NEXT (MIR_item_t, item)) {
+    HTAB_DO (MIR_item_t, module_item_tab, item, HTAB_INSERT, tab_item);
+  }
+  for (m = DLIST_HEAD (MIR_module_t, all_modules); m != NULL; m = DLIST_NEXT (MIR_module_t, m)) {
+    for (item = DLIST_HEAD (MIR_item_t, m->items); item != NULL;
+         item = DLIST_NEXT (MIR_item_t, item)) {
+      HTAB_DO (MIR_item_t, module_item_tab, item, HTAB_INSERT, tab_item);
+    }
+  }
+}
+
 static void remove_all_modules (MIR_context_t ctx) {
   MIR_module_t module;
 
@@ -1975,6 +2016,8 @@ static void link_module_lrefs (MIR_context_t ctx, MIR_module_t m) {
   }
 }
 
+void *_MIR_get_recycled_thunk (MIR_context_t ctx); /* forward decl */
+
 void MIR_load_module (MIR_context_t ctx, MIR_module_t m) {
   int lref_p = FALSE;
   mir_assert (m != NULL);
@@ -1989,7 +2032,8 @@ void MIR_load_module (MIR_context_t ctx, MIR_module_t m) {
       item = load_bss_data_section (ctx, item, FALSE);
     } else if (item->item_type == MIR_func_item) {
       if (item->addr == NULL) {
-        item->addr = _MIR_get_thunk (ctx);
+        void *recycled = _MIR_get_recycled_thunk (ctx);
+        item->addr = recycled != NULL ? recycled : _MIR_get_thunk (ctx);
 #if defined(MIR_DEBUG)
         fprintf (stderr, "%016llx: %s\n", (unsigned long long) item->addr, item->u.func->name);
 #endif
@@ -4642,13 +4686,24 @@ typedef struct code_holder code_holder_t;
 
 DEF_VARR (code_holder_t);
 
+typedef void *void_ptr_t;
+DEF_VARR (void_ptr_t);
+
 struct machine_code_ctx {
   VARR (code_holder_t) * code_holders;
+  VARR (code_holder_t) * isolated_holders; /* per-isolation-session code pages */
+  VARR (void_ptr_t) * thunk_recycle;       /* recycled thunk addresses */
   size_t page_size;
+  int isolating;         /* when set, _MIR_publish_code uses isolated_holders */
+  long cur_isolated_idx; /* active isolated holder index, or -1 */
 };
 
 #define code_holders ctx->machine_code_ctx->code_holders
+#define isolated_holders ctx->machine_code_ctx->isolated_holders
+#define thunk_recycle ctx->machine_code_ctx->thunk_recycle
 #define page_size ctx->machine_code_ctx->page_size
+#define isolating ctx->machine_code_ctx->isolating
+#define cur_isolated_idx ctx->machine_code_ctx->cur_isolated_idx
 
 static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   uint8_t *mem;
@@ -4707,11 +4762,49 @@ static uint8_t *add_code (MIR_context_t ctx MIR_UNUSED, code_holder_t *ch_ptr, c
   return mem;
 }
 
+static uint8_t *publish_code_isolated (MIR_context_t ctx, const uint8_t *code, size_t code_len) {
+  /* Try to reuse the current session's holder */
+  if (cur_isolated_idx >= 0) {
+    code_holder_t *ch_ptr = VARR_ADDR (code_holder_t, isolated_holders) + cur_isolated_idx;
+    ch_ptr->free = (uint8_t *) ((uint64_t) (ch_ptr->free + 15) / 16 * 16); /* align */
+    if (ch_ptr->free + code_len <= ch_ptr->bound) return add_code (ctx, ch_ptr, code, code_len);
+  }
+  /* Allocate a fresh code holder */
+  {
+    size_t npages = (code_len + page_size) / page_size;
+    size_t len = page_size * npages;
+    uint8_t *mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, len);
+    code_holder_t ch;
+    size_t i, vlen;
+    code_holder_t *holders;
+
+    if (mem == MAP_FAILED) return NULL;
+    ch.start = mem;
+    ch.free = mem;
+    ch.bound = mem + len;
+    /* Reuse a NULLed slot from a previously freed holder if available */
+    vlen = VARR_LENGTH (code_holder_t, isolated_holders);
+    holders = VARR_ADDR (code_holder_t, isolated_holders);
+    for (i = 0; i < vlen; i++) {
+      if (holders[i].start == NULL) {
+        holders[i] = ch;
+        cur_isolated_idx = (long) i;
+        return add_code (ctx, &holders[i], code, code_len);
+      }
+    }
+    VARR_PUSH (code_holder_t, isolated_holders, ch);
+    cur_isolated_idx = (long) VARR_LENGTH (code_holder_t, isolated_holders) - 1;
+    return add_code (ctx, VARR_ADDR (code_holder_t, isolated_holders) + cur_isolated_idx, code,
+                     code_len);
+  }
+}
+
 uint8_t *_MIR_publish_code (MIR_context_t ctx, const uint8_t *code,
                             size_t code_len) { /* thread safe */
   code_holder_t *ch_ptr;
   uint8_t *res = NULL;
 
+  if (isolating) return publish_code_isolated (ctx, code, code_len);
   if ((ch_ptr = get_last_code_holder (ctx, code_len)) != NULL)
     res = add_code (ctx, ch_ptr, code, code_len);
   return res;
@@ -4780,11 +4873,52 @@ uint8_t *_MIR_get_new_code_addr (MIR_context_t ctx, size_t size) {
   return ch_ptr == NULL ? NULL : ch_ptr->free;
 }
 
+void _MIR_set_code_isolation (MIR_context_t ctx) {
+  isolating = 1;
+  cur_isolated_idx = -1;
+}
+
+void _MIR_clear_code_isolation (MIR_context_t ctx) {
+  isolating = 0;
+  cur_isolated_idx = -1;
+}
+
+void _MIR_recycle_thunk (MIR_context_t ctx, void *thunk_addr) {
+  if (thunk_addr == NULL) return;
+  VARR_PUSH (void_ptr_t, thunk_recycle, thunk_addr);
+}
+
+void *_MIR_get_recycled_thunk (MIR_context_t ctx) {
+  if (VARR_LENGTH (void_ptr_t, thunk_recycle) > 0) return VARR_POP (void_ptr_t, thunk_recycle);
+  return NULL;
+}
+
+void _MIR_free_code (MIR_context_t ctx, void *addr) {
+  size_t len, i;
+  code_holder_t *holders;
+
+  if (addr == NULL) return;
+  len = VARR_LENGTH (code_holder_t, isolated_holders);
+  holders = VARR_ADDR (code_holder_t, isolated_holders);
+  for (i = 0; i < len; i++) {
+    if (holders[i].start == NULL) continue;
+    if ((uint8_t *) addr >= holders[i].start && (uint8_t *) addr < holders[i].bound) {
+      MIR_mem_unmap (ctx->code_alloc, holders[i].start, holders[i].bound - holders[i].start);
+      holders[i].start = holders[i].free = holders[i].bound = NULL;
+      return;
+    }
+  }
+}
+
 static void code_init (MIR_context_t ctx) {
   if ((ctx->machine_code_ctx = MIR_malloc (ctx->alloc, sizeof (struct machine_code_ctx))) == NULL)
     MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for ctx");
   page_size = mem_page_size ();
+  isolating = 0;
+  cur_isolated_idx = -1;
   VARR_CREATE (code_holder_t, code_holders, ctx->alloc, 128);
+  VARR_CREATE (code_holder_t, isolated_holders, ctx->alloc, 16);
+  VARR_CREATE (void_ptr_t, thunk_recycle, ctx->alloc, 16);
 }
 
 static void code_finish (MIR_context_t ctx) {
@@ -4793,6 +4927,12 @@ static void code_finish (MIR_context_t ctx) {
     MIR_mem_unmap (ctx->code_alloc, ch.start, ch.bound - ch.start);
   }
   VARR_DESTROY (code_holder_t, code_holders);
+  while (VARR_LENGTH (code_holder_t, isolated_holders) != 0) {
+    code_holder_t ch = VARR_POP (code_holder_t, isolated_holders);
+    if (ch.start != NULL) MIR_mem_unmap (ctx->code_alloc, ch.start, ch.bound - ch.start);
+  }
+  VARR_DESTROY (code_holder_t, isolated_holders);
+  VARR_DESTROY (void_ptr_t, thunk_recycle);
   MIR_free (ctx->alloc, ctx->machine_code_ctx);
   ctx->machine_code_ctx = NULL;
 }

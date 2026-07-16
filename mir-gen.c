@@ -9714,6 +9714,18 @@ static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int ma
   }
   consider_all_live_vars (gen_ctx);
   calculate_func_cfg_live_info (gen_ctx, TRUE);
+  /* Rebuild addr_regs with current variable numbers.  Variable numbers can
+     change after SSA rebuild following transform_addrs (e.g. SSA versions,
+     conventional SSA copies).  The register allocator needs addr_regs to force
+     address-taken variables onto the stack. */
+  if (addr_insn_p) {
+    bitmap_clear (addr_regs);
+    for (bb_t bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb))
+      for (bb_insn_t bi = DLIST_HEAD (bb_insn_t, bb->bb_insns); bi != NULL;
+           bi = DLIST_NEXT (bb_insn_t, bi))
+        if (MIR_addr_code_p (bi->insn->code) && bi->insn->ops[1].mode == MIR_OP_VAR)
+          bitmap_set_bit_p (addr_regs, bi->insn->ops[1].u.var);
+  }
   print_live_info (gen_ctx, "Live info before RA", optimize_level > 0, TRUE);
 #if !MIR_NO_DBINFO
   setup_debug_home_regs (gen_ctx);
@@ -9749,18 +9761,6 @@ static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int ma
     fprintf (debug_file, "+++++++++++++MIR after forming prolog/epilog and insn splitting:\n");
     print_CFG (gen_ctx, FALSE, FALSE, TRUE, TRUE, NULL);
   });
-  /* Rebuild addr_regs with current variable numbers.  Variable numbers can
-     change after SSA rebuild following transform_addrs (e.g. SSA versions,
-     conventional SSA copies).  The register allocator needs addr_regs to force
-     address-taken variables onto the stack. */
-  if (addr_insn_p) {
-    bitmap_clear (addr_regs);
-    for (bb_t bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb))
-      for (bb_insn_t bi = DLIST_HEAD (bb_insn_t, bb->bb_insns); bi != NULL;
-           bi = DLIST_NEXT (bb_insn_t, bi))
-        if (MIR_addr_code_p (bi->insn->code) && bi->insn->ops[1].mode == MIR_OP_VAR)
-          bitmap_set_bit_p (addr_regs, bi->insn->ops[1].u.var);
-  }
   if (machine_code_p) {
     code = target_translate (gen_ctx, &code_len);
     machine_code = _MIR_publish_code (ctx, code, code_len);

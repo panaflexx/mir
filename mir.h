@@ -653,6 +653,10 @@ extern void MIR_scan_string (MIR_context_t ctx, const char *str);
 
 extern MIR_item_t MIR_get_global_item (MIR_context_t ctx, const char *name);
 extern void MIR_load_module (MIR_context_t ctx, MIR_module_t m);
+/* Unload a previously loaded module: drop from modules_to_link / all_modules,
+   remove items from the global item table, free IR.  Does not free published
+   machine code — pair with _MIR_set_code_isolation / _MIR_free_code for that. */
+extern void MIR_unload_module (MIR_context_t ctx, MIR_module_t m);
 extern void MIR_load_external (MIR_context_t ctx, const char *name, void *addr);
 /* Skip MIR call-site inlining during MIR_link (preserves CALL/RET for step-over). */
 extern void MIR_set_no_inlines (int on);
@@ -723,6 +727,15 @@ extern MIR_item_t _MIR_builtin_func (MIR_context_t ctx, MIR_module_t module, con
                                      void *addr);
 extern void _MIR_flush_code_cache (void *start, void *bound);
 extern uint8_t *_MIR_publish_code (MIR_context_t ctx, const uint8_t *code, size_t code_len);
+/* Isolated code publishing: each isolation session uses dedicated page holders
+   so a module's machine code can be unmapped with _MIR_free_code later. */
+extern void _MIR_set_code_isolation (MIR_context_t ctx);
+extern void _MIR_clear_code_isolation (MIR_context_t ctx);
+extern void _MIR_free_code (MIR_context_t ctx, void *addr);
+extern void _MIR_recycle_thunk (MIR_context_t ctx, void *thunk_addr);
+extern void *_MIR_get_recycled_thunk (MIR_context_t ctx);
+/* Rebuild module_item_tab after many unload/remove cycles (reclaim dead slots). */
+extern void _MIR_compact_item_tab (MIR_context_t ctx);
 extern uint8_t *_MIR_get_new_code_addr (MIR_context_t ctx, size_t size);
 extern uint8_t *_MIR_publish_code_by_addr (MIR_context_t ctx, void *addr, const uint8_t *code,
                                            size_t code_len);
