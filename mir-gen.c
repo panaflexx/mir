@@ -2959,7 +2959,14 @@ static int collect_addr_uses (gen_ctx_t gen_ctx, bb_insn_t bb_insn,
   gen_assert (MIR_addr_code_p (bb_insn->insn->code) || move_p (bb_insn->insn));
   for (ssa_edge_t se = bb_insn->insn->ops[0].data; se != NULL; se = se->next_use) {
     if (se->use->insn->ops[se->use_op_num].mode == MIR_OP_VAR_MEM) {
-      gen_assert (move_code_p (se->use->insn->code) && se->use_op_num <= 1);
+      /* Address used as a memory base/index.  Only pure moves of that mem
+         are tracked for elimination; CALL/aggregate ops with VAR_MEM (e.g.
+         nested by-value List/Map block moves) mean the addr is not
+         eliminable — return FALSE rather than asserting. */
+      if (!move_code_p (se->use->insn->code) || se->use_op_num > 1) {
+        res = FALSE;
+        continue;
+      }
       if (bb_mem_insns != NULL) VARR_PUSH (bb_insn_t, bb_mem_insns, se->use);
       continue;
     }
