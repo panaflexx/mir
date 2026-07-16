@@ -766,6 +766,9 @@ static void target_machinize (gen_ctx_t gen_ctx) {
       gen_delete_insn (gen_ctx, insn);
     } else if (code == MIR_VA_END) { /* do nothing */
       gen_delete_insn (gen_ctx, insn);
+    } else if ((new_insn = machinize_atomic_insn (gen_ctx, insn)) != NULL) {
+      next_insn = new_insn;
+      leaf_p = FALSE;
     } else if (MIR_call_code_p (code)) {
       machinize_call (gen_ctx, insn);
       leaf_p = FALSE;

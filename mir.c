@@ -367,6 +367,16 @@ static const struct insn_desc insn_descs[] = {
   {MIR_PRBNE, "prbne", {MIR_OP_LABEL, MIR_OP_UNDEF, MIR_OP_INT, MIR_OP_BOUND}},
   {MIR_USE, "use", {MIR_OP_BOUND}},
   {MIR_PHI, "phi", {MIR_OP_BOUND}},
+  {MIR_ALOAD, "aload", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_ASTORE, "astore", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_AFENCE, "afence", {MIR_OP_BOUND}},
+  {MIR_AXCHG, "axchg", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_AADD, "aadd", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_ASUB, "asub", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_AAND, "aand", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_AOR, "aor", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_AXOR, "axor", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
+  {MIR_ACAS, "acas", {MIR_OP_INT | OUT_FLAG, MIR_OP_INT, MIR_OP_INT, MIR_OP_INT, MIR_OP_BOUND}},
   {MIR_INVALID_INSN, "invalid-insn", {MIR_OP_BOUND}},
 };
 
@@ -3794,7 +3804,10 @@ static void simplify_op (MIR_context_t ctx, MIR_item_t func_item, MIR_insn_t ins
     mem_op.u.mem.disp = 0;
     mem_op.u.mem.index = 0;
     mem_op.u.mem.scale = 0;
-    if (move_p && (nop == 1 || insn->ops[1].mode == MIR_OP_REG)) {
+    /* Atomic mem ops must stay as mem (like MOV), not expand to plain load/store. */
+    if (MIR_atomic_code_p (code)) {
+      *op = mem_op;
+    } else if (move_p && (nop == 1 || insn->ops[1].mode == MIR_OP_REG)) {
       *op = mem_op;
     } else if (((code == MIR_VA_START && nop == 0)
                 || ((code == MIR_VA_ARG || code == MIR_VA_BLOCK_ARG) && nop == 1)

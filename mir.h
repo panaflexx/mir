@@ -155,9 +155,24 @@ typedef enum {
   REP3 (INSN_EL, PRSET, PRBEQ, PRBNE), /* work with properties */
   INSN_EL (USE), /* Used only internally in the generator, all operands are input */
   INSN_EL (PHI), /* Used only internally in the generator, the first operand is output */
+  /* Integer atomics (seq_cst).  Width from mem type (i8..i64 / u*).  See CLASSY-ATOMICS.md. */
+  INSN_EL (ALOAD),  /* dst, mem */
+  INSN_EL (ASTORE), /* mem, val */
+  INSN_EL (AFENCE), /* no operands — full memory fence */
+  INSN_EL (AXCHG),  /* old, mem, val */
+  INSN_EL (AADD),   /* old, mem, val — fetch_add */
+  INSN_EL (ASUB),   /* old, mem, val — fetch_sub */
+  INSN_EL (AAND),   /* old, mem, val — fetch_and */
+  INSN_EL (AOR),    /* old, mem, val — fetch_or */
+  INSN_EL (AXOR),   /* old, mem, val — fetch_xor */
+  INSN_EL (ACAS),   /* old, mem, expected, desired — strong CAS; old = previous *mem */
   INSN_EL (INVALID_INSN),
   INSN_EL (INSN_BOUND), /* Should be the last  */
 } MIR_insn_code_t;
+
+static inline int MIR_atomic_code_p (MIR_insn_code_t code) {
+  return MIR_ALOAD <= code && code <= MIR_ACAS;
+}
 
 #define TYPE_EL(t) MIR_T_##t
 

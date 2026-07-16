@@ -319,6 +319,8 @@ DEF_VARR (uint8_t);
 DEF_VARR (uint64_t);
 //DEF_VARR (MIR_code_reloc_t); // Moved to mir.h
 
+#include "mir-gen-atomic.c"
+
 #if defined(__x86_64__) || defined(_M_AMD64)
 #include "mir-gen-x86_64.c"
 #elif defined(__aarch64__)
@@ -1721,7 +1723,7 @@ static void build_func_cfg (gen_ctx_t gen_ctx) {
         ret_insn = insn;
         continue;
       }
-    } else if (MIR_call_code_p (insn->code)) {
+    } else if (MIR_call_code_p (insn->code) || MIR_atomic_code_p (insn->code)) {
       bb->call_p = TRUE;
     } else {
       switch (insn->code) { /* ??? should we copy result change before insn and bo */
@@ -3653,7 +3655,7 @@ static void calculate_memory_availability (gen_ctx_t gen_ctx) {
       mem_expr_t e;
       size_t mem_num;
 
-      if (MIR_call_code_p (insn->code)) { /* ??? improving */
+      if (MIR_call_code_p (insn->code) || MIR_atomic_code_p (insn->code)) { /* ??? improving */
         bitmap_clear (bb->gen);
         continue;
       }
@@ -3906,7 +3908,7 @@ static int fixed_place_insn_p (MIR_insn_t insn) {
           || insn->code == MIR_LABEL || MIR_call_code_p (insn->code) || insn->code == MIR_ALLOCA
           || insn->code == MIR_BSTART || insn->code == MIR_BEND || insn->code == MIR_VA_START
           || insn->code == MIR_VA_ARG || insn->code == MIR_VA_BLOCK_ARG
-          || insn->code == MIR_VA_END);
+          || insn->code == MIR_VA_END || MIR_atomic_code_p (insn->code));
 }
 
 static int gvn_insn_p (MIR_insn_t insn) { return !fixed_place_insn_p (insn); }
@@ -4505,7 +4507,8 @@ static void gvn_modify (gen_ctx_t gen_ctx) {
         print_bb_insn_value (gen_ctx, bb_insn);
         continue;
       }
-      if (MIR_call_code_p (insn->code)) bitmap_clear (curr_available_mem);
+      if (MIR_call_code_p (insn->code) || MIR_atomic_code_p (insn->code))
+        bitmap_clear (curr_available_mem);
       if (!gvn_insn_p (insn)) continue;
       const_p = FALSE;
       switch (insn->code) {
@@ -5140,6 +5143,11 @@ static void update_call_mem_live (gen_ctx_t gen_ctx, bitmap_t mem_live, MIR_insn
   }
 }
 
+/* Atomics may touch any location; conservatively mark all mem live (like a call). */
+static void update_atomic_mem_live (gen_ctx_t gen_ctx, bitmap_t mem_live) {
+  bitmap_set_bit_range_p (mem_live, 1, VARR_LENGTH (mem_attr_t, mem_attrs));
+}
+
 static int alloca_mem_intersect_p (gen_ctx_t gen_ctx, uint32_t nloc1, MIR_type_t type1,
                                    uint32_t nloc2, MIR_type_t type2) {
   MIR_context_t ctx = gen_ctx->ctx;
@@ -5186,7 +5194,10 @@ static MIR_insn_t initiate_bb_mem_live_info (gen_ctx_t gen_ctx, MIR_insn_t bb_ta
 
   for (insn = bb_tail_insn; insn != NULL && get_insn_bb (gen_ctx, insn) == bb;
        insn = DLIST_PREV (MIR_insn_t, insn)) {
-    if (MIR_call_code_p (insn->code)) update_call_mem_live (gen_ctx, bb->mem_live_gen, insn);
+    if (MIR_call_code_p (insn->code))
+      update_call_mem_live (gen_ctx, bb->mem_live_gen, insn);
+    else if (MIR_atomic_code_p (insn->code))
+      update_atomic_mem_live (gen_ctx, bb->mem_live_gen);
     if (!move_code_p (insn->code)) continue;
     if (insn->ops[0].mode == MIR_OP_VAR_MEM) { /* store */
       if ((nloc = insn->ops[0].u.var_mem.nloc) != 0) {
@@ -5263,7 +5274,10 @@ static void dse (gen_ctx_t gen_ctx) {
     for (bb_insn = DLIST_TAIL (bb_insn_t, bb->bb_insns); bb_insn != NULL; bb_insn = prev_bb_insn) {
       prev_bb_insn = DLIST_PREV (bb_insn_t, bb_insn);
       insn = bb_insn->insn;
-      if (MIR_call_code_p (insn->code)) update_call_mem_live (gen_ctx, live, insn);
+      if (MIR_call_code_p (insn->code))
+        update_call_mem_live (gen_ctx, live, insn);
+      else if (MIR_atomic_code_p (insn->code))
+        update_atomic_mem_live (gen_ctx, live);
       if (!move_code_p (insn->code)) continue;
       if (insn->ops[0].mode == MIR_OP_VAR_MEM) { /* store */
         if ((nloc = insn->ops[0].u.var_mem.nloc) != 0) {
@@ -5319,8 +5333,8 @@ static int ssa_dead_insn_p (gen_ctx_t gen_ctx, bb_insn_t bb_insn) {
   ssa_edge_t ssa_edge;
 
   /* check control insns with possible output: */
-  if (MIR_call_code_p (insn->code) || insn->code == MIR_ALLOCA || insn->code == MIR_BSTART
-      || insn->code == MIR_VA_START || insn->code == MIR_VA_ARG
+  if (MIR_call_code_p (insn->code) || MIR_atomic_code_p (insn->code) || insn->code == MIR_ALLOCA
+      || insn->code == MIR_BSTART || insn->code == MIR_VA_START || insn->code == MIR_VA_ARG
       || (insn->nops > 0 && insn->ops[0].mode == MIR_OP_VAR
           && (insn->ops[0].u.var == FP_HARD_REG || insn->ops[0].u.var == SP_HARD_REG)))
     return FALSE;
@@ -5459,9 +5473,9 @@ static int loop_invariant_p (gen_ctx_t gen_ctx, loop_node_t loop, bb_insn_t bb_i
 
   if (MIR_any_branch_code_p (insn->code) || insn->code == MIR_PHI || insn->code == MIR_RET
       || insn->code == MIR_JRET || insn->code == MIR_LABEL || MIR_call_code_p (insn->code)
-      || insn->code == MIR_ALLOCA || insn->code == MIR_BSTART || insn->code == MIR_BEND
-      || insn->code == MIR_VA_START || insn->code == MIR_VA_ARG || insn->code == MIR_VA_BLOCK_ARG
-      || insn->code == MIR_VA_END
+      || MIR_atomic_code_p (insn->code) || insn->code == MIR_ALLOCA || insn->code == MIR_BSTART
+      || insn->code == MIR_BEND || insn->code == MIR_VA_START || insn->code == MIR_VA_ARG
+      || insn->code == MIR_VA_BLOCK_ARG || insn->code == MIR_VA_END
       /* possible exception insns: */
       || insn->code == MIR_DIV || insn->code == MIR_DIVS || insn->code == MIR_UDIV
       || insn->code == MIR_UDIVS || insn->code == MIR_MOD || insn->code == MIR_MODS

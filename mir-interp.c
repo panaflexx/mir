@@ -201,6 +201,18 @@ static void push_mem (struct interp_ctx *interp_ctx, MIR_op_t op) {
   VARR_PUSH (MIR_val_t, code_varr, v);
 }
 
+static int atomic_mem_size (MIR_type_t t) {
+  switch (t) {
+  case MIR_T_I8:
+  case MIR_T_U8: return 1;
+  case MIR_T_I16:
+  case MIR_T_U16: return 2;
+  case MIR_T_I32:
+  case MIR_T_U32: return 4;
+  default: return 8;
+  }
+}
+
 static void redirect_interface_to_interp (MIR_context_t ctx, MIR_item_t func_item);
 
 static void generate_icode (MIR_context_t ctx, MIR_item_t func_item) {
@@ -366,6 +378,52 @@ static void generate_icode (MIR_context_t ctx, MIR_item_t func_item) {
       } else {
         goto regreg;
       }
+      break;
+    case MIR_ALOAD:
+      push_insn_start (interp_ctx, code, insn);
+      v.i = get_reg (ops[0], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      push_mem (interp_ctx, ops[1]);
+      v.i = atomic_mem_size (ops[1].u.mem.type);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      break;
+    case MIR_ASTORE:
+      push_insn_start (interp_ctx, code, insn);
+      v.i = get_reg (ops[1], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      push_mem (interp_ctx, ops[0]);
+      v.i = atomic_mem_size (ops[0].u.mem.type);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      break;
+    case MIR_AFENCE:
+      push_insn_start (interp_ctx, code, insn);
+      break;
+    case MIR_AXCHG:
+    case MIR_AADD:
+    case MIR_ASUB:
+    case MIR_AAND:
+    case MIR_AOR:
+    case MIR_AXOR:
+      push_insn_start (interp_ctx, code, insn);
+      v.i = get_reg (ops[0], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      push_mem (interp_ctx, ops[1]);
+      v.i = get_reg (ops[2], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      v.i = atomic_mem_size (ops[1].u.mem.type);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      break;
+    case MIR_ACAS:
+      push_insn_start (interp_ctx, code, insn);
+      v.i = get_reg (ops[0], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      push_mem (interp_ctx, ops[1]);
+      v.i = get_reg (ops[2], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      v.i = get_reg (ops[3], &max_nreg);
+      VARR_PUSH (MIR_val_t, code_varr, v);
+      v.i = atomic_mem_size (ops[1].u.mem.type);
+      VARR_PUSH (MIR_val_t, code_varr, v);
       break;
     case MIR_LABEL: break;
     case MIR_INVALID_INSN:
@@ -1055,6 +1113,8 @@ static void OPTIMIZE eval (MIR_context_t ctx, func_desc_t func_desc, MIR_val_t *
     REP6 (LAB_EL, MIR_CALL, MIR_INLINE, MIR_JCALL, MIR_SWITCH, MIR_RET, MIR_JRET);
     REP3 (LAB_EL, MIR_ALLOCA, MIR_BSTART, MIR_BEND);
     REP4 (LAB_EL, MIR_VA_ARG, MIR_VA_BLOCK_ARG, MIR_VA_START, MIR_VA_END);
+    REP8 (LAB_EL, MIR_ALOAD, MIR_ASTORE, MIR_AFENCE, MIR_AXCHG, MIR_AADD, MIR_ASUB, MIR_AAND, MIR_AOR);
+    REP2 (LAB_EL, MIR_AXOR, MIR_ACAS);
     REP8 (LAB_EL, IC_LDI8, IC_LDU8, IC_LDI16, IC_LDU16, IC_LDI32, IC_LDU32, IC_LDI64, IC_LDF);
     REP8 (LAB_EL, IC_LDD, IC_LDLD, IC_STI8, IC_STU8, IC_STI16, IC_STU16, IC_STI32, IC_STU32);
     REP8 (LAB_EL, IC_STI64, IC_STF, IC_STD, IC_STLD, IC_MOVI, IC_MOVP, IC_MOVF, IC_MOVD);
@@ -1705,6 +1765,156 @@ common_addr:;
   }
   SCASE (MIR_VA_START, 1, va_start_interp_builtin (ctx, bp[get_i (ops)].a, bp[-1].a));
   SCASE (MIR_VA_END, 1, va_end_interp_builtin (ctx, bp[get_i (ops)].a));
+
+  /* Atomics (seq_cst).  Layout: dest/val regs, mem base reg, [args...], size imm. */
+  CASE (MIR_ALOAD, 3) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int sz = (int) get_i (ops + 2);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_load_n ((uint8_t *) a, __ATOMIC_SEQ_CST); break;
+    case 2: *r = (int64_t) __atomic_load_n ((uint16_t *) a, __ATOMIC_SEQ_CST); break;
+    case 4: *r = (int64_t) __atomic_load_n ((uint32_t *) a, __ATOMIC_SEQ_CST); break;
+    default: *r = (int64_t) __atomic_load_n ((uint64_t *) a, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_ASTORE, 3) {
+    int64_t v = *get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int sz = (int) get_i (ops + 2);
+    switch (sz) {
+    case 1: __atomic_store_n ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: __atomic_store_n ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: __atomic_store_n ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: __atomic_store_n ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_AFENCE, 0) {
+    __atomic_thread_fence (__ATOMIC_SEQ_CST);
+    END_INSN;
+  }
+  CASE (MIR_AXCHG, 4) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t v = *get_iop (bp, ops + 2);
+    int sz = (int) get_i (ops + 3);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_exchange_n ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2:
+      *r = (int64_t) __atomic_exchange_n ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST);
+      break;
+    case 4:
+      *r = (int64_t) __atomic_exchange_n ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST);
+      break;
+    default: *r = (int64_t) __atomic_exchange_n ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_AADD, 4) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t v = *get_iop (bp, ops + 2);
+    int sz = (int) get_i (ops + 3);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_fetch_add ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: *r = (int64_t) __atomic_fetch_add ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: *r = (int64_t) __atomic_fetch_add ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: *r = (int64_t) __atomic_fetch_add ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_ASUB, 4) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t v = *get_iop (bp, ops + 2);
+    int sz = (int) get_i (ops + 3);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_fetch_sub ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: *r = (int64_t) __atomic_fetch_sub ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: *r = (int64_t) __atomic_fetch_sub ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: *r = (int64_t) __atomic_fetch_sub ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_AAND, 4) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t v = *get_iop (bp, ops + 2);
+    int sz = (int) get_i (ops + 3);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_fetch_and ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: *r = (int64_t) __atomic_fetch_and ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: *r = (int64_t) __atomic_fetch_and ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: *r = (int64_t) __atomic_fetch_and ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_AOR, 4) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t v = *get_iop (bp, ops + 2);
+    int sz = (int) get_i (ops + 3);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_fetch_or ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: *r = (int64_t) __atomic_fetch_or ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: *r = (int64_t) __atomic_fetch_or ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: *r = (int64_t) __atomic_fetch_or ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_AXOR, 4) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t v = *get_iop (bp, ops + 2);
+    int sz = (int) get_i (ops + 3);
+    switch (sz) {
+    case 1: *r = (int64_t) __atomic_fetch_xor ((uint8_t *) a, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: *r = (int64_t) __atomic_fetch_xor ((uint16_t *) a, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: *r = (int64_t) __atomic_fetch_xor ((uint32_t *) a, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: *r = (int64_t) __atomic_fetch_xor ((uint64_t *) a, (uint64_t) v, __ATOMIC_SEQ_CST); break;
+    }
+    END_INSN;
+  }
+  CASE (MIR_ACAS, 5) {
+    int64_t *r = get_iop (bp, ops);
+    void *a = (void *) (intptr_t) get_mem_addr (bp, ops + 1);
+    int64_t exp = *get_iop (bp, ops + 2);
+    int64_t des = *get_iop (bp, ops + 3);
+    int sz = (int) get_i (ops + 4);
+    switch (sz) {
+    case 1: {
+      uint8_t e = (uint8_t) exp;
+      __atomic_compare_exchange_n ((uint8_t *) a, &e, (uint8_t) des, 0, __ATOMIC_SEQ_CST,
+                                   __ATOMIC_SEQ_CST);
+      *r = (int64_t) e;
+      break;
+    }
+    case 2: {
+      uint16_t e = (uint16_t) exp;
+      __atomic_compare_exchange_n ((uint16_t *) a, &e, (uint16_t) des, 0, __ATOMIC_SEQ_CST,
+                                   __ATOMIC_SEQ_CST);
+      *r = (int64_t) e;
+      break;
+    }
+    case 4: {
+      uint32_t e = (uint32_t) exp;
+      __atomic_compare_exchange_n ((uint32_t *) a, &e, (uint32_t) des, 0, __ATOMIC_SEQ_CST,
+                                   __ATOMIC_SEQ_CST);
+      *r = (int64_t) e;
+      break;
+    }
+    default: {
+      uint64_t e = (uint64_t) exp;
+      __atomic_compare_exchange_n ((uint64_t *) a, &e, (uint64_t) des, 0, __ATOMIC_SEQ_CST,
+                                   __ATOMIC_SEQ_CST);
+      *r = (int64_t) e;
+      break;
+    }
+    }
+    END_INSN;
+  }
 
   SCASE (IC_LDI8, 2, LD (iop, int64_t, int8_t));
   SCASE (IC_LDU8, 2, LD (uop, uint64_t, uint8_t));

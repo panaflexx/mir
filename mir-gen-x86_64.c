@@ -1187,12 +1187,17 @@ static void target_machinize (gen_ctx_t gen_ctx) {
       SWAP (insn->ops[1], insn->ops[2], temp_op);
       insn->code = MIR_LDBGE;
       break;
-    default:
-      if (MIR_call_code_p (code)) {
+    default: {
+      MIR_insn_t at_first;
+      if ((at_first = machinize_atomic_insn (gen_ctx, insn)) != NULL) {
+        next_insn = at_first;
+        leaf_p = FALSE;
+      } else if (MIR_call_code_p (code)) {
         machinize_call (gen_ctx, insn);
         leaf_p = FALSE;
       }
       break;
+    }
     }
   }
 }
