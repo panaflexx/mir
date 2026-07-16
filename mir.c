@@ -343,7 +343,7 @@ static const struct insn_desc insn_descs[] = {
   {MIR_UBO, "ubo", {MIR_OP_LABEL, MIR_OP_BOUND}},
   {MIR_BNO, "bno", {MIR_OP_LABEL, MIR_OP_BOUND}},
   {MIR_UBNO, "ubno", {MIR_OP_LABEL, MIR_OP_BOUND}},
-  {MIR_LADDR, "laddr", {MIR_OP_INT, MIR_OP_LABEL, MIR_OP_BOUND}},
+  {MIR_LADDR, "laddr", {MIR_OP_INT | OUT_FLAG, MIR_OP_LABEL, MIR_OP_BOUND}},
   {MIR_JMPI, "jmpi", {MIR_OP_INT, MIR_OP_BOUND}},
   {MIR_CALL, "call", {MIR_OP_BOUND}},
   {MIR_INLINE, "inline", {MIR_OP_BOUND}},
@@ -4696,6 +4696,7 @@ struct machine_code_ctx {
   size_t page_size;
   int isolating;         /* when set, _MIR_publish_code uses isolated_holders */
   long cur_isolated_idx; /* active isolated holder index, or -1 */
+  uint8_t *code_reserve_start, *code_reserve_free, *code_reserve_bound;
 };
 
 #define code_holders ctx->machine_code_ctx->code_holders
@@ -4704,6 +4705,28 @@ struct machine_code_ctx {
 #define page_size ctx->machine_code_ctx->page_size
 #define isolating ctx->machine_code_ctx->isolating
 #define cur_isolated_idx ctx->machine_code_ctx->cur_isolated_idx
+#define code_reserve_start ctx->machine_code_ctx->code_reserve_start
+#define code_reserve_free ctx->machine_code_ctx->code_reserve_free
+#define code_reserve_bound ctx->machine_code_ctx->code_reserve_bound
+
+/* Generated code, thunks, and wrappers reference each other with direct
+   branches whose reach is limited on some targets (e.g. +-128MB on aarch64).
+   Carving all code holders out of one contiguous address-space reservation
+   keeps every piece of generated code within direct branch range of every
+   other one.  The reservation is address space only: untouched pages cost no
+   memory.  Without it, code mappings can end up scattered across the address
+   space -- the libc allocator's own mmaps land between them -- which breaks
+   the bb thunk -> bb wrapper and generated-code -> bb thunk branches of
+   lazy basic-block generation (seen with musl libc's allocator on aarch64).
+   If the reservation is exhausted or unavailable, fall back to individual
+   mappings as before.  */
+#ifndef MIR_CODE_RESERVE_SIZE
+#if UINTPTR_MAX == 0xffffffffffffffffu && !defined(_WIN32)
+#define MIR_CODE_RESERVE_SIZE (128 * 1024 * 1024)
+#else
+#define MIR_CODE_RESERVE_SIZE 0 /* scarce address space (or Windows commit charge) */
+#endif
+#endif
 
 static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   uint8_t *mem;
@@ -4717,8 +4740,13 @@ static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   }
   npages = (size + page_size) / page_size;
   len = page_size * npages;
-  mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, len);
-  if (mem == MAP_FAILED) return NULL;
+  if (code_reserve_start != NULL && (size_t) (code_reserve_bound - code_reserve_free) >= len) {
+    mem = code_reserve_free;
+    code_reserve_free += len;
+  } else {
+    mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, len);
+    if (mem == MAP_FAILED) return NULL;
+  }
   ch.start = mem;
   ch.free = mem;
   ch.bound = mem + len;
@@ -4919,13 +4947,26 @@ static void code_init (MIR_context_t ctx) {
   VARR_CREATE (code_holder_t, code_holders, ctx->alloc, 128);
   VARR_CREATE (code_holder_t, isolated_holders, ctx->alloc, 16);
   VARR_CREATE (void_ptr_t, thunk_recycle, ctx->alloc, 16);
+  code_reserve_start = code_reserve_free = code_reserve_bound = NULL;
+  if (MIR_CODE_RESERVE_SIZE != 0) {
+    uint8_t *mem = (uint8_t *) MIR_mem_map (ctx->code_alloc, MIR_CODE_RESERVE_SIZE);
+    if (mem != MAP_FAILED) {
+      code_reserve_start = code_reserve_free = mem;
+      code_reserve_bound = mem + MIR_CODE_RESERVE_SIZE;
+    }
+  }
 }
 
 static void code_finish (MIR_context_t ctx) {
   while (VARR_LENGTH (code_holder_t, code_holders) != 0) {
     code_holder_t ch = VARR_POP (code_holder_t, code_holders);
+    if (code_reserve_start != NULL && ch.start >= code_reserve_start
+        && ch.start < code_reserve_bound)
+      continue; /* carved from the reservation, unmapped below as a whole */
     MIR_mem_unmap (ctx->code_alloc, ch.start, ch.bound - ch.start);
   }
+  if (code_reserve_start != NULL)
+    MIR_mem_unmap (ctx->code_alloc, code_reserve_start, code_reserve_bound - code_reserve_start);
   VARR_DESTROY (code_holder_t, code_holders);
   while (VARR_LENGTH (code_holder_t, isolated_holders) != 0) {
     code_holder_t ch = VARR_POP (code_holder_t, isolated_holders);
@@ -5122,7 +5163,19 @@ static size_t put_ldouble (MIR_context_t ctx, writer_func_t writer, long double 
   size_t len;
 
   if (writer == NULL) return 0;
+  /* Zero the whole union first: an 80-bit long double occupies only 10 of the
+     16 bytes, so u.ld = ld leaves the 6 padding bytes uninitialized — writing
+     them makes binary MIR non-deterministic (the decoder reads back only the
+     valid bits, so content matches but raw bytes vary, breaking the bootstrap
+     self-consistency test). */
+  u.u[0] = u.u[1] = 0;
   u.ld = ld;
+#if defined(__i386__) || defined(__x86_64__)
+  /* x86 80-bit extended long double occupies only 10 of the 16 bytes; the
+     assignment may still copy the source's 6 padding bytes (e.g. via a 16-byte
+     SSE move), so mask to the meaningful 80 bits (bytes 0-9) for determinism. */
+  u.u[1] &= 0xffffULL;
+#endif
   len = put_uint (ctx, writer, u.u[0], sizeof (uint64_t));
   return put_uint (ctx, writer, u.u[1], sizeof (uint64_t)) + len;
 }

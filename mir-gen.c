@@ -213,6 +213,8 @@ struct gen_ctx {
 #endif
   VARR (void_ptr_t) * to_free;
   int addr_insn_p;    /* true if we have address insns in the input func */
+  int jmpi_p;         /* true if the input func has indirect jumps (JMPI):
+                         their successor edges cannot be split */
   bitmap_t tied_regs; /* regs tied to hard reg */
   bitmap_t addr_regs; /* regs in addr insns as 2nd op */
 #if !MIR_NO_DBINFO
@@ -257,6 +259,7 @@ struct gen_ctx {
 #define debug_level gen_ctx->debug_level
 #define to_free gen_ctx->to_free
 #define addr_insn_p gen_ctx->addr_insn_p
+#define jmpi_p gen_ctx->jmpi_p
 #define tied_regs gen_ctx->tied_regs
 #define addr_regs gen_ctx->addr_regs
 #if !MIR_NO_DBINFO
@@ -1693,6 +1696,7 @@ static void build_func_cfg (gen_ctx_t gen_ctx) {
   bitmap_clear (tied_regs);
   bitmap_clear (addr_regs);
   addr_insn_p = FALSE;
+  jmpi_p = FALSE;
   VARR_TRUNC (MIR_insn_t, temp_insns, 0);
   VARR_TRUNC (MIR_insn_t, temp_insns2, 0);
   for (ret_insn = NULL, insn = DLIST_HEAD (MIR_insn_t, func->insns); insn != NULL;
@@ -1895,6 +1899,7 @@ static void build_func_cfg (gen_ctx_t gen_ctx) {
       VARR_PUSH (MIR_insn_t, temp_insns2, insn->ops[1].u.label);
     } else if (insn->code == MIR_JMPI) {
       VARR_PUSH (MIR_insn_t, temp_insns, insn);
+      jmpi_p = TRUE;
     }
     nops = MIR_insn_nops (ctx, insn);
     if (next_insn != NULL
@@ -2854,13 +2859,11 @@ static void make_conventional_ssa (gen_ctx_t gen_ctx) { /* requires life info */
         insn->ops[i].u.var = dest_var;
         e = DLIST_NEXT (in_edge_t, e);
       }
-      for (se = insn->ops[0].data; se != NULL; se = se->next_use)
-        if (se->use->bb != bb) break;
-      if (se == NULL) { /* we should do this only after adding moves at the end of bbs */
-        /* r=phi(...), all r uses in the same bb: change new_r = phi(...) and all uses by new_r */
-        insn->ops[0].u.var = dest_var;
-        change_ssa_edge_list_def (insn->ops[0].data, bb_insn, 0, var, dest_var);
-      } else {
+      /* Always take the slow path when the phi result has uses (issue #454 /
+         MIR #455 follow-up): a same-bb rename is a lost-copy hazard on
+         self-loop edges (phi-input mov of dest_var is inserted before the
+         tail branch).  When there are no uses, leave the phi as dest_var. */
+      if (insn->ops[0].data != NULL) {
         new_insn = MIR_new_insn (ctx, move_code, _MIR_new_var_op (ctx, var),
                                  _MIR_new_var_op (ctx, dest_var));
         gen_add_insn_after (gen_ctx, insn, new_insn);
@@ -4778,44 +4781,37 @@ static void gvn_modify (gen_ctx_t gen_ctx) {
                 || (mem_insn->ops[1].mode == MIR_OP_VAR_MEM && mem_insn->ops[0].data == NULL)) {
               add_mem_insn (gen_ctx, insn);
             } else { /* (mem=x|x=mem); ...; r=mem => (mem=x|x=mem); t=x; ...; r=t */
-              copy_gvn_info (bb_insn, mem_bb_insn);
-              print_bb_insn_value (gen_ctx, bb_insn);
-              temp_reg = mem_expr->temp_reg;
-              add_ext_p = TRUE;
-              switch (op_ref->u.mem.type) {
-                case MIR_T_I8:
-                  ext_code = MIR_EXT8;
-                  break;
-                case MIR_T_I16:
-                  ext_code = MIR_EXT16;
-                  break;
-                case MIR_T_I32:
-                  ext_code = MIR_EXT32;
-                  break;
-                case MIR_T_U8:
-                  ext_code = MIR_UEXT8;
-                  break;
-                case MIR_T_U16:
-                  ext_code = MIR_UEXT16;
-                  break;
-                case MIR_T_U32:
-                  ext_code = MIR_UEXT32;
-                  break;
-                default:
-                  add_ext_p = FALSE;
+              /* When forwarding from a store of an integer type narrower than
+                 64 bits, the loaded value is the stored register *extended*
+                 from the memory type, not the raw stored register: materialize
+                 the temp with the corresponding extension insn (issue #423 /
+                 MIR #432).  Load-load forwarding keeps the previous load result
+                 (already extended). */
+              MIR_insn_code_t temp_code = insn->code;
+              if (op_ref == &mem_insn->ops[0] && insn->code == MIR_MOV) {
+                switch (op_ref->u.var_mem.type) {
+                case MIR_T_I8: temp_code = MIR_EXT8; break;
+                case MIR_T_U8: temp_code = MIR_UEXT8; break;
+                case MIR_T_I16: temp_code = MIR_EXT16; break;
+                case MIR_T_U16: temp_code = MIR_UEXT16; break;
+                case MIR_T_I32: temp_code = MIR_EXT32; break;
+                case MIR_T_U32: temp_code = MIR_UEXT32; break;
+                default: break;
+                }
               }
-              gen_assert(insn->code == MIR_MOV || !add_ext_p);
+              temp_reg = mem_expr->temp_reg;
               add_def_p = temp_reg == MIR_NON_VAR;
               if (add_def_p) {
                 mem_expr->temp_reg = temp_reg
                   = get_expr_temp_reg (gen_ctx, mem_expr->insn, &mem_expr->temp_reg);
-                new_insn = MIR_new_insn (ctx, add_ext_p ? ext_code : insn->code, _MIR_new_var_op (ctx, temp_reg),
+                new_insn = MIR_new_insn (ctx, temp_code, _MIR_new_var_op (ctx, temp_reg),
                                          op_ref == &mem_insn->ops[0] ? mem_insn->ops[1]
                                                                      : mem_insn->ops[0]);
                 new_insn->ops[1].data = NULL; /* remove ssa edge taken from load/store op */
                 gen_add_insn_after (gen_ctx, mem_insn, new_insn);
                 new_bb_insn = new_insn->data;
-                copy_gvn_info (new_bb_insn, mem_bb_insn);
+                if (temp_code == insn->code) /* an extended value is a new value: */
+                  copy_gvn_info (new_bb_insn, mem_bb_insn); /* otherwise keep its fresh one */
                 se = op_ref == &mem_insn->ops[0] ? mem_insn->ops[1].data : mem_insn->ops[0].data;
                 add_ssa_edge (gen_ctx, se->def, se->def_op_num, new_bb_insn, 1);
                 DEBUG (2, {
@@ -4831,6 +4827,8 @@ static void gvn_modify (gen_ctx_t gen_ctx) {
               insn->ops[1] = _MIR_new_var_op (ctx, temp_reg); /* changing mem */
               def_insn = DLIST_NEXT (MIR_insn_t, mem_insn);
               add_ssa_edge (gen_ctx, def_insn->data, 0, bb_insn, 1);
+              copy_gvn_info (bb_insn, (bb_insn_t) def_insn->data);
+              print_bb_insn_value (gen_ctx, bb_insn);
               gvn_insns_num++;
               DEBUG (2, {
                 fprintf (debug_file, "  changing curr insn to ");
@@ -6779,6 +6777,8 @@ static void jump_opt (gen_ctx_t gen_ctx) {
     DEBUG (1, { fprintf (debug_file, "%ld deleted unrechable bb insns\n", bb_deleted_insns_num); });
   }
   bitmap_clear (temp_bitmap);
+  /* Labels whose address is taken (laddr / lref) can be reached by jmpi and
+     must not be removed (issue #424 / MIR #433): */
   for (MIR_lref_data_t lref = curr_func_item->u.func->first_lref; lref != NULL;
        lref = lref->next) {
     bitmap_set_bit_p (temp_bitmap, lref->label->ops[0].u.u);
@@ -6789,6 +6789,10 @@ static void jump_opt (gen_ctx_t gen_ctx) {
     bb_insn_t bb_insn;
     int i, start_nop, bound_nop;
 
+    for (bb_insn = DLIST_HEAD (bb_insn_t, bb->bb_insns); bb_insn != NULL;
+         bb_insn = DLIST_NEXT (bb_insn_t, bb_insn))
+      if (bb_insn->insn->code == MIR_LADDR)
+        bitmap_set_bit_p (temp_bitmap, bb_insn->insn->ops[1].u.label->ops[0].u.u);
     if ((bb_insn = DLIST_TAIL (bb_insn_t, bb->bb_insns)) == NULL) continue;
     if (bb_insn->insn->code == MIR_SWITCH) {
       start_nop = 1;
@@ -7700,7 +7704,7 @@ static void assign (gen_ctx_t gen_ctx) {
   MIR_func_t func = curr_func_item->u.func;
   bitmap_t global_hard_regs = _MIR_get_module_global_var_hard_regs (ctx, curr_func_item->module);
   const char *msg;
-  const int simplified_p = ONLY_SIMPLIFIED_RA || optimize_level < 2;
+  const int simplified_p = ONLY_SIMPLIFIED_RA || optimize_level < 2 || jmpi_p;
   bitmap_t conflict_locs = conflict_locs1, spill_lr_starts = temp_bitmap2;
 
   func_stack_slots_num = 0;
@@ -7752,11 +7756,13 @@ static void assign (gen_ctx_t gen_ctx) {
     bm = bitmap_create2 (alloc, MAX_HARD_REG + 1);
     if (global_hard_regs != NULL) bitmap_copy (bm, global_hard_regs);
     VARR_PUSH (bitmap_t, used_locs, bm);
-    if (!simplified_p) {
-      bm = bitmap_create2 (alloc, MAX_HARD_REG + 1);
-      if (global_hard_regs != NULL) bitmap_copy (bm, global_hard_regs);
-      VARR_PUSH (bitmap_t, busy_used_locs, bm);
-    }
+    /* Keep busy_used_locs in sync with used_locs even for the simplified
+       RA: simplified_p can vary per function (e.g. functions with
+       indirect jumps), and a later function using the full RA clears
+       busy_used_locs entries up to the shared used_locs length. */
+    bm = bitmap_create2 (alloc, MAX_HARD_REG + 1);
+    if (global_hard_regs != NULL) bitmap_copy (bm, global_hard_regs);
+    VARR_PUSH (bitmap_t, busy_used_locs, bm);
   }
   nregs = (int) VARR_LENGTH (allocno_info_t, sorted_regs);
   qsort (VARR_ADDR (allocno_info_t, sorted_regs), nregs, sizeof (allocno_info_t),
@@ -8367,7 +8373,7 @@ static void rewrite (gen_ctx_t gen_ctx) {
   size_t insns_num = 0, movs_num = 0, deleted_movs_num = 0;
   bitmap_t global_hard_regs
     = _MIR_get_module_global_var_hard_regs (gen_ctx->ctx, curr_func_item->module);
-  const int simplified_p = ONLY_SIMPLIFIED_RA || optimize_level < 2;
+  const int simplified_p = ONLY_SIMPLIFIED_RA || optimize_level < 2 || jmpi_p;
 
   if (simplified_p) {
     for (insn = DLIST_HEAD (MIR_insn_t, curr_func_item->u.func->insns); insn != NULL;
@@ -8663,7 +8669,7 @@ static void split (gen_ctx_t gen_ctx) { /* split by putting spill/restore insns 
 
 static void reg_alloc (gen_ctx_t gen_ctx) {
   MIR_reg_t reg, max_var = get_max_var (gen_ctx);
-  const int simplified_p = ONLY_SIMPLIFIED_RA || optimize_level < 2;
+  const int simplified_p = ONLY_SIMPLIFIED_RA || optimize_level < 2 || jmpi_p;
 
   build_live_ranges (gen_ctx);
   assign (gen_ctx);
