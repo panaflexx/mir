@@ -143,12 +143,30 @@ static MIR_insn_t machinize_atomic_insn (gen_ctx_t gen_ctx, MIR_insn_t insn) {
   if (!MIR_atomic_code_p (code)) return NULL;
 
 #if defined(__x86_64__) || defined(_M_AMD64)
-  /* Native patterns in mir-gen-x86_64.c for ALOAD/ASTORE/AADD/ASUB/AXCHG/AFENCE.
-     Keep those as MIR atomics so we do not CALL out of minicoro fiber stacks.
-     CAS and bitops still lower to host builtins below. */
-  if (code == MIR_ALOAD || code == MIR_ASTORE || code == MIR_AADD || code == MIR_ASUB
-      || code == MIR_AXCHG || code == MIR_AFENCE)
+  /* Native patterns in mir-gen-x86_64.c.  Do not CALL host builtins (breaks
+     minicoro fiber stacks).  Rewrite RMW/store so the lock/xchg register is a
+     fresh temp, never coalesced with the mem base (pattern uses tied "r m 0"). */
+  if (code == MIR_ALOAD || code == MIR_AFENCE) return NULL;
+  if (code == MIR_AADD || code == MIR_ASUB || code == MIR_AXCHG) {
+    /* aadd/asub/axchg old, mem, val  →  t=val; op t, mem, t; old=t
+       Skip if already tied (re-scan after return mov1). */
+    MIR_op_t old_op = insn->ops[0], val = insn->ops[2];
+    if (old_op.mode == MIR_OP_VAR && val.mode == MIR_OP_VAR && old_op.u.var == val.u.var)
+      return NULL;
+    MIR_op_t t = _MIR_new_var_op (ctx, gen_new_temp_reg (gen_ctx, MIR_T_I64, func));
+    MIR_insn_t mov1 = MIR_new_insn (ctx, MIR_MOV, t, val);
+    MIR_insn_t mov2 = MIR_new_insn (ctx, MIR_MOV, old_op, t);
+    gen_add_insn_before (gen_ctx, insn, mov1);
+    insn->ops[0] = t;
+    insn->ops[2] = t;
+    gen_add_insn_after (gen_ctx, insn, mov2);
+    return mov1;
+  }
+  if (code == MIR_ASTORE) {
+    /* astore: leave as-is for native patterns (val is already a separate use). */
     return NULL;
+  }
+  /* ACAS / AAND / AOR / AXOR: host builtins below */
 #endif
 
   freg_op = _MIR_new_var_op (ctx, gen_new_temp_reg (gen_ctx, MIR_T_I64, func));

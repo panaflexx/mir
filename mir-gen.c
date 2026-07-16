@@ -9382,9 +9382,10 @@ static void dead_code_elimination (gen_ctx_t gen_ctx) {
         if (bitmap_clear_bit_p (live, var) || bitmap_bit_p (addr_regs, var)) dead_p = FALSE;
       }
       if (!reg_def_p) dead_p = FALSE;
-      if (dead_p && !MIR_call_code_p (insn->code) && insn->code != MIR_RET && insn->code != MIR_JRET
-          && insn->code != MIR_ALLOCA && insn->code != MIR_BSTART && insn->code != MIR_BEND
-          && insn->code != MIR_VA_START && insn->code != MIR_VA_ARG && insn->code != MIR_VA_END
+      if (dead_p && !MIR_call_code_p (insn->code) && !MIR_atomic_code_p (insn->code)
+          && insn->code != MIR_RET && insn->code != MIR_JRET && insn->code != MIR_ALLOCA
+          && insn->code != MIR_BSTART && insn->code != MIR_BEND && insn->code != MIR_VA_START
+          && insn->code != MIR_VA_ARG && insn->code != MIR_VA_END
           && !(MIR_overflow_insn_code_p (insn->code)
                && reachable_bo_exists_p (DLIST_NEXT (bb_insn_t, bb_insn)))
           && !(insn->ops[0].mode == MIR_OP_VAR

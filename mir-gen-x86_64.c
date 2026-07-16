@@ -1664,6 +1664,31 @@ static struct pattern patterns[] = {
   {MIR_MOV, "m0 i0", "Y C6 /0 m0 i1", 0}, /* mov m0,i8 */
   {MIR_MOV, "m2 i2", "Y C7 /0 m0 I1", 0}, /* mov m0,i32 */
 
+  /* ---- Integer atomics (seq_cst on x86 TSO + lock/xchg/mfence) ----
+     Machinize rewrites AADD/ASUB/AXCHG/ASTORE so val/result share one reg
+     distinct from mem base ("r m 0" / "m r").  No hard-reg scratch in the
+     pattern (temps would fight RA reloads into R10/R11). */
+  {MIR_ALOAD, "r m3", "X 8B r0 m1", 0},
+  {MIR_ALOAD, "r m2", "Y 8B r0 m1", 0},
+  {MIR_ALOAD, "r mu2", "Y 8B r0 m1", 0},
+  {MIR_ALOAD, "r ms2", "X 63 r0 m1", 0},
+  {MIR_ALOAD, "r mu1", "X 0F B7 r0 m1", 0},
+  {MIR_ALOAD, "r ms1", "X 0F BF r0 m1", 0},
+  {MIR_ALOAD, "r mu0", "X 0F B6 r0 m1", 0},
+  {MIR_ALOAD, "r ms0", "X 0F BE r0 m1", 0},
+  {MIR_ASTORE, "m3 r", "X 89 r1 m0; 0F AE F0", 0},
+  {MIR_ASTORE, "m2 r", "Y 89 r1 m0; 0F AE F0", 0},
+  {MIR_ASTORE, "m1 r", "66 Y 89 r1 m0; 0F AE F0", 0},
+  {MIR_ASTORE, "m0 r", "Z 88 r1 m0; 0F AE F0", 0},
+  /* axchg/aadd/asub: op0 == op2 (tied); lock op leaves old in that reg */
+  {MIR_AXCHG, "r m3 0", "X 87 r0 m1", 0},
+  {MIR_AXCHG, "r m2 0", "Y 87 r0 m1", 0},
+  {MIR_AADD, "r m3 0", "F0 X 0F C1 r0 m1", 0},
+  {MIR_AADD, "r m2 0", "F0 Y 0F C1 r0 m1", 0},
+  {MIR_ASUB, "r m3 0", "X F7 /3 R0; F0 X 0F C1 r0 m1", 0},
+  {MIR_ASUB, "r m2 0", "Y F7 /3 R0; F0 Y 0F C1 r0 m1", 0},
+  {MIR_AFENCE, "", "0F AE F0", 0},
+
   {MIR_FMOV, "r r", "Y 0F 28 r0 R1", 0},     /* movaps r0,r1 */
   {MIR_FMOV, "r mf", "F3 Y 0F 10 r0 m1", 0}, /* movss r0,m32 */
   {MIR_FMOV, "mf r", "F3 Y 0F 11 r1 m0", 0}, /* movss r0,m32 */
