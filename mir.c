@@ -4194,11 +4194,11 @@ static void set_inline_reg_map (MIR_context_t ctx, MIR_reg_t old_reg, MIR_reg_t 
 #endif
 
 #ifndef MIR_MAX_INSNS_FOR_CALL_INLINE
-#define MIR_MAX_INSNS_FOR_CALL_INLINE 50
+#define MIR_MAX_INSNS_FOR_CALL_INLINE 500
 #endif
 
 #ifndef MIR_MAX_FUNC_INLINE_GROWTH
-#define MIR_MAX_FUNC_INLINE_GROWTH 50
+#define MIR_MAX_FUNC_INLINE_GROWTH 500
 #endif
 
 #ifndef MIR_MAX_CALLER_SIZE_FOR_ANY_GROWTH_INLINE
