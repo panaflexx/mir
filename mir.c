@@ -59,6 +59,7 @@ struct MIR_context {
   struct interp_ctx *interp_ctx;
   void *setjmp_addr;      /* used in interpreter to call setjmp directly not from a shim and FFI */
   void *wrapper_end_addr; /* used by generator */
+  int tls_native_aot_p;   /* b2obj: ELF LE TLS; skip emulated mir_tls_addr rewrite */
 };
 
 #define error_func ctx->error_func
@@ -679,6 +680,8 @@ const char *MIR_item_name (MIR_context_t ctx MIR_UNUSED, MIR_item_t item) {
   case MIR_ref_data_item: return item->u.ref_data->name ? item->u.ref_data->name : "";
   case MIR_lref_data_item: return item->u.lref_data->name ? item->u.lref_data->name : "";
   case MIR_expr_data_item: return item->u.expr_data->name ? item->u.expr_data->name : "";
+  case MIR_tls_bss_item: return item->u.tls_bss->name ? item->u.tls_bss->name : "";
+  case MIR_tls_data_item: return item->u.tls_data->name ? item->u.tls_data->name : "";
   default: mir_assert (FALSE); return NULL;
   }
 }
@@ -764,6 +767,9 @@ static void init_module (MIR_context_t ctx, MIR_module_t m, const char *name) {
 #if !MIR_NO_DBINFO
   m->dbtypes = NULL;
 #endif
+  m->tls_module_id = 0;
+  m->tls_size = 0;
+  m->tls_template = NULL;
 }
 
 static void code_init (MIR_context_t ctx);
@@ -830,6 +836,7 @@ MIR_context_t _MIR_init (MIR_alloc_t alloc, MIR_code_alloc_t code_alloc) {
   init_module (ctx, &environment_module, ".environment");
   HTAB_CREATE (MIR_item_t, module_item_tab, ctx->alloc, 512, item_hash, item_eq, NULL);
   setjmp_addr = NULL;
+  ctx->tls_native_aot_p = 0;
   code_init (ctx);
   wrapper_end_addr = _MIR_get_wrapper_end (ctx); /* should be after code_init */
   hard_reg_name_init (ctx);
@@ -905,6 +912,12 @@ static void remove_item (MIR_context_t ctx, MIR_item_t item) {
       MIR_free (ctx->alloc, item->addr);
     MIR_free (ctx->alloc, item->u.bss);
     break;
+  case MIR_tls_bss_item:
+    MIR_free (ctx->alloc, item->u.tls_bss);
+    break;
+  case MIR_tls_data_item:
+    MIR_free (ctx->alloc, item->u.tls_data);
+    break;
   default: mir_assert (FALSE);
   }
   if (item->data != NULL)
@@ -919,6 +932,15 @@ static void remove_module (MIR_context_t ctx, MIR_module_t module, int free_modu
     DLIST_REMOVE (MIR_item_t, module->items, item);
     item_tab_remove (ctx, item);
     remove_item (ctx, item);
+  }
+  if (module->tls_module_id != 0) {
+    mir_tls_unregister (module->tls_module_id);
+    module->tls_module_id = 0;
+  }
+  if (module->tls_template != NULL) {
+    MIR_free (ctx->alloc, module->tls_template);
+    module->tls_template = NULL;
+    module->tls_size = 0;
   }
   if (module->data != NULL)
     bitmap_destroy (module->data);
@@ -1152,6 +1174,8 @@ static MIR_item_t add_item (MIR_context_t ctx, MIR_item_t item) {
   case MIR_ref_data_item:
   case MIR_lref_data_item:
   case MIR_expr_data_item:
+  case MIR_tls_bss_item:
+  case MIR_tls_data_item:
   case MIR_func_item:
     if (item->item_type == MIR_export_item) {
       if (tab_item->export_p) {
@@ -1310,6 +1334,61 @@ MIR_item_t MIR_new_data (MIR_context_t ctx, const char *name, MIR_type_t el_type
 
 MIR_item_t MIR_new_string_data (MIR_context_t ctx, const char *name, MIR_str_t str) {
   return MIR_new_data (ctx, name, MIR_T_U8, str.len, str.s);
+}
+
+MIR_item_t MIR_new_tls_bss (MIR_context_t ctx, const char *name, size_t len) {
+  MIR_item_t tab_item, item = create_item (ctx, MIR_tls_bss_item, "tls_bss");
+
+  item->u.tls_bss = MIR_malloc (ctx->alloc, sizeof (struct MIR_tls_bss));
+  if (item->u.tls_bss == NULL) {
+    MIR_free (ctx->alloc, item);
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of tls_bss %s",
+                              name == NULL ? "" : name);
+  }
+  if (name != NULL) name = get_ctx_str (ctx, name);
+  item->u.tls_bss->name = name;
+  item->u.tls_bss->len = len;
+  item->u.tls_bss->offset = 0;
+  if (name == NULL) {
+    DLIST_APPEND (MIR_item_t, curr_module->items, item);
+  } else if ((tab_item = add_item (ctx, item)) != item) {
+    MIR_free (ctx->alloc, item);
+    item = tab_item;
+  }
+  return item;
+}
+
+MIR_item_t MIR_new_tls_data (MIR_context_t ctx, const char *name, MIR_type_t el_type, size_t nel,
+                             const void *els) {
+  MIR_item_t tab_item, item = create_item (ctx, MIR_tls_data_item, "tls_data");
+  MIR_tls_data_t data;
+  size_t el_len;
+
+  if (wrong_type_p (el_type)) {
+    MIR_free (ctx->alloc, item);
+    MIR_get_error_func (ctx) (MIR_wrong_type_error, "wrong type in tls_data %s",
+                              name == NULL ? "" : name);
+  }
+  el_len = _MIR_type_size (ctx, el_type);
+  item->u.tls_data = data = MIR_malloc (ctx->alloc, sizeof (struct MIR_tls_data) + el_len * nel);
+  if (data == NULL) {
+    MIR_free (ctx->alloc, item);
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for creation of tls_data %s",
+                              name == NULL ? "" : name);
+  }
+  if (name != NULL) name = get_ctx_str (ctx, name);
+  data->name = name;
+  data->offset = 0;
+  if (name == NULL) {
+    DLIST_APPEND (MIR_item_t, curr_module->items, item);
+  } else if ((tab_item = add_item (ctx, item)) != item) {
+    MIR_free (ctx->alloc, item);
+    item = tab_item;
+  }
+  data->el_type = canon_type (el_type);
+  data->nel = nel;
+  memcpy (data->u.els, els, el_len * nel);
+  return item;
 }
 
 MIR_item_t MIR_new_ref_data (MIR_context_t ctx, const char *name, MIR_item_t ref_item,
@@ -2028,6 +2107,104 @@ static void link_module_lrefs (MIR_context_t ctx, MIR_module_t m) {
 
 void *_MIR_get_recycled_thunk (MIR_context_t ctx); /* forward decl */
 
+/* Build contiguous TLS template for the module, assign offsets, register with
+   the host emulated-TLS runtime.  Live addresses are per-thread via mir_tls_addr. */
+static void load_module_tls (MIR_context_t ctx, MIR_module_t m) {
+  size_t size = 0;
+  int has_tls = FALSE;
+  static uint32_t next_tls_mod_id = 1;
+
+  for (MIR_item_t item = DLIST_HEAD (MIR_item_t, m->items); item != NULL;
+       item = DLIST_NEXT (MIR_item_t, item)) {
+    size_t isz = 0;
+    if (item->item_type == MIR_tls_bss_item) {
+      isz = (size_t) item->u.tls_bss->len;
+      has_tls = TRUE;
+    } else if (item->item_type == MIR_tls_data_item) {
+      isz = item->u.tls_data->nel * _MIR_type_size (ctx, item->u.tls_data->el_type);
+      has_tls = TRUE;
+    } else
+      continue;
+    /* 8-byte align each TLS object (matches data/bss section packing). */
+    if (size % 8 != 0) size += 8 - size % 8;
+    if (item->item_type == MIR_tls_bss_item)
+      item->u.tls_bss->offset = (uint32_t) size;
+    else
+      item->u.tls_data->offset = (uint32_t) size;
+    size += isz;
+  }
+  if (!has_tls) return;
+  if (size % 8 != 0) size += 8 - size % 8;
+  if (m->tls_template != NULL) {
+    MIR_free (ctx->alloc, m->tls_template);
+    m->tls_template = NULL;
+  }
+  if ((m->tls_template = MIR_malloc (ctx->alloc, size ? size : 1)) == NULL)
+    MIR_get_error_func (ctx) (MIR_alloc_error, "Not enough memory for TLS template of module %s",
+                              m->name);
+  memset (m->tls_template, 0, size);
+  for (MIR_item_t item = DLIST_HEAD (MIR_item_t, m->items); item != NULL;
+       item = DLIST_NEXT (MIR_item_t, item)) {
+    if (item->item_type == MIR_tls_bss_item) {
+      /* already zero-filled */
+      item->addr = NULL; /* not a live process-global cell */
+    } else if (item->item_type == MIR_tls_data_item) {
+      size_t isz = item->u.tls_data->nel * _MIR_type_size (ctx, item->u.tls_data->el_type);
+      memcpy ((uint8_t *) m->tls_template + item->u.tls_data->offset, item->u.tls_data->u.els, isz);
+      item->addr = NULL;
+    }
+  }
+  m->tls_size = size;
+  if (m->tls_module_id == 0) {
+    if (next_tls_mod_id == 0) next_tls_mod_id = 1; /* skip 0 = "no TLS" */
+    m->tls_module_id = next_tls_mod_id++;
+  }
+  mir_tls_register (m->tls_module_id, m->tls_size, 8, m->tls_template);
+}
+
+/* Rewrite mov r, ref(tls_item) → call mir.tls_addr(mod, off) so both the
+   interpreter and generator see a call (per-thread address, not a constant). */
+static void lower_module_tls_refs (MIR_context_t ctx, MIR_module_t m) {
+  MIR_item_t proto_item, func_import_item;
+  MIR_type_t res_type = MIR_T_I64;
+  MIR_op_t ops[6], freg_op;
+  MIR_insn_t insn, next, new_insn;
+  MIR_func_t func;
+  MIR_item_t tls_item;
+  uint32_t mod_id, off;
+
+  if (m->tls_module_id == 0) return;
+  if (ctx->tls_native_aot_p) return; /* object file uses ELF LE; see MIR_set_tls_native_aot */
+  proto_item = _MIR_builtin_proto (ctx, m, "mir.tls_addr.p", 1, &res_type, 2, MIR_T_I64, "id",
+                                   MIR_T_I64, "off");
+  func_import_item = _MIR_builtin_func (ctx, m, "mir.tls_addr", (void *) mir_tls_addr);
+
+  for (MIR_item_t fitem = DLIST_HEAD (MIR_item_t, m->items); fitem != NULL;
+       fitem = DLIST_NEXT (MIR_item_t, fitem)) {
+    if (fitem->item_type != MIR_func_item) continue;
+    func = fitem->u.func;
+    for (insn = DLIST_HEAD (MIR_insn_t, func->insns); insn != NULL; insn = next) {
+      next = DLIST_NEXT (MIR_insn_t, insn);
+      if (insn->code != MIR_MOV || insn->nops < 2 || insn->ops[1].mode != MIR_OP_REF) continue;
+      tls_item = insn->ops[1].u.ref;
+      if (!MIR_tls_item_p (tls_item)) continue;
+      mod_id = tls_item->module != NULL ? tls_item->module->tls_module_id : m->tls_module_id;
+      off = MIR_tls_item_offset (tls_item);
+      freg_op = MIR_new_reg_op (ctx, _MIR_new_temp_reg (ctx, MIR_T_I64, func));
+      new_insn = MIR_new_insn (ctx, MIR_MOV, freg_op, MIR_new_ref_op (ctx, func_import_item));
+      MIR_insert_insn_before (ctx, fitem, insn, new_insn);
+      ops[0] = MIR_new_ref_op (ctx, proto_item);
+      ops[1] = freg_op;
+      ops[2] = insn->ops[0];
+      ops[3] = MIR_new_int_op (ctx, (int64_t) mod_id);
+      ops[4] = MIR_new_int_op (ctx, (int64_t) off);
+      new_insn = MIR_new_insn_arr (ctx, MIR_CALL, 5, ops);
+      MIR_insert_insn_before (ctx, fitem, insn, new_insn);
+      MIR_remove_insn (ctx, fitem, insn);
+    }
+  }
+}
+
 void MIR_load_module (MIR_context_t ctx, MIR_module_t m) {
   int lref_p = FALSE;
   mir_assert (m != NULL);
@@ -2040,6 +2217,9 @@ void MIR_load_module (MIR_context_t ctx, MIR_module_t m) {
         || item->item_type == MIR_expr_data_item) {
       if (item->item_type == MIR_lref_data_item) lref_p = TRUE;
       item = load_bss_data_section (ctx, item, FALSE);
+    } else if (item->item_type == MIR_tls_bss_item || item->item_type == MIR_tls_data_item) {
+      /* Offsets/template filled in load_module_tls after the walk. */
+      ;
     } else if (item->item_type == MIR_func_item) {
       if (item->addr == NULL) {
         void *recycled = _MIR_get_recycled_thunk (ctx);
@@ -2054,6 +2234,7 @@ void MIR_load_module (MIR_context_t ctx, MIR_module_t m) {
       mir_assert (first_item->item_type != MIR_export_item
                   && first_item->item_type != MIR_import_item
                   && first_item->item_type != MIR_forward_item);
+      /* TLS exports: addr is not a live cell; still register name for resolution. */
       if (setup_global (ctx, MIR_item_name (ctx, first_item), first_item->addr, first_item)
           && item->item_type == MIR_func_item
           && !func_redef_permission_p
@@ -2066,6 +2247,8 @@ void MIR_load_module (MIR_context_t ctx, MIR_module_t m) {
                                   item->u.func->name);
     }
   }
+  load_module_tls (ctx, m);
+  lower_module_tls_refs (ctx, m);
   if (lref_p) link_module_lrefs (ctx, m);
   VARR_PUSH (MIR_module_t, modules_to_link, m);
 }
@@ -2078,6 +2261,12 @@ void MIR_load_external (MIR_context_t ctx, const char *name, void *addr) {
     setjmp_addr = addr;
   setup_global (ctx, name, addr, NULL);
 }
+
+void MIR_set_tls_native_aot (MIR_context_t ctx, int on) {
+  ctx->tls_native_aot_p = on != 0;
+}
+
+int MIR_tls_native_aot_p (MIR_context_t ctx) { return ctx->tls_native_aot_p; }
 
 /* Source location API for debug info */
 uint16_t MIR_module_add_source_file (MIR_context_t ctx, MIR_module_t module,
@@ -3056,6 +3245,8 @@ static void set_item_name (MIR_item_t item, const char *name) {
   case MIR_ref_data_item: item->u.ref_data->name = name; break;
   case MIR_lref_data_item: item->u.lref_data->name = name; break;
   case MIR_expr_data_item: item->u.expr_data->name = name; break;
+  case MIR_tls_bss_item: item->u.tls_bss->name = name; break;
+  case MIR_tls_data_item: item->u.tls_data->name = name; break;
   default: mir_assert (FALSE);
   }
 }
@@ -3357,6 +3548,38 @@ void MIR_output_item (MIR_context_t ctx, FILE *f, MIR_item_t item) {
   if (item->item_type == MIR_bss_item) {
     if (item->u.bss->name != NULL) fprintf (f, "%s:", item->u.bss->name);
     fprintf (f, "\tbss\t%" PRIu64 "\n", item->u.bss->len);
+    return;
+  }
+  if (item->item_type == MIR_tls_bss_item) {
+    if (item->u.tls_bss->name != NULL) fprintf (f, "%s:", item->u.tls_bss->name);
+    fprintf (f, "\ttls_bss\t%" PRIu64 "\n", item->u.tls_bss->len);
+    return;
+  }
+  if (item->item_type == MIR_tls_data_item) {
+    MIR_tls_data_t td = item->u.tls_data;
+    if (td->name != NULL) fprintf (f, "%s:", td->name);
+    fprintf (f, "\ttls_data\t%s\t", MIR_type_str (ctx, td->el_type));
+    for (size_t i = 0; i < td->nel; i++) {
+      switch (td->el_type) {
+      case MIR_T_I8: fprintf (f, "%" PRId8, ((int8_t *) td->u.els)[i]); break;
+      case MIR_T_U8: fprintf (f, "%" PRIu8, ((uint8_t *) td->u.els)[i]); break;
+      case MIR_T_I16: fprintf (f, "%" PRId16, ((int16_t *) td->u.els)[i]); break;
+      case MIR_T_U16: fprintf (f, "%" PRIu16, ((uint16_t *) td->u.els)[i]); break;
+      case MIR_T_I32: fprintf (f, "%" PRId32, ((int32_t *) td->u.els)[i]); break;
+      case MIR_T_U32: fprintf (f, "%" PRIu32, ((uint32_t *) td->u.els)[i]); break;
+      case MIR_T_I64: fprintf (f, "%" PRId64, ((int64_t *) td->u.els)[i]); break;
+      case MIR_T_U64: fprintf (f, "%" PRIu64, ((uint64_t *) td->u.els)[i]); break;
+      case MIR_T_F: fprintf (f, "%.*ef", FLT_MANT_DIG, ((float *) td->u.els)[i]); break;
+      case MIR_T_D: fprintf (f, "%.*e", DBL_MANT_DIG, ((double *) td->u.els)[i]); break;
+      case MIR_T_LD:
+        fprintf (f, "%.*LeL", LDBL_MANT_DIG, ((long double *) td->u.els)[i]);
+        break;
+      case MIR_T_P: fprintf (f, "0x%" PRIxPTR, ((uintptr_t *) td->u.els)[i]); break;
+      default: mir_assert (FALSE);
+      }
+      if (i + 1 < td->nel) fprintf (f, ", ");
+    }
+    fprintf (f, "\n");
     return;
   }
   if (item->item_type == MIR_ref_data_item) {
@@ -5381,8 +5604,10 @@ static size_t write_insn (MIR_context_t ctx, writer_func_t writer, MIR_func_t fu
   len += write_uint (ctx, writer, code);
   for (i = 0; i < nops; i++) len += write_op (ctx, writer, func, insn->ops[i]);
   if (insn_descs[code].op_modes[0] == MIR_OP_BOUND) {
-    /* first operand mode is undefined if it is a variable operand insn */
-    mir_assert (MIR_call_code_p (code) || code == MIR_RET || code == MIR_SWITCH);
+    /* first operand mode is undefined if it is a variable operand insn
+       (or the zero-operand AFENCE atomic, which serializes like one) */
+    mir_assert (MIR_call_code_p (code) || code == MIR_RET || code == MIR_SWITCH
+                || code == MIR_AFENCE);
     put_byte (ctx, writer, TAG_EOI);
     len++;
   }
@@ -5531,6 +5756,47 @@ static size_t write_item (MIR_context_t ctx, writer_func_t writer, MIR_item_t it
       len += write_name (ctx, writer, item->u.bss->name);
     }
     len += write_uint (ctx, writer, item->u.bss->len);
+    return len;
+  }
+  if (item->item_type == MIR_tls_bss_item) {
+    if (item->u.tls_bss->name == NULL) {
+      len += write_name (ctx, writer, "tlsbss");
+    } else {
+      len += write_name (ctx, writer, "ntlsbss");
+      len += write_name (ctx, writer, item->u.tls_bss->name);
+    }
+    len += write_uint (ctx, writer, item->u.tls_bss->len);
+    return len;
+  }
+  if (item->item_type == MIR_tls_data_item) {
+    MIR_tls_data_t data = item->u.tls_data;
+    size_t i;
+
+    if (data->name == NULL) {
+      len += write_name (ctx, writer, "tlsdata");
+    } else {
+      len += write_name (ctx, writer, "ntlsdata");
+      len += write_name (ctx, writer, data->name);
+    }
+    write_type (ctx, writer, data->el_type);
+    for (i = 0; i < data->nel; i++) switch (data->el_type) {
+      case MIR_T_I8: len += write_int (ctx, writer, ((int8_t *) data->u.els)[i]); break;
+      case MIR_T_U8: len += write_uint (ctx, writer, ((uint8_t *) data->u.els)[i]); break;
+      case MIR_T_I16: len += write_int (ctx, writer, ((int16_t *) data->u.els)[i]); break;
+      case MIR_T_U16: len += write_uint (ctx, writer, ((uint16_t *) data->u.els)[i]); break;
+      case MIR_T_I32: len += write_int (ctx, writer, ((int32_t *) data->u.els)[i]); break;
+      case MIR_T_U32: len += write_uint (ctx, writer, ((uint32_t *) data->u.els)[i]); break;
+      case MIR_T_I64: len += write_int (ctx, writer, ((int64_t *) data->u.els)[i]); break;
+      case MIR_T_U64: len += write_uint (ctx, writer, ((uint64_t *) data->u.els)[i]); break;
+      case MIR_T_F: len += write_float (ctx, writer, ((float *) data->u.els)[i]); break;
+      case MIR_T_D: len += write_double (ctx, writer, ((double *) data->u.els)[i]); break;
+      case MIR_T_LD:
+        len += write_ldouble (ctx, writer, ((long double *) data->u.els)[i]);
+        break;
+      case MIR_T_P: len += write_uint (ctx, writer, ((uintptr_t *) data->u.els)[i]); break;
+      default: mir_assert (FALSE);
+      }
+    len += put_byte (ctx, writer, TAG_EOI);
     return len;
   }
   if (item->item_type == MIR_ref_data_item) {
@@ -6308,6 +6574,13 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
                                     name == NULL ? "" : name);
         u = read_uint (ctx, "wrong bss len");
         MIR_new_bss (ctx, name, u);
+      } else if (strcmp (name, "ntlsbss") == 0 || strcmp (name, "tlsbss") == 0) {
+        name = strcmp (name, "ntlsbss") == 0 ? read_name (ctx, module, "wrong tls_bss name") : NULL;
+        if (VARR_LENGTH (uint64_t, insn_label_string_nums) != 0)
+          MIR_get_error_func (ctx) (MIR_binary_io_error, "tls_bss %s should have no labels",
+                                    name == NULL ? "" : name);
+        u = read_uint (ctx, "wrong tls_bss len");
+        MIR_new_tls_bss (ctx, name, u);
       } else if (strcmp (name, "nref") == 0 || strcmp (name, "ref") == 0) {
         name = strcmp (name, "nref") == 0 ? read_name (ctx, module, "wrong ref data name") : NULL;
         if (VARR_LENGTH (uint64_t, insn_label_string_nums) != 0)
@@ -6342,8 +6615,10 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
           MIR_get_error_func (ctx) (MIR_binary_io_error, "expr refers to non-function %s",
                                     item_name);
         MIR_new_expr_data (ctx, name, item);
-      } else if (strcmp (name, "ndata") == 0 || strcmp (name, "data") == 0) {
+      } else if (strcmp (name, "ndata") == 0 || strcmp (name, "data") == 0
+                 || strcmp (name, "ntlsdata") == 0 || strcmp (name, "tlsdata") == 0) {
         MIR_type_t type;
+        int tls_data_p = strcmp (name, "ntlsdata") == 0 || strcmp (name, "tlsdata") == 0;
         union {
           uint8_t u8;
           uint16_t u16;
@@ -6355,10 +6630,13 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
           int64_t i64;
         } v;
 
-        name = strcmp (name, "ndata") == 0 ? read_name (ctx, module, "wrong data name") : NULL;
+        if (strcmp (name, "ndata") == 0 || strcmp (name, "ntlsdata") == 0)
+          name = read_name (ctx, module, tls_data_p ? "wrong tls_data name" : "wrong data name");
+        else
+          name = NULL;
         if (VARR_LENGTH (uint64_t, insn_label_string_nums) != 0)
-          MIR_get_error_func (ctx) (MIR_binary_io_error, "data %s should have no labels",
-                                    name == NULL ? "" : name);
+          MIR_get_error_func (ctx) (MIR_binary_io_error, "%s %s should have no labels",
+                                    tls_data_p ? "tls_data" : "data", name == NULL ? "" : name);
         tag = read_token (ctx, &attr);
         if (TAG_TI8 > tag || tag > TAG_TRBLOCK)
           MIR_get_error_func (ctx) (MIR_binary_io_error, "wrong data type tag %d", tag);
@@ -6456,9 +6734,14 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
           default: MIR_get_error_func (ctx) (MIR_binary_io_error, "wrong data value tag %d", tag);
           }
         }
-        MIR_new_data (ctx, name, type,
-                      VARR_LENGTH (uint8_t, temp_data) / _MIR_type_size (ctx, type),
-                      VARR_ADDR (uint8_t, temp_data));
+        if (tls_data_p)
+          MIR_new_tls_data (ctx, name, type,
+                            VARR_LENGTH (uint8_t, temp_data) / _MIR_type_size (ctx, type),
+                            VARR_ADDR (uint8_t, temp_data));
+        else
+          MIR_new_data (ctx, name, type,
+                        VARR_LENGTH (uint8_t, temp_data) / _MIR_type_size (ctx, type),
+                        VARR_ADDR (uint8_t, temp_data));
       } else if ((global_p = strcmp (name, "global") == 0) || strcmp (name, "local") == 0) {
         if (func == NULL)
           MIR_get_error_func (ctx) (MIR_binary_io_error, "local/global outside func");
@@ -6495,7 +6778,9 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
       MIR_insn_code_t insn_code = attr.u;
       MIR_insn_t new_insn;
 
-      if (insn_code >= MIR_LABEL)
+      /* Atomics (ALOAD..ACAS) are portable machine insns (ClassyC): they sit
+         past MIR_LABEL in the enum but must survive the binary round trip. */
+      if (insn_code >= MIR_LABEL && !MIR_atomic_code_p (insn_code))
         MIR_get_error_func (ctx) (MIR_binary_io_error, "wrong insn code %d", insn_code);
       if (insn_code == MIR_UNSPEC || insn_code == MIR_USE || insn_code == MIR_PHI)
         MIR_get_error_func (ctx) (MIR_binary_io_error,
@@ -6506,7 +6791,7 @@ void MIR_read_with_func (MIR_context_t ctx, int (*const reader) (MIR_context_t))
       }
       nop = insn_code_nops (ctx, insn_code);
       mir_assert (nop != 0 || MIR_call_code_p (insn_code) || insn_code == MIR_RET
-                  || insn_code == MIR_SWITCH);
+                  || insn_code == MIR_SWITCH || insn_code == MIR_AFENCE);
       for (n = 0; (nop == 0 || n < nop) && read_operand (ctx, &op, func); n++)
         VARR_PUSH (MIR_op_t, read_insn_ops, op);
       if (nop != 0 && n < nop)

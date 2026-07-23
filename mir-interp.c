@@ -273,7 +273,10 @@ static void generate_icode (MIR_context_t ctx, MIR_item_t func_item) {
         push_insn_start (interp_ctx, IC_MOVP, insn);
         v.i = get_reg (ops[0], &max_nreg);
         VARR_PUSH (MIR_val_t, code_varr, v);
-        v.a = item->addr;
+        if (MIR_tls_item_p (item) && item->module != NULL && item->module->tls_module_id != 0)
+          v.a = mir_tls_addr (item->module->tls_module_id, MIR_tls_item_offset (item));
+        else
+          v.a = item->addr;
         VARR_PUSH (MIR_val_t, code_varr, v);
       } else {
         const char *hard_reg_name;

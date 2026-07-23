@@ -320,6 +320,7 @@ DEF_VARR (uint64_t);
 //DEF_VARR (MIR_code_reloc_t); // Moved to mir.h
 
 #include "mir-gen-atomic.c"
+#include "mir-gen-tls.c"
 
 #if defined(__x86_64__) || defined(_M_AMD64)
 #include "mir-gen-x86_64.c"
@@ -9602,6 +9603,8 @@ static void *generate_func_code (MIR_context_t ctx, MIR_item_t func_item, int ma
   });
   curr_func_item = func_item;
   _MIR_duplicate_func_insns (ctx, func_item);
+  /* TLS: rewrite mov r, ref(tls_item) → call mir.tls_addr(mod, off) before CFG. */
+  lower_tls_refs (gen_ctx);
   curr_cfg = func_item->data = gen_malloc (gen_ctx, sizeof (struct func_cfg));
   build_func_cfg (gen_ctx);
   bbs_num = curr_bb_index;

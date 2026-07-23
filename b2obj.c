@@ -550,6 +550,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 break;
             }
 
+            case MIR_tls_data_item:
+            case MIR_tls_bss_item:
+                /* N1: emulated TLS — no ELF TLS sections yet (see TLS-IMPLEMENTATION.md). */
+                break;
+
             case MIR_data_item: {
                 MIR_data_t d = item->u.data;
                 size_t sz = d->nel * _MIR_type_size(ctx, d->el_type);

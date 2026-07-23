@@ -3045,11 +3045,66 @@ static const char *nop_pats[] = {
   "\x0f\x1f\x80\x00\x00\x00\x00" /* 7: nopl 0x0(%rax) */,
 };
 
+/* ELF local-exec: materialize address of TLS symbol into hard reg.
+   Encoding matches gcc -fno-pie: mov %fs:0, %reg; add $sym@tpoff, %reg. */
+static void emit_tls_addr_le (gen_ctx_t gen_ctx, MIR_insn_t insn) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  MIR_reg_t hreg;
+  MIR_item_t tls_item;
+  const char *sym;
+  int r, rex;
+  MIR_code_reloc_t reloc;
+
+  gen_assert (insn->ops[0].mode == MIR_OP_VAR);
+  hreg = insn->ops[0].u.var;
+  gen_assert (hreg <= R15_HARD_REG);
+  tls_item = insn->ops[1].u.ref;
+  sym = MIR_item_name (ctx, tls_item);
+  gen_assert (sym != NULL && sym[0] != 0);
+  r = (int) (hreg & 7);
+
+  /* 64 48/4c 8b /r 04 25 00 00 00 00 — mov %fs:0, %reg */
+  put_byte (gen_ctx, 0x64);
+  rex = 0x48;
+  if (hreg >= 8) rex |= 0x04; /* REX.R */
+  put_byte (gen_ctx, rex);
+  put_byte (gen_ctx, 0x8b);
+  put_byte (gen_ctx, 0x04 | (r << 3));
+  put_byte (gen_ctx, 0x25);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+
+  /* add $sym@tpoff, %reg — R_X86_64_TPOFF32 on the imm32 */
+  if (hreg == AX_HARD_REG) {
+    put_byte (gen_ctx, 0x48);
+    put_byte (gen_ctx, 0x05);
+  } else {
+    rex = 0x48;
+    if (hreg >= 8) rex |= 0x01; /* REX.B */
+    put_byte (gen_ctx, rex);
+    put_byte (gen_ctx, 0x81);
+    put_byte (gen_ctx, 0xc0 | r);
+  }
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = R_X86_64_TPOFF32;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+}
+
 static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
   MIR_context_t ctx = gen_ctx->ctx;
   MIR_insn_t insn;
   int ind, max_insn_size;
   size_t curr_size, n;
+  const int TLS_LE_PAT = -2;
 
   gen_assert (curr_func_item->item_type == MIR_func_item);
   translate_init (gen_ctx);
@@ -3061,15 +3116,20 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
       if (gen_nested_loop_label_p (gen_ctx, insn)) curr_size += LOOP_ALIGN;
       set_label_disp (gen_ctx, insn, curr_size); /* estimation */
     } else if (insn->code != MIR_USE) {
-      ind = find_insn_pattern (gen_ctx, insn, &max_insn_size);
-      if (ind < 0) {
-        fprintf (stderr, "Fatal failure in matching insn:");
-        MIR_output_insn (ctx, stderr, insn, curr_func_item->u.func, TRUE);
-        exit (1);
+      if (tls_native_mov_p (gen_ctx, insn)) {
+        curr_size += 20; /* mov %fs:0 + add tpoff */
+        VARR_PUSH (int, insn_pattern_indexes, TLS_LE_PAT);
+      } else {
+        ind = find_insn_pattern (gen_ctx, insn, &max_insn_size);
+        if (ind < 0) {
+          fprintf (stderr, "Fatal failure in matching insn:");
+          MIR_output_insn (ctx, stderr, insn, curr_func_item->u.func, TRUE);
+          exit (1);
+        }
+        curr_size += max_insn_size;
+        if (insn->code == MIR_SWITCH) curr_size += (insn->nops - 1) * 8; /* label addresses */
+        VARR_PUSH (int, insn_pattern_indexes, ind);
       }
-      curr_size += max_insn_size;
-      if (insn->code == MIR_SWITCH) curr_size += (insn->nops - 1) * 8; /* label addresses */
-      VARR_PUSH (int, insn_pattern_indexes, ind);
     }
   }
   for (n = 0, insn = DLIST_HEAD (MIR_insn_t, curr_func_item->u.func->insns); insn != NULL;
@@ -3084,6 +3144,10 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
       set_label_disp (gen_ctx, insn, VARR_LENGTH (uint8_t, result_code));
     } else if (insn->code != MIR_USE) {
       ind = VARR_GET (int, insn_pattern_indexes, n++);
+      if (ind == TLS_LE_PAT) {
+        emit_tls_addr_le (gen_ctx, insn);
+        continue;
+      }
       if (MIR_branch_code_p (insn->code)) /* possible replacement change */
         ind = find_insn_pattern (gen_ctx, insn, NULL);
       gen_assert (ind >= 0);

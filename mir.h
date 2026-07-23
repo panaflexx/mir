@@ -320,6 +320,7 @@ DEF_VARR (MIR_var_t);
 // MIR_code_reloc.type
 #define R_X86_64_PC32 2  // 32-bit PC-relative relocation
 #define R_X86_64_64   1  // 64-bit absolute relocation
+#define R_X86_64_TPOFF32 23 /* TLS local-exec: 32-bit offset from TP */
 
 struct MIR_code_reloc {
   size_t offset;
@@ -403,6 +404,26 @@ typedef struct MIR_bss {
   uint64_t len;
 } *MIR_bss_t;
 
+/* Thread-local storage items (C11 _Thread_local).  Unlike data/bss, live
+   addresses are per-OS-thread: base = mir_tls_base(module_tls_id),
+   cell = base + offset.  item->addr is not a live cell after load. */
+typedef struct MIR_tls_bss {
+  const char *name; /* can be NULL */
+  uint64_t len;
+  uint32_t offset; /* filled at MIR_load_module: offset in module TLS image */
+} *MIR_tls_bss_t;
+
+typedef struct MIR_tls_data {
+  const char *name; /* can be NULL */
+  MIR_type_t el_type;
+  size_t nel;
+  uint32_t offset; /* filled at MIR_load_module */
+  union {
+    long double d; /* alignment of temporary literals */
+    uint8_t els[1];
+  } u;
+} *MIR_tls_data_t;
+
 typedef struct MIR_module *MIR_module_t;
 
 /* Definition of link of double list of MIR_item_t type elements */
@@ -412,7 +433,7 @@ DEF_DLIST_LINK (MIR_item_t);
 
 typedef enum {
   REP8 (ITEM_EL, func, proto, import, export, forward, data, ref_data, lref_data),
-  REP2 (ITEM_EL, expr_data, bss),
+  REP4 (ITEM_EL, expr_data, bss, tls_data, tls_bss),
 } MIR_item_type_t;
 
 #undef ERR_EL
@@ -432,7 +453,8 @@ struct MIR_item {
      linking.  It forms a chain to the final definition. */
   MIR_item_t ref_def;
   /* address of loaded data/bss items, function to call the function
-     item, imported definition or proto object */
+     item, imported definition or proto object.
+     For TLS items after load: unused for live access (use mir_tls_addr). */
   void *addr;
   char export_p; /* true for export items (only func items) */
   /* defined for data-bss after loading. True if it is a start of allocated section */
@@ -448,6 +470,8 @@ struct MIR_item {
     MIR_lref_data_t lref_data;
     MIR_expr_data_t expr_data;
     MIR_bss_t bss;
+    MIR_tls_data_t tls_data;
+    MIR_tls_bss_t tls_bss;
   } u;
 };
 
@@ -470,6 +494,10 @@ struct MIR_module {
 #if !MIR_NO_DBINFO
   MIR_dbtype_table_t *dbtypes; /* debug type table, NULL when -g not used */
 #endif
+  /* TLS image (filled by MIR_load_module when module has tls_* items): */
+  uint32_t tls_module_id; /* 0 = no TLS; else id for mir_tls_base/addr */
+  size_t tls_size;        /* total TLS image size (bytes) */
+  void *tls_template;     /* init image; owned by module until unload */
 };
 
 /* Definition of double list of MIR_item_t type elements */
@@ -548,8 +576,38 @@ extern MIR_item_t MIR_new_bss (MIR_context_t ctx, const char *name,
                                size_t len); /* name can be NULL */
 extern MIR_item_t MIR_new_data (MIR_context_t ctx, const char *name, MIR_type_t el_type, size_t nel,
                                 const void *els); /* name can be NULL */
+extern MIR_item_t MIR_new_tls_bss (MIR_context_t ctx, const char *name,
+                                   size_t len); /* name can be NULL */
+extern MIR_item_t MIR_new_tls_data (MIR_context_t ctx, const char *name, MIR_type_t el_type,
+                                    size_t nel, const void *els); /* name can be NULL */
 extern MIR_item_t MIR_new_string_data (MIR_context_t ctx, const char *name,
                                        MIR_str_t str); /* name can be NULL */
+
+/* True if item is thread-local storage (not process-global data/bss). */
+static inline int MIR_tls_item_p (MIR_item_t item) {
+  return item != NULL
+         && (item->item_type == MIR_tls_data_item || item->item_type == MIR_tls_bss_item);
+}
+/* Offset of a TLS item within its module TLS image (valid after MIR_load_module). */
+static inline uint32_t MIR_tls_item_offset (MIR_item_t item) {
+  if (item == NULL) return 0;
+  if (item->item_type == MIR_tls_bss_item) return item->u.tls_bss->offset;
+  if (item->item_type == MIR_tls_data_item) return item->u.tls_data->offset;
+  return 0;
+}
+
+/* Host emulated TLS runtime (implemented in src/mir-tls.c for ClassyC).
+   MIR_load_module calls mir_tls_register for modules that define TLS. */
+extern void mir_tls_register (uint32_t id, size_t size, size_t align, const void *tmpl);
+extern void *mir_tls_base (uint32_t id);
+extern void *mir_tls_addr (uint32_t id, size_t offset);
+extern void mir_tls_unregister (uint32_t id);
+
+/* When set before MIR_load_module, TLS refs are NOT rewritten to mir_tls_addr
+   calls.  b2obj uses this with gen_object_file to emit ELF LE (%fs + TPOFF).
+   JIT/interp leave this clear (emulated TLS). */
+extern void MIR_set_tls_native_aot (MIR_context_t ctx, int on);
+extern int MIR_tls_native_aot_p (MIR_context_t ctx);
 extern MIR_item_t MIR_new_ref_data (MIR_context_t ctx, const char *name, MIR_item_t item,
                                     int64_t disp); /* name can be NULL */
 extern MIR_item_t MIR_new_lref_data (MIR_context_t ctx, const char *name, MIR_label_t label,
