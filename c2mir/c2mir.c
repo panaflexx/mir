@@ -107,7 +107,7 @@ DEF_VARR (token_t);
 
 typedef struct node *node_t;
 
-enum symbol_mode { S_REGULAR, S_TAG, S_LABEL };
+enum symbol_mode { S_REGULARS, S_TAG, S_LABEL };
 
 DEF_VARR (node_t);
 
@@ -6546,7 +6546,7 @@ static void symbol_insert (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, 
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
   symbol_t el, symbol;
   const char *smode = (mode == S_TAG ? "s_tag" :
-                       mode == S_REGULAR ? "s_regular" : "s_label");
+                       mode == S_REGULARS ? "s_regular" : "s_label");
 
   if (c2m_options->verbose_p) {
       printf("symbol_insert: %s type %s class ? %s\n", id->u.s.s, smode, c2m_ctx->curr_class?"YES":"NO");
@@ -6593,7 +6593,7 @@ static void symbol_dump_one (symbol_t sym, void *arg) {
     pos = POS(sym.def_node);
 
   const char *smode = (sym.mode == S_TAG ? "s_tag" :
-                       sym.mode == S_REGULAR ? "s_regular" : "s_label");
+                       sym.mode == S_REGULARS ? "s_regular" : "s_label");
 
   fprintf (stderr, "Symbol: %s (%s), at %s:%d:%d\n",
            sym.id->u.s.s, smode,
@@ -7624,7 +7624,7 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
   if (!found_p) {
     // Classes need both, since they implement their own definition(tag)
     //if (r->code != N_CLASS)
-    //    symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
+    //    symbol_insert (c2m_ctx, S_REGULARS, id, scope, r, NULL);
     //else
         symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
   } else if (sym.def_node->code != r->code) {
@@ -7931,7 +7931,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
         error (c2m_ctx, POS (n), "double with short");
       break;
     case N_ID: {
-      node_t def = find_def (c2m_ctx, S_REGULAR, n, skip_struct_scopes (curr_scope), NULL);
+      node_t def = find_def (c2m_ctx, S_REGULARS, n, skip_struct_scopes (curr_scope), NULL);
       decl_t decl;
 
       set_type_pos_node (type, n);
@@ -7987,7 +7987,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
             // The def_node is the CLASS node (class_node_for_symbol) to which we attach .attr.
             node_t class_node_for_symbol = res_tag_type ? res_tag_type : n;
             if (id->code == N_ID) {
-                symbol_insert(c2m_ctx, S_REGULAR, id, curr_scope, class_node_for_symbol, NULL);
+                symbol_insert(c2m_ctx, S_REGULARS, id, curr_scope, class_node_for_symbol, NULL);
                 tpname_add(c2m_ctx, id, curr_scope, TRUE); // Register in tpname_tab
             }
 
@@ -8075,10 +8075,10 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
           id = NL_HEAD (en->u.ops);
           const_expr = NL_NEXT (id);
           check (c2m_ctx, const_expr, n);
-          if (symbol_find (c2m_ctx, S_REGULAR, id, enum_const_scope, &sym)) {
+          if (symbol_find (c2m_ctx, S_REGULARS, id, enum_const_scope, &sym)) {
             error (c2m_ctx, POS (id), "enum constant %s redeclaration", id->u.s.s);
           } else {
-            symbol_insert (c2m_ctx, S_REGULAR, id, enum_const_scope, en, n);
+            symbol_insert (c2m_ctx, S_REGULARS, id, enum_const_scope, en, n);
           }
           curr_val++;
           if (curr_val == 0) neg_p = FALSE;
@@ -8418,7 +8418,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     static node_code_t get_id_linkage (c2m_ctx_t c2m_ctx, int func_p, node_t id, node_t scope,
                                        struct decl_spec decl_spec) {
       node_code_t linkage;
-      node_t def = find_def (c2m_ctx, S_REGULAR, id, scope, NULL);
+      node_t def = find_def (c2m_ctx, S_REGULARS, id, scope, NULL);
 
       if (decl_spec.typedef_p) return N_IGNORE;                       // p6: no linkage
       if (decl_spec.static_p && scope == top_scope) return N_STATIC;  // p3: internal linkage
@@ -9147,7 +9147,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                 /* dict key handled later in check_dict_initializer */
               } else if (curr_type->mode != TM_STRUCT && curr_type->mode != TM_UNION && curr_type->mode != TM_CLASS) {
                 error (c2m_ctx, POS (curr_des), "field name not in struct, union or class initializer");
-              } else if (!symbol_find (c2m_ctx, S_REGULAR, id, curr_type->u.tag_type, &sym)) {
+              } else if (!symbol_find (c2m_ctx, S_REGULARS, id, curr_type->u.tag_type, &sym)) {
                 error (c2m_ctx, POS (curr_des), "unknown field %s in initializer", id->u.s.s);
               } else {
                 process_init_field_designator (c2m_ctx, sym.def_node, curr_type);
@@ -9264,9 +9264,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           VARR_PUSH (decl_t, func_decls_for_allocation, decl);
       }
       if (declarator->code == N_DECL) {
-        def_symbol (c2m_ctx, S_REGULAR, id, scope, decl_node, decl->decl_spec.linkage);
+        def_symbol (c2m_ctx, S_REGULARS, id, scope, decl_node, decl->decl_spec.linkage);
         if (scope != top_scope && decl->decl_spec.linkage == N_EXTERN)
-          def_symbol (c2m_ctx, S_REGULAR, id, top_scope, decl_node, N_EXTERN);
+          def_symbol (c2m_ctx, S_REGULARS, id, top_scope, decl_node, N_EXTERN);
         if (func_p && decl->decl_spec.thread_local_p) {
           error (c2m_ctx, POS (id), "thread local function declaration");
           if (c2m_options->message_file != NULL) {
@@ -9987,7 +9987,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         node_t aux_node = NULL;
         decl_t decl;
 
-        op1 = find_def (c2m_ctx, S_REGULAR, r, curr_scope, &aux_node);
+        op1 = find_def (c2m_ctx, S_REGULARS, r, curr_scope, &aux_node);
         e = create_expr (c2m_ctx, r);
         e->def_node = op1;
         if (op1 == NULL) {
@@ -10410,7 +10410,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           break;
         }
 
-        class_def = find_def (c2m_ctx, S_REGULAR, type_id, curr_scope, NULL);
+        class_def = find_def (c2m_ctx, S_REGULARS, type_id, curr_scope, NULL);
         e = create_expr (c2m_ctx, r);
         if (class_def == NULL || class_def->code != N_CLASS) {
           error (c2m_ctx, POS (r), "'new' requires a class type, '%s' is not a class",
@@ -10426,7 +10426,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 
         snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", type_id->u.s.s);
         ctor_id = build_id (c2m_ctx, ctor_name, POS (r));
-        ctor_def = find_def (c2m_ctx, S_REGULAR, ctor_id, curr_scope, NULL);
+        ctor_def = find_def (c2m_ctx, S_REGULARS, ctor_id, curr_scope, NULL);
 
         for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
           if (arg->code == N_FIELD_ID) has_named = TRUE;
@@ -10568,7 +10568,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           set_type_layout(c2m_ctx, _d->decl_spec.type); \
           _d->reg_p = scalar_type_p(_d->decl_spec.type); \
           _sd->attr = _d; \
-          symbol_insert(c2m_ctx, S_REGULAR, _copy, curr_scope, _sd, NULL); \
+          symbol_insert(c2m_ctx, S_REGULARS, _copy, curr_scope, _sd, NULL); \
         } while(0)
 
         if (forin_arr_p) {
@@ -10743,15 +10743,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
           break;
-        } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
-            !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
+        } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULARS, op2, t1->u.tag_type, &sym) &&
+            !(func = find_def(c2m_ctx, S_REGULARS, op2, t1->u.tag_type, &func_op)) )  {
             // FIXME: Needs to be able to find clsss cuntions
              if (t1->mode != TM_DICT) {
                if (t1->mode == TM_CLASS) {
                  /* TM_CLASS namespace static: variants dict member or bare variant as const */
                  node_t class_node = t1->u.tag_type;
                  symbol_t vsym;
-                 if (symbol_find(c2m_ctx, S_REGULAR, op2, class_node, &vsym)) {
+                 if (symbol_find(c2m_ctx, S_REGULARS, op2, class_node, &vsym)) {
                    decl = vsym.def_node->attr;
                    if (decl) {
                      *e->type = *decl->decl_spec.type;
@@ -10766,7 +10766,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                  node_t v_id = build_id(c2m_ctx, "variants", POS(op2));
                  symbol_t vsym2;
                  node_t valnode = NULL;
-                 if (symbol_find(c2m_ctx, S_REGULAR, v_id, class_node, &vsym2)) {
+                 if (symbol_find(c2m_ctx, S_REGULARS, v_id, class_node, &vsym2)) {
                    node_t vd = vsym2.def_node;
                    node_t vi = vd ? MEMBER_INIT(vd) : NULL;
                    node_t found_sub = NULL;
@@ -11118,7 +11118,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           prop_ne_p = strcmp(op1->u.s.s, PROP_NE) == 0;
           json_p = strcmp(op1->u.s.s, BUILTIN_JSON) == 0;
         }
-        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
+        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULARS, op1, curr_scope, NULL) == NULL) {
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
           va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
           if (!va_arg_p && !va_start_p && !alloca_p && !json_p) {
@@ -11317,7 +11317,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 	                node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
 
 	                // Find method definition in class scope
-	                node_t func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+	                node_t func_def = find_def(c2m_ctx, S_REGULARS, method_id, obj_type->u.tag_type, NULL);
 	                if (!func_def) {
 	                  error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
 	                  break;
@@ -11839,7 +11839,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                 } else {
                     node_t class_id = NL_HEAD(curr_class->u.ops);
                     if (class_id && class_id->code == N_ID) {
-                        class_def = find_def(c2m_ctx, S_REGULAR, class_id, curr_scope, NULL);
+                        class_def = find_def(c2m_ctx, S_REGULARS, class_id, curr_scope, NULL);
                         if (!class_def) class_def = find_def(c2m_ctx, S_TAG, class_id, curr_scope, NULL);
                     }
                 }
@@ -11885,7 +11885,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         next_p = NL_NEXT(p);
         if (p->code != N_ID) break;
         NL_REMOVE(param_list->u.ops, p);
-        if (!symbol_find(c2m_ctx, S_REGULAR, p, curr_scope, &sym)) {
+        if (!symbol_find(c2m_ctx, S_REGULARS, p, curr_scope, &sym)) {
             if (c2m_options->pedantic_p) {
                 error(c2m_ctx, POS(p), "parameter %s has no type", p->u.s.s);
             } else {
@@ -12315,7 +12315,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           node_t dtor_id, dtor_def;
           snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
           dtor_id = build_id (c2m_ctx, dtor_name, POS (r));
-          dtor_def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+          dtor_def = find_def (c2m_ctx, S_REGULARS, dtor_id, curr_scope, NULL);
           if (dtor_def != NULL && dtor_def->code == N_FUNC_DEF) r->attr = dtor_def;
         }
       }
@@ -14093,7 +14093,7 @@ check_one_value:
 
           /* field should be only in struct/union initializer */
           assert (curr_type->mode == TM_STRUCT || curr_type->mode == TM_UNION || curr_type->mode == TM_CLASS);
-          found_p = symbol_find (c2m_ctx, S_REGULAR, id, curr_type->u.tag_type, &sym);
+          found_p = symbol_find (c2m_ctx, S_REGULARS, id, curr_type->u.tag_type, &sym);
           assert (found_p); /* field should present */
           process_init_field_designator (c2m_ctx, sym.def_node, curr_type);
           ok_p = update_path_and_do (c2m_ctx, NL_NEXT (curr_des) == NULL, collect_init_els, mark,
@@ -16815,7 +16815,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         decl->u.item = MIR_new_forward (ctx, name);
         move_item_forward (c2m_ctx, decl->u.item);
       } else if (decl->used_p && decl->decl_spec.linkage != N_IGNORE) {
-        if (symbol_find (c2m_ctx, S_REGULAR, id,
+        if (symbol_find (c2m_ctx, S_REGULARS, id,
                          decl->decl_spec.linkage == N_EXTERN ? top_scope : decl->scope, &sym)
             && (decl->u.item = get_ref_item (c2m_ctx, sym.def_node, name)) == NULL) {
           for (i = 0; i < VARR_LENGTH (node_t, sym.defs); i++)
@@ -16832,7 +16832,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           if (decl->scope != top_scope && decl->decl_spec.static_p) {
             decl->u.item = MIR_new_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
           } else if (decl->scope == top_scope
-                     && symbol_find (c2m_ctx, S_REGULAR, id, top_scope, &sym)
+                     && symbol_find (c2m_ctx, S_REGULARS, id, top_scope, &sym)
                      && ((curr_decl = sym.def_node->attr)->u.item == NULL
                          || curr_decl->u.item->item_type != MIR_bss_item)) {
             for (i = 0; i < VARR_LENGTH (node_t, sym.defs); i++) {
@@ -17122,7 +17122,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         // RSD: Find the function symbol to get its definition context
         printf("DEBUG: Calling symbol_find for function %s\n", id->u.s.s);
     }
-    if (symbol_find(c2m_ctx, S_REGULAR, id, func_decl->scope, &sym)) {
+    if (symbol_find(c2m_ctx, S_REGULARS, id, func_decl->scope, &sym)) {
         // Check if the function is defined in a class context
         if (c2m_options->verbose_p) {
             printf("DEBUG: symbol_find SUCCESS for %s\n", id->u.s.s);
@@ -17722,7 +17722,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       {
         symbol_t ksym;
         MIR_type_t kt = MIR_T_I64;
-        if (symbol_find (c2m_ctx, S_REGULAR, key_id, r, &ksym) && ksym.def_node != NULL
+        if (symbol_find (c2m_ctx, S_REGULARS, key_id, r, &ksym) && ksym.def_node != NULL
             && ksym.def_node->attr != NULL)
           kt = promote_mir_int_type (
                  get_mir_type (c2m_ctx, ((decl_t) ksym.def_node->attr)->decl_spec.type));
@@ -17734,7 +17734,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
         symbol_t vsym;
         MIR_type_t vt = MIR_T_I64;
-        if (symbol_find (c2m_ctx, S_REGULAR, val_id, r, &vsym) && vsym.def_node != NULL
+        if (symbol_find (c2m_ctx, S_REGULARS, val_id, r, &vsym) && vsym.def_node != NULL
             && vsym.def_node->attr != NULL)
           vt = promote_mir_int_type (
                  get_mir_type (c2m_ctx, ((decl_t) vsym.def_node->attr)->decl_spec.type));
