@@ -3045,8 +3045,10 @@ static const char *nop_pats[] = {
   "\x0f\x1f\x80\x00\x00\x00\x00" /* 7: nopl 0x0(%rax) */,
 };
 
-/* ELF local-exec: materialize address of TLS symbol into hard reg.
-   Encoding matches gcc -fno-pie: mov %fs:0, %reg; add $sym@tpoff, %reg. */
+/* Native AOT TLS address into hard reg.
+   Linux:  mov %fs:0, %reg; add $sym@tpoff, %reg  (ELF LE)
+   Apple:  movq sym@TLVP(%rip), %rax; call *(%rax)  → &cell in %rax
+           (Mach-O TLV; dyld fills the slot / descriptor). */
 static void emit_tls_addr_le (gen_ctx_t gen_ctx, MIR_insn_t insn) {
   MIR_context_t ctx = gen_ctx->ctx;
   MIR_reg_t hreg;
@@ -3063,6 +3065,37 @@ static void emit_tls_addr_le (gen_ctx_t gen_ctx, MIR_insn_t insn) {
   gen_assert (sym != NULL && sym[0] != 0);
   r = (int) (hreg & 7);
 
+#if defined(__APPLE__)
+  /* Darwin x86_64 TLV (matches clang):
+       movq  sym@TLVP(%rip), %rdi   // &tlv_descriptor
+       callq *(%rdi)                // thunk(desc); returns &cell in %rax
+       [movq %rax, %reg]            // if dest != rax
+     First arg must be %rdi (System V / Apple). */
+  put_byte (gen_ctx, 0x48);
+  put_byte (gen_ctx, 0x8b);
+  put_byte (gen_ctx, 0x3d); /* movq disp32(%rip), %rdi */
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = R_X86_64_TLV;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  put_byte (gen_ctx, 0);
+  /* callq *(%rdi) — ff 17 */
+  put_byte (gen_ctx, 0xff);
+  put_byte (gen_ctx, 0x17);
+  if (hreg != AX_HARD_REG) {
+    /* movq %rax, %reg */
+    rex = 0x48;
+    if (hreg >= 8) rex |= 0x01;
+    put_byte (gen_ctx, rex);
+    put_byte (gen_ctx, 0x89);
+    put_byte (gen_ctx, 0xc0 | r);
+  }
+#else
   /* 64 48/4c 8b /r 04 25 00 00 00 00 — mov %fs:0, %reg */
   put_byte (gen_ctx, 0x64);
   rex = 0x48;
@@ -3097,6 +3130,7 @@ static void emit_tls_addr_le (gen_ctx_t gen_ctx, MIR_insn_t insn) {
   put_byte (gen_ctx, 0);
   put_byte (gen_ctx, 0);
   put_byte (gen_ctx, 0);
+#endif
 }
 
 static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
@@ -3117,7 +3151,11 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
       set_label_disp (gen_ctx, insn, curr_size); /* estimation */
     } else if (insn->code != MIR_USE) {
       if (tls_native_mov_p (gen_ctx, insn)) {
+#if defined(__APPLE__)
+        curr_size += 16; /* movq TLVP(%rip) + call *(%rax) [+ optional mov] */
+#else
         curr_size += 20; /* mov %fs:0 + add tpoff */
+#endif
         VARR_PUSH (int, insn_pattern_indexes, TLS_LE_PAT);
       } else {
         ind = find_insn_pattern (gen_ctx, insn, &max_insn_size);

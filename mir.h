@@ -322,6 +322,24 @@ DEF_VARR (MIR_var_t);
 #define R_X86_64_64   1  // 64-bit absolute relocation
 #define R_X86_64_TPOFF32 23 /* TLS local-exec: 32-bit offset from TP */
 
+/* AArch64 ELF local-exec (see aaelf64).  Used by mir-gen-aarch64 + b2obj. */
+#define R_AARCH64_ABS64 257
+#define R_AARCH64_TLSLE_ADD_TPREL_HI12 549
+#define R_AARCH64_TLSLE_ADD_TPREL_LO12_NC 551
+
+/* Mach-O arm64 TLV access (internal markers for b2objmac; match ARM64_RELOC_*).
+   Distinct from small x86_64 ELF type codes used on 10.12 Intel builds. */
+#define R_ARM64_TLVP_LOAD_PAGE21 0xA640008
+#define R_ARM64_TLVP_LOAD_PAGEOFF12 0xA640009
+#define R_ARM64_PAGE21 0xA640003
+#define R_ARM64_PAGEOFF12 0xA640004
+#define R_ARM64_BRANCH26 0xA640002
+#define R_ARM64_UNSIGNED 0xA640000
+
+/* Mach-O x86_64 TLV: maps to X86_64_RELOC_TLV (9).  Distinct from GOTPCREL (9)
+   only by context — use a high code so b2objmac can tell them apart. */
+#define R_X86_64_TLV 0x86000009
+
 struct MIR_code_reloc {
   size_t offset;
   const void *value;
@@ -604,8 +622,12 @@ extern void *mir_tls_addr (uint32_t id, size_t offset);
 extern void mir_tls_unregister (uint32_t id);
 
 /* When set before MIR_load_module, TLS refs are NOT rewritten to mir_tls_addr
-   calls.  b2obj uses this with gen_object_file to emit ELF LE (%fs + TPOFF).
-   JIT/interp leave this clear (emulated TLS). */
+   calls.  Object writers use this with gen_object_file for native TLS:
+     - Linux x86_64:  ELF LE (%fs + TPOFF)
+     - Linux aarch64: ELF LE (TPIDR_EL0 + TLSLE ADD)
+     - macOS aarch64: Mach-O TLV (__thread_vars + TLVP relocs)
+   JIT/interp leave this clear (emulated TLS via mir_tls_addr).  macOS x86_64
+   (incl. 10.12) keeps emulated AOT unless extended later. */
 extern void MIR_set_tls_native_aot (MIR_context_t ctx, int on);
 extern int MIR_tls_native_aot_p (MIR_context_t ctx);
 extern MIR_item_t MIR_new_ref_data (MIR_context_t ctx, const char *name, MIR_item_t item,

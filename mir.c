@@ -59,7 +59,7 @@ struct MIR_context {
   struct interp_ctx *interp_ctx;
   void *setjmp_addr;      /* used in interpreter to call setjmp directly not from a shim and FFI */
   void *wrapper_end_addr; /* used by generator */
-  int tls_native_aot_p;   /* b2obj: ELF LE TLS; skip emulated mir_tls_addr rewrite */
+  int tls_native_aot_p;   /* AOT object: native TLS (ELF LE / Mach-O TLV); skip mir_tls_addr */
 };
 
 #define error_func ctx->error_func

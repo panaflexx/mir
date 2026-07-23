@@ -716,6 +716,8 @@ struct target_ctx {
   VARR (label_ref_t) * label_refs;
   VARR (uint64_t) * abs_address_locs;
   VARR (MIR_code_reloc_t) * relocs;
+  /* Object-file relocs (func-relative offsets) for b2obj / b2objmac TLS etc. */
+  VARR (MIR_code_reloc_t) * obj_relocs;
 };
 
 #define alloca_p gen_ctx->target_ctx->alloca_p
@@ -733,6 +735,7 @@ struct target_ctx {
 #define label_refs gen_ctx->target_ctx->label_refs
 #define abs_address_locs gen_ctx->target_ctx->abs_address_locs
 #define relocs gen_ctx->target_ctx->relocs
+#define obj_relocs gen_ctx->target_ctx->obj_relocs
 
 static MIR_disp_t target_get_stack_slot_offset (gen_ctx_t gen_ctx, MIR_type_t type MIR_UNUSED,
                                                 MIR_reg_t slot) {
@@ -2469,6 +2472,77 @@ static int target_insn_ok_p (gen_ctx_t gen_ctx, MIR_insn_t insn) {
 
 static void target_split_insns (gen_ctx_t gen_ctx MIR_UNUSED) {}
 
+/* Native AOT: materialize address of a TLS symbol into a hard reg.
+   Linux:  mrs xt, tpidr_el0; add xt, xt, #:tprel_hi12:sym, lsl#12;
+           add xt, xt, #:tprel_lo12_nc:sym
+   Apple:  TLVP load of tlv_descriptor + call thunk (returns cell in x0).
+           LR is saved/restored; x16/x17 used as temps. */
+static void emit_tls_addr_native (gen_ctx_t gen_ctx, MIR_insn_t insn) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  MIR_reg_t hreg;
+  MIR_item_t tls_item;
+  const char *sym;
+  MIR_code_reloc_t reloc;
+  unsigned rd;
+
+  gen_assert (insn->ops[0].mode == MIR_OP_VAR);
+  hreg = insn->ops[0].u.var;
+  gen_assert (hreg < V0_HARD_REG && hreg != SP_HARD_REG);
+  tls_item = insn->ops[1].u.ref;
+  sym = MIR_item_name (ctx, tls_item);
+  gen_assert (sym != NULL && sym[0] != 0);
+  rd = (unsigned) hreg;
+
+#if defined(__APPLE__)
+  /* Darwin arm64 TLV (clang -fno-pic style):
+       adrp x0, sym@TLVPPAGE
+       ldr  x0, [x0, sym@TLVPPAGEOFF]   // x0 = &tlv_descriptor
+       ldr  x16, [x0]                   // thunk
+       blr  x16                         // returns &cell in x0
+     LR saved/restored; result moved to hreg if needed. */
+  put_uint64 (gen_ctx, 0xf81f0ffeULL, 4); /* str x30, [sp, #-16]! */
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = R_ARM64_TLVP_LOAD_PAGE21;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_uint64 (gen_ctx, 0x90000000ULL, 4); /* adrp x0, #0 */
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = R_ARM64_TLVP_LOAD_PAGEOFF12;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_uint64 (gen_ctx, 0xf9400000ULL, 4); /* ldr x0, [x0] */
+  put_uint64 (gen_ctx, 0xf9400010ULL, 4); /* ldr x16, [x0] */
+  put_uint64 (gen_ctx, 0xd63f0200ULL, 4); /* blr x16 */
+  if (rd != R0_HARD_REG)
+    put_uint64 (gen_ctx, 0xaa0003e0ULL | rd, 4); /* mov xd, x0 */
+  put_uint64 (gen_ctx, 0xf84107feULL, 4); /* ldr x30, [sp], #16 */
+#else
+  /* ELF local-exec: TP + TPREL */
+  /* mrs xd, tpidr_el0  (S3_3_C13_C0_2) */
+  put_uint64 (gen_ctx, 0xd53bd040ULL | rd, 4);
+  /* add xd, xd, #:tprel_hi12:sym, lsl #12 */
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = R_AARCH64_TLSLE_ADD_TPREL_HI12;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_uint64 (gen_ctx, 0x91400000ULL | (rd << 5) | rd, 4);
+  /* add xd, xd, #:tprel_lo12_nc:sym */
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = R_AARCH64_TLSLE_ADD_TPREL_LO12_NC;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_uint64 (gen_ctx, 0x91000000ULL | (rd << 5) | rd, 4);
+#endif
+}
+
 static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
   MIR_context_t ctx = gen_ctx->ctx;
   size_t i;
@@ -2479,11 +2553,16 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
   VARR_TRUNC (uint8_t, result_code, 0);
   VARR_TRUNC (label_ref_t, label_refs, 0);
   VARR_TRUNC (uint64_t, abs_address_locs, 0);
+  VARR_TRUNC (MIR_code_reloc_t, obj_relocs, 0);
   for (insn = DLIST_HEAD (MIR_insn_t, curr_func_item->u.func->insns); insn != NULL;
        insn = DLIST_NEXT (MIR_insn_t, insn)) {
     if (insn->code == MIR_LABEL) {
       set_label_disp (gen_ctx, insn, VARR_LENGTH (uint8_t, result_code));
     } else if (insn->code != MIR_USE) {
+      if (tls_native_mov_p (gen_ctx, insn)) {
+        emit_tls_addr_native (gen_ctx, insn);
+        continue;
+      }
       replacement = find_insn_pattern_replacement (gen_ctx, insn);
       if (replacement == NULL) {
         fprintf (stderr, "fatal failure in matching insn:");
@@ -2525,14 +2604,21 @@ static void target_rebase (gen_ctx_t gen_ctx, uint8_t *base) {
   MIR_code_reloc_t reloc;
 
   VARR_TRUNC (MIR_code_reloc_t, relocs, 0);
-  for (size_t i = 0; i < VARR_LENGTH (uint64_t, abs_address_locs); i++) {
-    reloc.offset = VARR_GET (uint64_t, abs_address_locs, i);
-    reloc.value = base + get_int64 (base + reloc.offset, 8);
-    VARR_PUSH (MIR_code_reloc_t, relocs, reloc);
+  if (!gen_ctx->gen_object_file) {
+    for (size_t i = 0; i < VARR_LENGTH (uint64_t, abs_address_locs); i++) {
+      reloc.offset = VARR_GET (uint64_t, abs_address_locs, i);
+      reloc.value = base + get_int64 (base + reloc.offset, 8);
+      VARR_PUSH (MIR_code_reloc_t, relocs, reloc);
+    }
+    _MIR_update_code_arr (gen_ctx->ctx, base, VARR_LENGTH (MIR_code_reloc_t, relocs),
+                          VARR_ADDR (MIR_code_reloc_t, relocs));
   }
-  _MIR_update_code_arr (gen_ctx->ctx, base, VARR_LENGTH (MIR_code_reloc_t, relocs),
-                        VARR_ADDR (MIR_code_reloc_t, relocs));
   gen_setup_lrefs (gen_ctx, base);
+  if (gen_ctx->gen_object_file) {
+    _MIR_set_func_code_relocs (gen_ctx->ctx, curr_func_item->u.func,
+                               VARR_ADDR (MIR_code_reloc_t, obj_relocs),
+                               VARR_LENGTH (MIR_code_reloc_t, obj_relocs));
+  }
 }
 
 static void target_change_to_direct_calls (MIR_context_t ctx MIR_UNUSED) {}
@@ -2665,6 +2751,7 @@ static void target_init (gen_ctx_t gen_ctx) {
   VARR_CREATE (label_ref_t, label_refs, alloc, 0);
   VARR_CREATE (uint64_t, abs_address_locs, alloc, 0);
   VARR_CREATE (MIR_code_reloc_t, relocs, alloc, 0);
+  VARR_CREATE (MIR_code_reloc_t, obj_relocs, alloc, 0);
   patterns_init (gen_ctx);
   temp_jump = MIR_new_insn (ctx, MIR_JMP, MIR_new_label_op (ctx, NULL));
   temp_jump_replacement = find_insn_pattern_replacement (gen_ctx, temp_jump);
@@ -2678,6 +2765,7 @@ static void target_finish (gen_ctx_t gen_ctx) {
   VARR_DESTROY (label_ref_t, label_refs);
   VARR_DESTROY (uint64_t, abs_address_locs);
   VARR_DESTROY (MIR_code_reloc_t, relocs);
+  VARR_DESTROY (MIR_code_reloc_t, obj_relocs);
   MIR_free (alloc, gen_ctx->target_ctx);
   gen_ctx->target_ctx = NULL;
 }
