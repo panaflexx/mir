@@ -1748,9 +1748,9 @@ static const struct pattern patterns[] = {
   // i2ld, ui2ld, ld2i, f2ld, d2ld, ld2f, ld2d are builtins
 
   {MIR_CALL, "X r $", "d63f0000:fffffc1f rn1"},   /* blr *Rn */
-  {MIR_CALL, "X L $", "94000000:fc000000 rn1"},   /* bl address */
+  {MIR_CALL, "X L $", "94000000:fc000000 L"},     /* bl label/symbol (BRANCH26) */
   {MIR_INLINE, "X r $", "d63f0000:fffffc1f rn1"}, /* blr *Rn */
-  {MIR_INLINE, "X L $", "94000000:fc000000 rn1"}, /* bl address */
+  {MIR_INLINE, "X L $", "94000000:fc000000 L"},   /* bl label/symbol (BRANCH26) */
   {MIR_RET, "$", "d65f0000:fffffc1f hn1e"},       /* ret R30  */
 
   {MIR_JCALL, "X r $", "d61f0000:fffffc00 rn1"}, /* br r1 */
@@ -2170,6 +2170,7 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
   const char *p, *insn_str;
   label_ref_t lr;
   int switch_table_adr_insn_start = -1;
+  const char *branch_obj_sym = NULL; /* object-file: bl/b target symbol (BRANCH26) */
 
   if (insn->code == MIR_ALLOCA
       && (insn->ops[1].mode == MIR_OP_INT || insn->ops[1].mode == MIR_OP_UINT))
@@ -2349,6 +2350,12 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
         if (insn->code == MIR_LADDR || insn->code == MIR_CALL || insn->code == MIR_INLINE) nop = 1;
         op = insn->ops[nop];
         gen_assert (op.mode == MIR_OP_LABEL || (start_ch == 'L' && op.mode == MIR_OP_REF));
+        if (start_ch == 'L' && op.mode == MIR_OP_REF && gen_ctx->gen_object_file) {
+          /* Direct bl to symbol — linker fills imm26 (no PC fixup here). */
+          branch_obj_sym = MIR_item_name (ctx, op.u.ref);
+          gen_assert (branch_obj_sym != NULL && branch_obj_sym[0] != 0);
+          break;
+        }
         lr.abs_addr_p = FALSE;
         lr.short_p = start_ch == 'l';
         lr.label_val_disp = 0;
@@ -2427,6 +2434,16 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
     [label_ref_num].label_val_disp = VARR_LENGTH (uint8_t, result_code);
 
     if (switch_table_addr_p) switch_table_adr_insn_start = VARR_LENGTH (uint8_t, result_code);
+    if (branch_obj_sym != NULL) {
+      MIR_code_reloc_t reloc;
+      reloc.offset = VARR_LENGTH (uint8_t, result_code);
+      reloc.value = NULL;
+      reloc.symbol = branch_obj_sym;
+      reloc.type = R_ARM64_BRANCH26;
+      reloc.addend = 0;
+      VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+      branch_obj_sym = NULL;
+    }
     put_uint64 (gen_ctx, opcode, 4); /* output the machine insn */
 
     if (*p == 0) break;
@@ -2471,6 +2488,66 @@ static int target_insn_ok_p (gen_ctx_t gen_ctx, MIR_insn_t insn) {
 }
 
 static void target_split_insns (gen_ctx_t gen_ctx MIR_UNUSED) {}
+
+/* Object-file AOT: materialize &sym into hard reg rd without baking JIT
+   addresses.  Local (func/data/bss): adrp+add (PAGE21/PAGEOFF12).  Import /
+   forward / other: adrp+ldr GOT (GOT_LOAD_PAGE*).  Matches clang -fPIC style
+   and is PIE-safe; pairs with b2objmac ARM64_RELOC_* emission. */
+static int obj_ref_use_got_p (MIR_item_t item) {
+  if (item == NULL) return 1;
+  switch (item->item_type) {
+  case MIR_func_item:
+  case MIR_data_item:
+  case MIR_bss_item:
+  case MIR_ref_data_item: return 0;
+  default: return 1; /* import, forward, proto-only, etc. */
+  }
+}
+
+static void emit_obj_ref_addr (gen_ctx_t gen_ctx, MIR_reg_t hreg, MIR_item_t item) {
+  MIR_context_t ctx = gen_ctx->ctx;
+  const char *sym;
+  MIR_code_reloc_t reloc;
+  unsigned rd;
+  int use_got;
+
+  gen_assert (gen_ctx->gen_object_file);
+  gen_assert (hreg < V0_HARD_REG && hreg != SP_HARD_REG);
+  gen_assert (item != NULL);
+  sym = MIR_item_name (ctx, item);
+  gen_assert (sym != NULL && sym[0] != 0);
+  rd = (unsigned) hreg;
+  use_got = obj_ref_use_got_p (item);
+
+  /* adrp xd, #0  (+ PAGE21 or GOT_LOAD_PAGE21) */
+  reloc.offset = VARR_LENGTH (uint8_t, result_code);
+  reloc.value = NULL;
+  reloc.symbol = sym;
+  reloc.type = use_got ? R_ARM64_GOT_LOAD_PAGE21 : R_ARM64_PAGE21;
+  reloc.addend = 0;
+  VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+  put_uint64 (gen_ctx, 0x90000000ULL | rd, 4);
+
+  if (use_got) {
+    /* ldr xd, [xd, #0]  (+ GOT_LOAD_PAGEOFF12) */
+    reloc.offset = VARR_LENGTH (uint8_t, result_code);
+    reloc.value = NULL;
+    reloc.symbol = sym;
+    reloc.type = R_ARM64_GOT_LOAD_PAGEOFF12;
+    reloc.addend = 0;
+    VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+    put_uint64 (gen_ctx, 0xf9400000ULL | (rd << 5) | rd, 4);
+  } else {
+    /* add xd, xd, #0  (+ PAGEOFF12) */
+    reloc.offset = VARR_LENGTH (uint8_t, result_code);
+    reloc.value = NULL;
+    reloc.symbol = sym;
+    reloc.type = R_ARM64_PAGEOFF12;
+    reloc.addend = 0;
+    VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+    put_uint64 (gen_ctx, 0x91000000ULL | (rd << 5) | rd, 4);
+  }
+}
 
 /* Native AOT: materialize address of a TLS symbol into a hard reg.
    Linux:  mrs xt, tpidr_el0; add xt, xt, #:tprel_hi12:sym, lsl#12;
@@ -2563,6 +2640,13 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
         emit_tls_addr_native (gen_ctx, insn);
         continue;
       }
+      /* Object AOT: never bake ref->addr into movz/movk (those are JIT
+         process addresses).  Materialize with adrp/add or adrp/ldr@GOT. */
+      if (gen_ctx->gen_object_file && insn->code == MIR_MOV
+          && insn->ops[0].mode == MIR_OP_VAR && insn->ops[1].mode == MIR_OP_REF) {
+        emit_obj_ref_addr (gen_ctx, insn->ops[0].u.var, insn->ops[1].u.ref);
+        continue;
+      }
       replacement = find_insn_pattern_replacement (gen_ctx, insn);
       if (replacement == NULL) {
         fprintf (stderr, "fatal failure in matching insn:");
@@ -2589,9 +2673,19 @@ static uint8_t *target_translate (gen_ctx_t gen_ctx, size_t *len) {
         *(uint32_t *) (VARR_ADDR (uint8_t, result_code) + lr.label_val_disp)
           |= (offset / 4) & 0x3ffffff; /* 26-bit */
     } else {
-      set_int64 (&VARR_ADDR (uint8_t, result_code)[lr.label_val_disp],
-                 (int64_t) get_label_disp (gen_ctx, lr.u.label), 8);
+      int64_t label_disp = (int64_t) get_label_disp (gen_ctx, lr.u.label);
+      set_int64 (&VARR_ADDR (uint8_t, result_code)[lr.label_val_disp], label_disp, 8);
       VARR_PUSH (uint64_t, abs_address_locs, lr.label_val_disp);
+      if (gen_ctx->gen_object_file) {
+        /* Absolute label address = this function + label_disp. */
+        MIR_code_reloc_t reloc;
+        reloc.offset = lr.label_val_disp;
+        reloc.value = NULL;
+        reloc.symbol = curr_func_item->u.func->name;
+        reloc.type = R_ARM64_UNSIGNED;
+        reloc.addend = label_disp;
+        VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+      }
     }
   }
   while (VARR_LENGTH (uint8_t, result_code) % 16 != 0) /* Align the pool */

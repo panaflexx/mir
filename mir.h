@@ -327,14 +327,16 @@ DEF_VARR (MIR_var_t);
 #define R_AARCH64_TLSLE_ADD_TPREL_HI12 549
 #define R_AARCH64_TLSLE_ADD_TPREL_LO12_NC 551
 
-/* Mach-O arm64 TLV access (internal markers for b2objmac; match ARM64_RELOC_*).
+/* Mach-O arm64 reloc markers for b2objmac (low nibble = ARM64_RELOC_*).
    Distinct from small x86_64 ELF type codes used on 10.12 Intel builds. */
-#define R_ARM64_TLVP_LOAD_PAGE21 0xA640008
-#define R_ARM64_TLVP_LOAD_PAGEOFF12 0xA640009
+#define R_ARM64_UNSIGNED 0xA640000
+#define R_ARM64_BRANCH26 0xA640002
 #define R_ARM64_PAGE21 0xA640003
 #define R_ARM64_PAGEOFF12 0xA640004
-#define R_ARM64_BRANCH26 0xA640002
-#define R_ARM64_UNSIGNED 0xA640000
+#define R_ARM64_GOT_LOAD_PAGE21 0xA640005
+#define R_ARM64_GOT_LOAD_PAGEOFF12 0xA640006
+#define R_ARM64_TLVP_LOAD_PAGE21 0xA640008
+#define R_ARM64_TLVP_LOAD_PAGEOFF12 0xA640009
 
 /* Mach-O x86_64 TLV: maps to X86_64_RELOC_TLV (9).  Distinct from GOTPCREL (9)
    only by context — use a high code so b2objmac can tell them apart. */

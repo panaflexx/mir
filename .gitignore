@@ -10,3 +10,5 @@
 /mir-run
 /build
 /.cache
+CMakeCache.txt
+CMakeFiles
