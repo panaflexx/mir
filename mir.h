@@ -666,6 +666,9 @@ extern void MIR_finish_module (MIR_context_t ctx);
 
 extern MIR_error_func_t MIR_get_error_func (MIR_context_t ctx);
 extern void MIR_set_error_func (MIR_context_t ctx, MIR_error_func_t func);
+/* Install a hook run at MIR_finish time; used by mir-debug-gdb.c to unregister
+   GDB-JIT debug objects bound to this context. */
+extern void _MIR_set_gdb_jit_finish (MIR_context_t ctx, void (*finish) (MIR_context_t ctx));
 
 extern MIR_alloc_t MIR_get_alloc (MIR_context_t ctx);
 

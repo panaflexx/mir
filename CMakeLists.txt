@@ -41,7 +41,13 @@ message("C compiler flags: ${CMAKE_C_FLAGS}")
 option(BUILD_TESTING "" ON)
 include(CTest)
 
-add_library(mir OBJECT mir.c mir-gen.c mir-tls.c c2mir/c2mir.c mir.h mir-gen.h c2mir/c2mir.h)
+# mir-debug-gdb.c is the GDB JIT interface (from the mir-madc fork): it owns the
+# process-global __jit_debug_descriptor and publishes an in-memory debug object
+# to gdb.  Its companion DWARF/object builder (mir-debug.c) is deliberately NOT
+# vendored yet -- it defines its own MIR_line_map_t, which collides with the one
+# classyc already has in mir-dbinfo.h; adopting it needs that type reconciled.
+add_library(mir OBJECT mir.c mir-gen.c mir-tls.c c2mir/c2mir.c mir-debug-gdb.c
+                      mir.h mir-gen.h mir-debug.h c2mir/c2mir.h)
 target_include_directories(mir PRIVATE ${PROJECT_SOURCE_DIR})
 # Report unused functions to help keep c2mir.c clean of dead code:
 set_source_files_properties(c2mir/c2mir.c PROPERTIES COMPILE_FLAGS "-Wunused-function")

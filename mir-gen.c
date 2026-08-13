@@ -1636,6 +1636,18 @@ static void rename_op_reg (gen_ctx_t gen_ctx, MIR_op_t *op_ref, MIR_reg_t reg, M
   });
 }
 
+/* O(1) equivalent of `MIR_reg_hard_reg_name (ctx, var - MAX_HARD_REG, func) != NULL`
+   for an operand var.  MIR_reg_hard_reg_name goes through find_rd_by_reg, which
+   pushes a temp descriptor, hashes, does an HTAB_FIND and pops -- far too costly
+   for the per-instruction GVN predicates below, where it dominated codegen of
+   large functions.  tied_regs holds exactly "reg is tied to a hard reg": it is
+   filled in build_func_cfg and kept current through SSA renaming (get_new_reg).
+   A var that *is* a hard reg counts as tied, which is the conservative answer
+   for every caller here (it only ever suppresses a transformation). */
+static inline int gen_tied_var_p (gen_ctx_t gen_ctx, MIR_reg_t var) {
+  return var <= MAX_HARD_REG || bitmap_bit_p (tied_regs, var);
+}
+
 static void update_tied_regs (gen_ctx_t gen_ctx, MIR_reg_t reg) {
   gen_assert (reg > MAX_HARD_REG);
   if (reg == MIR_NON_VAR
@@ -2416,8 +2428,23 @@ static void add_phi_operands (gen_ctx_t gen_ctx, MIR_reg_t reg, bb_insn_t phi) {
 }
 
 static bb_insn_t skip_redundant_phis (bb_insn_t def) {
-  while (def->insn->code == MIR_PHI && def != def->insn->ops[0].data) def = def->insn->ops[0].data;
-  return def;
+  bb_insn_t root = def, next;
+
+  while (root->insn->code == MIR_PHI && root != root->insn->ops[0].data)
+    root = root->insn->ops[0].data;
+  /* Path compression.  ops[0].data is a union-find parent link here: create_phi
+     makes a new phi its own root, and a phi found redundant is repointed at its
+     replacement.  Collapsing the traversed chain onto the root keeps the meaning
+     identical but turns later lookups into O(1).  minimize_ssa re-walks these
+     chains for every phi operand on every iteration of its fixpoint loop, so
+     without compression the walks dominate SSA construction on big functions. */
+  while (def != root && def->insn->code == MIR_PHI) {
+    next = def->insn->ops[0].data;
+    if (next == def) break; /* a root: leave it alone */
+    def->insn->ops[0].data = root;
+    def = next;
+  }
+  return root;
 }
 
 static void minimize_ssa (gen_ctx_t gen_ctx, size_t insns_num) {
@@ -2429,6 +2456,20 @@ static void minimize_ssa (gen_ctx_t gen_ctx, size_t insns_num) {
   insn_var_iterator_t iter;
 
   VARR_TRUNC (bb_insn_t, deleted_phis, 0);
+  /* Process phis from newest to oldest.  Removing trivial phis is a monotone
+     fixpoint, so the final set is independent of visiting order -- but the order
+     decides how many sweeps it takes.  Phis are appended as they are created,
+     and a phi's operands are usually defined by phis created before it, so the
+     creation order makes each sweep resolve only one link of a chain.  Walking
+     newest-first collapses whole chains per sweep: on the SQLite amalgamation
+     this cut inner phi visits from 117.4M to 7.7M (50.3 -> 3.3 visits per phi)
+     and the worst function from 515 sweeps to 65, with an identical result
+     (2,288,897 phis removed either way). */
+  { size_t a = 0, b = VARR_LENGTH (bb_insn_t, phis);
+    bb_insn_t *pa = VARR_ADDR (bb_insn_t, phis), tmp;
+    if (b > 0)
+      for (b--; a < b; a++, b--) { tmp = pa[a]; pa[a] = pa[b]; pa[b] = tmp; }
+  }
   do {
     change_p = FALSE;
     saved_bound = 0;
@@ -2781,7 +2822,14 @@ static void build_ssa (gen_ctx_t gen_ctx, int rename_p) {
 
   gen_assert (VARR_LENGTH (bb_insn_t, arg_bb_insns) == 0
               && VARR_LENGTH (bb_insn_t, undef_insns) == 0);
-  HTAB_CLEAR (def_tab_el_t, def_tab);
+  /* Recreate instead of clearing.  HTAB_CLEAR rewrites the *entire* entries
+     array, and these tables are reused across functions, so they keep the size
+     of the largest function ever compiled.  With ~2.5K functions in the SQLite
+     amalgamation that meant every tiny function paid to blank a table sized for
+     sqlite3VdbeExec -- 13s of pure memset, half of build_ssa. */
+  HTAB_DESTROY (def_tab_el_t, def_tab);
+  HTAB_CREATE (def_tab_el_t, def_tab, gen_alloc (gen_ctx), 1024, def_tab_el_hash, def_tab_el_eq,
+               gen_ctx);
   VARR_TRUNC (bb_t, worklist, 0);
   for (bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb))
     VARR_PUSH (bb_t, worklist, bb);
@@ -3941,22 +3989,40 @@ static int add_sub_const_insn_p (gen_ctx_t gen_ctx, MIR_insn_t insn, int64_t *va
     return FALSE;
   MIR_func_t func = curr_func_item->u.func;
   if (insn->ops[1].mode == MIR_OP_VAR
-      && MIR_reg_hard_reg_name (gen_ctx->ctx, insn->ops[1].u.var - MAX_HARD_REG, func) != NULL)
+      && gen_tied_var_p (gen_ctx, insn->ops[1].u.var))
     return FALSE;
   *val = insn->code == MIR_SUB || insn->code == MIR_SUBS ? -def_bb_insn->gvn_val
                                                          : def_bb_insn->gvn_val;
   return TRUE;
 }
 
+/* Walk back through a chain of register moves to the insn that really defines
+   the value.  The chain can be *cyclic*: conventional SSA inserts copies on
+   predecessor edges, so a phi web can yield r1 = r2; r2 = r1.  Following that
+   naively never terminates -- it hung codegen of several SQLite functions
+   (parseModifier, valueFromExpr, ...) for hours.  Detect a cycle with Floyd's
+   two-pointer walk (O(1) extra memory, no arbitrary iteration cap) and stop:
+   returning a move insn simply means the caller finds nothing to fold, which
+   is always safe. */
 static MIR_insn_t skip_moves (gen_ctx_t gen_ctx, MIR_insn_t insn) {
   ssa_edge_t se;
   MIR_func_t func = curr_func_item->u.func;
+  MIR_insn_t slow = insn;
+  int advance_slow_p = FALSE;
 
   while (insn->code == MIR_MOV && insn->ops[1].mode == MIR_OP_VAR) {
-    if ((se = insn->ops[1].data) == NULL
-        || MIR_reg_hard_reg_name (gen_ctx->ctx, insn->ops[1].u.var - MAX_HARD_REG, func) != NULL)
+    if ((se = insn->ops[1].data) == NULL || gen_tied_var_p (gen_ctx, insn->ops[1].u.var))
       return insn;
     insn = se->def->insn;
+    if (advance_slow_p) { /* slow advances one step per two fast steps */
+      ssa_edge_t slow_se;
+      if (slow->code != MIR_MOV || slow->ops[1].mode != MIR_OP_VAR
+          || (slow_se = slow->ops[1].data) == NULL)
+        break; /* slow hit the end: no cycle on this path */
+      slow = slow_se->def->insn;
+    }
+    advance_slow_p = !advance_slow_p;
+    if (insn == slow) return insn; /* cycle */
   }
   return insn;
 }
@@ -4517,8 +4583,8 @@ static void gvn_modify (gen_ctx_t gen_ctx) {
         const_p = gvn_phi_val (bb_insn, &val);
         if (const_p) break;
         if (insn->nops == 2 && insn->ops[0].mode == MIR_OP_VAR && insn->ops[1].mode == MIR_OP_VAR
-            && MIR_reg_hard_reg_name (ctx, insn->ops[0].u.var - MAX_HARD_REG, func) == NULL
-            && MIR_reg_hard_reg_name (ctx, insn->ops[1].u.var - MAX_HARD_REG, func) == NULL) {
+            && !gen_tied_var_p (gen_ctx, insn->ops[0].u.var)
+            && !gen_tied_var_p (gen_ctx, insn->ops[1].u.var)) {
           remove_copy (gen_ctx, insn);
           continue;
         }
@@ -4851,9 +4917,8 @@ static void gvn_modify (gen_ctx_t gen_ctx) {
           update_mem_availability (gen_ctx, curr_available_mem, bb_insn);
         } else if (move_p (insn) && (se = insn->ops[1].data) != NULL && !fake_insn_p (se->def)
                    && (se = se->def->insn->ops[se->def_op_num].data) != NULL && se->next_use == NULL
-                   && MIR_reg_hard_reg_name (ctx, insn->ops[0].u.var - MAX_HARD_REG, func) == NULL
-                   && MIR_reg_hard_reg_name (ctx, insn->ops[1].u.var - MAX_HARD_REG, func)
-                        == NULL) {
+                   && !gen_tied_var_p (gen_ctx, insn->ops[0].u.var)
+                   && !gen_tied_var_p (gen_ctx, insn->ops[1].u.var)) {
           /* one source for definition: remove copy */
           gen_assert (se->use == bb_insn && se->use_op_num == 1);
           remove_copy (gen_ctx, insn);
@@ -5055,9 +5120,12 @@ static void gvn (gen_ctx_t gen_ctx) {
 }
 
 static void gvn_clear (gen_ctx_t gen_ctx) {
-  HTAB_CLEAR (expr_t, expr_tab);
+  MIR_alloc_t alloc = gen_alloc (gen_ctx); /* see the note in build_ssa on clear vs recreate */
+  HTAB_DESTROY (expr_t, expr_tab);
+  HTAB_CREATE (expr_t, expr_tab, alloc, 1024, expr_hash, expr_eq, gen_ctx);
   while (VARR_LENGTH (expr_t, exprs) != 0) gen_free (gen_ctx, VARR_POP (expr_t, exprs));
-  HTAB_CLEAR (mem_expr_t, mem_expr_tab);
+  HTAB_DESTROY (mem_expr_t, mem_expr_tab);
+  HTAB_CREATE (mem_expr_t, mem_expr_tab, alloc, 512, mem_expr_hash, mem_expr_eq, gen_ctx);
   while (VARR_LENGTH (mem_expr_t, mem_exprs) != 0) gen_free (gen_ctx, VARR_POP (mem_expr_t, mem_exprs));
 }
 
@@ -7390,6 +7458,9 @@ struct ra_ctx {
   VARR (bitmap_t) * used_locs, *busy_used_locs; /* indexed by bb or point */
   VARR (bitmap_t) * var_bbs;
   VARR (lr_gap_t) * spill_gaps, *curr_gaps; /* used to find live ranges to spill */
+  /* Per-live-range unions of used/busy locs over the range's points, rebuilt at
+     each get_hard_reg_with_split call and reused across all hard regs. */
+  VARR (bitmap_t) * lr_all_unions, *lr_busy_unions;
   bitmap_t lr_gap_bitmaps[MAX_HARD_REG + 1];
   HTAB (lr_gap_t) * lr_gap_tab;
   VARR (spill_el_t) * spill_els;
@@ -7409,6 +7480,8 @@ struct ra_ctx {
 #define var_bbs gen_ctx->ra_ctx->var_bbs
 #define spill_gaps gen_ctx->ra_ctx->spill_gaps
 #define curr_gaps gen_ctx->ra_ctx->curr_gaps
+#define lr_all_unions gen_ctx->ra_ctx->lr_all_unions
+#define lr_busy_unions gen_ctx->ra_ctx->lr_busy_unions
 #define lr_gap_bitmaps gen_ctx->ra_ctx->lr_gap_bitmaps
 #define lr_gap_tab gen_ctx->ra_ctx->lr_gap_tab
 #define spill_els gen_ctx->ra_ctx->spill_els
@@ -7517,7 +7590,16 @@ static MIR_reg_t get_hard_reg (gen_ctx_t gen_ctx, MIR_reg_t type, bitmap_t confl
     if (bitmap_bit_p (conflict_locs, hreg)) continue;
     if (!target_hard_reg_type_ok_p (hreg, type) || target_fixed_hard_reg_p (hreg)) continue;
     if ((nregs = target_locs_num (hreg, type)) > 1) {
+      /* This is a property of *this* hreg.  When candidates are visited in
+         increasing order every later hreg fails the same test, so `break` is a
+         valid (and much cheaper) early exit.  With TARGET_HARD_REG_ALLOC_ORDER
+         the order is arbitrary, and there `break` would silently discard
+         still-usable registers -- skip just this one instead. */
+#ifdef TARGET_HARD_REG_ALLOC_ORDER
+      if (target_nth_loc (hreg, type, nregs - 1) > MAX_HARD_REG) continue;
+#else
       if (target_nth_loc (hreg, type, nregs - 1) > MAX_HARD_REG) break;
+#endif
       for (k = nregs - 1; k > 0; k--) {
         curr_hreg = target_nth_loc (hreg, type, k);
         if (target_fixed_hard_reg_p (curr_hreg) || bitmap_bit_p (conflict_locs, curr_hreg)) break;
@@ -7531,21 +7613,6 @@ static MIR_reg_t get_hard_reg (gen_ctx_t gen_ctx, MIR_reg_t type, bitmap_t confl
     }
   }
   return best_hreg;
-}
-
-static int available_hreg_p (int hreg, MIR_reg_t type, int nregs, bitmap_t *conflict_locs,
-                             live_range_t lr) {
-  for (int j = lr->start; j <= lr->finish; j++) {
-    if (bitmap_bit_p (conflict_locs[j], hreg)) return FALSE;
-    if (nregs > 1) {
-      if (target_nth_loc (hreg, type, nregs - 1) > MAX_HARD_REG) return FALSE;
-      for (int k = nregs - 1; k > 0; k--) {
-        MIR_reg_t curr_hreg = target_nth_loc (hreg, type, k);
-        if (bitmap_bit_p (conflict_locs[j], curr_hreg)) return FALSE;
-      }
-    }
-  }
-  return TRUE;
 }
 
 /* Return cost spill of given lr */
@@ -7581,6 +7648,11 @@ static void find_lr_gaps (gen_ctx_t gen_ctx, live_range_t for_lr, MIR_reg_t hreg
   int i, j, cont, slots_num = target_locs_num (hreg, type);
   int found_p MIR_UNUSED;
   lr_gap_t lr_gap, last_lr_gap;
+  /* Accumulate over all slots of the hard reg.  This used to be reset inside the
+     loop below, so for a type occupying more than one hard-reg slot only the
+     last slot's cost reached the caller and `profit -= cost` under-charged the
+     spill, skewing the allocation choice. */
+  *spill_cost = 0;
   for (i = 0; i < slots_num; i++) {
     curr_hreg = target_nth_loc (hreg, type, i);
     gen_assert (curr_hreg <= MAX_HARD_REG);
@@ -7589,19 +7661,46 @@ static void find_lr_gaps (gen_ctx_t gen_ctx, live_range_t for_lr, MIR_reg_t hreg
     } else {
       last_lr_gap = VARR_LAST (lr_gap_t, lr_gaps);
     }
-    *spill_cost = 0;
-    for (j = for_lr->start; j >= 0; j--)
-      if (find_lr_gap (gen_ctx, curr_hreg, j, &lr_gap)) break;
+    /* Find the nearest gap start at or below for_lr->start.  find_lr_gap first
+       tests lr_gap_bitmaps[hreg], so the old bit-at-a-time backward walk cost
+       O(program points) per live range per slot -- quadratic on huge functions
+       (SQLite's sqlite3VdbeExec is ~49K insns).  Ask the bitmap directly for the
+       previous set bit instead; the htab lookup then confirms it. */
+    j = -1;
+    if (lr_gap_bitmaps[curr_hreg] != NULL && for_lr->start >= 0) {
+      size_t prev;
+      int probe = for_lr->start;
+      /* A set bit does not guarantee an htab entry, so keep stepping down to
+         the next set bit on a miss -- same result as the old linear scan. */
+      while (probe >= 0
+             && bitmap_prev_set_bit_p (lr_gap_bitmaps[curr_hreg], (size_t) probe, &prev)) {
+        if (find_lr_gap (gen_ctx, curr_hreg, (int) prev, &lr_gap)) {
+          j = (int) prev;
+          break;
+        }
+        probe = (int) prev - 1;
+      }
+    }
     cont = for_lr->start + 1;
     if (j >= 0 && lr_gap.lr->finish >= for_lr->start) { /* found the leftmost interesecting */
       cont = lr_gap.lr->finish + 1;
       if (last_lr_gap.lr != lr_gap.lr) {
         VARR_PUSH (lr_gap_t, lr_gaps, lr_gap);
-        *spill_cost = gap_lr_spill_cost (gen_ctx, lr_gap.lr);
+        *spill_cost += gap_lr_spill_cost (gen_ctx, lr_gap.lr);
         last_lr_gap = lr_gap;
       }
     }
+    /* Scan forward for gap starts.  find_lr_gap tests lr_gap_bitmaps[curr_hreg]
+       first, so stepping one program point at a time made this O(range length)
+       per slot -- the dominant cost of register allocation on large functions.
+       Jump straight to the next set bit instead; behaviour is identical because
+       a clear bit can never produce a gap. */
     for (j = cont; j <= for_lr->finish; j++) {
+      size_t nxt;
+      if (lr_gap_bitmaps[curr_hreg] == NULL) break;
+      if (!bitmap_next_set_bit_p (lr_gap_bitmaps[curr_hreg], (size_t) j, &nxt)) break;
+      if ((int) nxt > for_lr->finish) break;
+      j = (int) nxt;
       if (!find_lr_gap (gen_ctx, curr_hreg, j, &lr_gap)) continue;
       if (last_lr_gap.lr != lr_gap.lr) {
         VARR_PUSH (lr_gap_t, lr_gaps, lr_gap);
@@ -7623,6 +7722,30 @@ static MIR_reg_t get_hard_reg_with_split (gen_ctx_t gen_ctx, MIR_reg_t reg, MIR_
   bitmap_t *all_locs = VARR_ADDR (bitmap_t, used_locs);
   bitmap_t *busy_locs = VARR_ADDR (bitmap_t, busy_used_locs);
   VARR (lr_gap_t) * temp_gaps;
+  bitmap_t *all_un, *busy_un;
+  size_t nranges = 0, ri;
+  MIR_alloc_t ra_alloc = gen_alloc (gen_ctx);
+  /* available_hreg_p rescanned every program point of every live range for each
+     candidate hard reg, making this O(MAX_HARD_REG * total live length).  The
+     answer depends only on the union of the loc bitmaps over a range, so build
+     those unions once and test hard regs against them below.  Nothing in the
+     loop (find_lr_gaps / gap_lr_spill_cost) writes used_locs or busy_used_locs,
+     so the unions stay valid for the whole call. */
+  for (lr = start_lr; lr != NULL; lr = lr->next) nranges++;
+  while (VARR_LENGTH (bitmap_t, lr_all_unions) < nranges) {
+    VARR_PUSH (bitmap_t, lr_all_unions, bitmap_create2 (ra_alloc, MAX_HARD_REG + 1));
+    VARR_PUSH (bitmap_t, lr_busy_unions, bitmap_create2 (ra_alloc, MAX_HARD_REG + 1));
+  }
+  all_un = VARR_ADDR (bitmap_t, lr_all_unions);
+  busy_un = VARR_ADDR (bitmap_t, lr_busy_unions);
+  for (ri = 0, lr = start_lr; lr != NULL; lr = lr->next, ri++) {
+    bitmap_clear (all_un[ri]);
+    bitmap_clear (busy_un[ri]);
+    for (int j = lr->start; j <= lr->finish; j++) {
+      bitmap_ior (all_un[ri], all_un[ri], all_locs[j]);
+      bitmap_ior (busy_un[ri], busy_un[ri], busy_locs[j]);
+    }
+  }
   for (n = 0; n <= MAX_HARD_REG; n++) {
 #ifdef TARGET_HARD_REG_ALLOC_ORDER
     hreg = TARGET_HARD_REG_ALLOC_ORDER (n);
@@ -7641,9 +7764,9 @@ static MIR_reg_t get_hard_reg_with_split (gen_ctx_t gen_ctx, MIR_reg_t reg, MIR_
     VARR_TRUNC (lr_gap_t, curr_gaps, 0);
     profit = curr_reg_infos[reg].freq;
     gap_size = 0;
-    for (lr = start_lr; lr != NULL; lr = lr->next) {
-      if (available_hreg_p (hreg, type, nregs, all_locs, lr)) {
-      } else if (available_hreg_p (hreg, type, nregs, busy_locs, lr)) {
+    for (ri = 0, lr = start_lr; lr != NULL; lr = lr->next, ri++) {
+      if (!hreg_in_bitmap_p (hreg, type, nregs, all_un[ri])) {
+      } else if (!hreg_in_bitmap_p (hreg, type, nregs, busy_un[ri])) {
         /* spill other pseudo regs in their gap */
         find_lr_gaps (gen_ctx, lr, hreg, type, nregs, &cost, curr_gaps);
         profit -= cost;
@@ -7800,7 +7923,10 @@ static void assign (gen_ctx_t gen_ctx) {
       }
   }
   bitmap_clear (func_used_hard_regs);
-  if (!simplified_p) HTAB_CLEAR (lr_gap_t, lr_gap_tab);
+  if (!simplified_p) { /* see the note in build_ssa on clear vs recreate */
+    HTAB_DESTROY (lr_gap_t, lr_gap_tab);
+    HTAB_CREATE (lr_gap_t, lr_gap_tab, alloc, 1024, lr_gap_hash, lr_gap_eq, NULL);
+  }
   for (int n = 0; n < nregs; n++) { /* hard reg and stack slot assignment */
     reg = VARR_GET (allocno_info_t, sorted_regs, n).reg;
     if (VARR_GET (MIR_reg_t, reg_renumber, reg) != MIR_NON_VAR) continue;
@@ -8729,6 +8855,8 @@ static void init_ra (gen_ctx_t gen_ctx) {
   VARR_CREATE (bitmap_t, var_bbs, alloc, 0);
   VARR_CREATE (lr_gap_t, spill_gaps, alloc, 0);
   VARR_CREATE (lr_gap_t, curr_gaps, alloc, 0);
+  VARR_CREATE (bitmap_t, lr_all_unions, alloc, 0);
+  VARR_CREATE (bitmap_t, lr_busy_unions, alloc, 0);
   VARR_CREATE (spill_el_t, spill_els, alloc, 0);
   init_lr_gap_tab (gen_ctx);
   VARR_CREATE (spill_cache_el_t, spill_cache, alloc, 0);
@@ -8748,6 +8876,12 @@ static void finish_ra (gen_ctx_t gen_ctx) {
   VARR_DESTROY (bitmap_t, var_bbs);
   VARR_DESTROY (lr_gap_t, spill_gaps);
   VARR_DESTROY (lr_gap_t, curr_gaps);
+  while (VARR_LENGTH (bitmap_t, lr_all_unions) != 0)
+    bitmap_destroy (VARR_POP (bitmap_t, lr_all_unions));
+  VARR_DESTROY (bitmap_t, lr_all_unions);
+  while (VARR_LENGTH (bitmap_t, lr_busy_unions) != 0)
+    bitmap_destroy (VARR_POP (bitmap_t, lr_busy_unions));
+  VARR_DESTROY (bitmap_t, lr_busy_unions);
   VARR_DESTROY (spill_el_t, spill_els);
   finish_lr_gap_tab (gen_ctx);
   VARR_DESTROY (spill_cache_el_t, spill_cache);
@@ -9871,7 +10005,7 @@ void MIR_gen_set_save_relocs (MIR_context_t ctx, unsigned int level) {
     fprintf (stderr, "Calling MIR_gen_set_save_relocs before MIR_gen_init -- good bye\n");
     exit (1);
   }
-  gen_ctx->gen_object_file = (level != 0) ? 1:01;
+  gen_ctx->gen_object_file = level != 0;
 }
 
 

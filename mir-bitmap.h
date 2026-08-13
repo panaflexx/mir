@@ -78,6 +78,61 @@ static inline int bitmap_bit_p (const_bitmap_t bm, size_t nb) {
   return (addr[nw] >> sh) & 1;
 }
 
+/* Find the largest set bit index <= nb.  Returns TRUE and stores it in *res,
+   or FALSE when no bit at or below nb is set.  Scans a word at a time so runs
+   of clear bits are skipped in O(1) each instead of one test per bit -- the
+   register allocator uses this to locate the nearest live-range gap without
+   walking every program point (see find_lr_gaps in mir-gen.c). */
+static inline int bitmap_prev_set_bit_p (const_bitmap_t bm, size_t nb, size_t *res) {
+  size_t nw, sh, len = VARR_LENGTH (bitmap_el_t, bm);
+  bitmap_el_t *addr = VARR_ADDR (bitmap_el_t, bm);
+  bitmap_el_t w;
+
+  if (len == 0) return 0;
+  if (nb >= BITMAP_WORD_BITS * len) nb = BITMAP_WORD_BITS * len - 1;
+  nw = nb / BITMAP_WORD_BITS;
+  sh = nb % BITMAP_WORD_BITS;
+  /* mask off the bits above nb in the starting word */
+  w = addr[nw];
+  if (sh + 1 < BITMAP_WORD_BITS) w &= ((bitmap_el_t) 1 << (sh + 1)) - 1;
+  for (;;) {
+    if (w != 0) {
+      size_t hi = BITMAP_WORD_BITS - 1;
+      while (((w >> hi) & 1) == 0) hi--; /* highest set bit of w */
+      *res = nw * BITMAP_WORD_BITS + hi;
+      return 1;
+    }
+    if (nw == 0) return 0;
+    w = addr[--nw];
+  }
+}
+
+/* Find the smallest set bit index >= nb.  Returns TRUE and stores it in *res,
+   or FALSE when no bit at or above nb is set.  Word-at-a-time, so runs of clear
+   bits are skipped in O(1) each (companion of bitmap_prev_set_bit_p). */
+static inline int bitmap_next_set_bit_p (const_bitmap_t bm, size_t nb, size_t *res) {
+  size_t nw, sh, lo, len = VARR_LENGTH (bitmap_el_t, bm);
+  bitmap_el_t *addr = VARR_ADDR (bitmap_el_t, bm);
+  bitmap_el_t w;
+
+  if (nb >= BITMAP_WORD_BITS * len) return 0;
+  nw = nb / BITMAP_WORD_BITS;
+  sh = nb % BITMAP_WORD_BITS;
+  w = addr[nw] >> sh;
+  if (w != 0) {
+    for (lo = 0; ((w >> lo) & 1) == 0; lo++) ;
+    *res = nb + lo;
+    return 1;
+  }
+  for (nw++; nw < len; nw++) {
+    if ((w = addr[nw]) == 0) continue;
+    for (lo = 0; ((w >> lo) & 1) == 0; lo++) ;
+    *res = nw * BITMAP_WORD_BITS + lo;
+    return 1;
+  }
+  return 0;
+}
+
 static inline int bitmap_set_bit_p (bitmap_t bm, size_t nb) {
   size_t nw, sh;
   bitmap_el_t *addr;

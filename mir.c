@@ -60,6 +60,11 @@ struct MIR_context {
   void *setjmp_addr;      /* used in interpreter to call setjmp directly not from a shim and FFI */
   void *wrapper_end_addr; /* used by generator */
   int tls_native_aot_p;   /* AOT object: native TLS (ELF LE / Mach-O TLV); skip mir_tls_addr */
+  /* Installed by MIR_debug_gdb_register (mir-debug-gdb.c) so MIR_finish can drop
+     any GDB-JIT debug objects bound to this context.  Kept as a hook so mir.c
+     never references mir-debug-gdb.c -- otherwise every build would force-link
+     its process-global __jit_debug_descriptor. */
+  void (*gdb_jit_finish) (MIR_context_t ctx);
 };
 
 #define error_func ctx->error_func
@@ -783,6 +788,10 @@ static void hard_reg_name_finish (MIR_context_t ctx);
 #include "mir-alloc-default.c"
 #include "mir-code-alloc-default.c"
 
+void _MIR_set_gdb_jit_finish (MIR_context_t ctx, void (*finish) (MIR_context_t ctx)) {
+  ctx->gdb_jit_finish = finish;
+}
+
 MIR_context_t _MIR_init (MIR_alloc_t alloc, MIR_code_alloc_t code_alloc) {
   MIR_context_t ctx;
 
@@ -810,6 +819,7 @@ MIR_context_t _MIR_init (MIR_alloc_t alloc, MIR_code_alloc_t code_alloc) {
   ctx->code_alloc = code_alloc;
   error_func = default_error;
   func_redef_permission_p = FALSE;
+  ctx->gdb_jit_finish = NULL;
   curr_module = NULL;
   curr_func = NULL;
   curr_label_num = 0;
@@ -1015,6 +1025,9 @@ static void remove_all_modules (MIR_context_t ctx) {
 }
 
 void MIR_finish (MIR_context_t ctx) {
+  /* Unregister any GDB-JIT debug objects for this context before its machine
+     code is freed below -- their addresses become stale. */
+  if (ctx->gdb_jit_finish != NULL) ctx->gdb_jit_finish (ctx);
   interp_finish (ctx);
   remove_all_modules (ctx);
   HTAB_DESTROY (MIR_item_t, module_item_tab);
