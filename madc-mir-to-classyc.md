@@ -50,11 +50,10 @@ Commit per phase (or per cherry-pick group) so regressions can be bisected.
 | | | skipped | `c40ed469` (empty — already covered by Phase 1 `ded4b82c`/`940eeacf`); `8864a739` (all 5 fixes already present) |
 | | | classyc.c | ported `MIR_add_alias_conflict` registration (`get_type_alias` / `add_union_member_conflicts` / `union_alias_done`) — uncommitted in parent until parent commit |
 | | | validation | build OK; cy-validate 58/58 PASS; struct-ret-multi-return + va-struct-args + issue456/458 PASS; JIT + b2obj smoke OK |
-| 2026-08-13 | 3 | **PARTIAL** | frontend ports into c2mir + classyc.c |
-| | | done | `9c7e7f3b` uninit narrow birth extend (+ force_val addr_p gate); `3582b48e` empty-struct call slot; `8a6a6c57` &array ptr-to-array; `8f3934ac` zero-length silent; `1fdf44d8` member _Alignas; `01f999bb` scope_depth (c2mir; classyc already uses func_scope_num) |
-| | | deferred | `e2c0ae95`+`731c2234` unprototyped call ABI (larger; Apple arm64 relevant) |
-| | | note | `bde8658d` applied then superseded by `9c7e7f3b` as MadC intended |
-| | | validation | build OK; cy-validate 58/58 PASS; JIT smoke OK |
+| 2026-08-13 | 3 | **DONE** | frontend ports into c2mir + classyc.c |
+| | | done | all Phase 3 commits including `e2c0ae95`+`731c2234` unprototyped call ABI |
+| | | note | `bde8658d` superseded by `9c7e7f3b`; unprototyped uses VARARG proto with fixed actual args |
+| | | validation | build OK; cy-validate 58/58; unproto add3 + undeclared printf PASS; JIT smoke OK |
 
 ---
 
@@ -114,7 +113,7 @@ addr_regs rebuild, jump_opt lref labels, remove_item guards.
 
 ## Phase 3 — Frontend bug-fix ports (c2mir.c → classyc.c)
 
-**Status: PARTIAL** (core ports done; unprototyped-call pair deferred).
+**Status: DONE.**
 
 For each: cherry-pick into `ext/mir/c2mir/c2mir.c` **and** hand-port the same
 change into `src/classyc.c` (locate by function name; the fork preserves most).
