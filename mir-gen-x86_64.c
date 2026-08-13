@@ -708,6 +708,9 @@ struct target_ctx {
 #define obj_relocs gen_ctx->target_ctx->obj_relocs
 #define switch_table_descs gen_ctx->target_ctx->switch_table_descs
 
+/* Linux ELF AOT PIC via .mir.addrpool; 0 on Apple (Mach-O in-function pool). */
+static int aot_pic_addrpool_p (gen_ctx_t gen_ctx);
+
 static void prohibit_omitting_fp (gen_ctx_t gen_ctx) { keep_fp_p = TRUE; }
 
 static MIR_disp_t target_get_stack_slot_offset (gen_ctx_t gen_ctx, MIR_type_t type,
@@ -1633,7 +1636,8 @@ static struct pattern patterns[] = {
   {MIR_MOV, "m3 r", "X 89 r1 m0", 0},     /* mov m0,r1 */
   {MIR_MOV, "r i2", "X C7 /0 R0 I1", 0},  /* mov r0,i32 */
   {MIR_MOV, "m3 i2", "X C7 /0 m0 I1", 0}, /* mov m0,i32 */
-  {MIR_MOV, "r j", "X 8B r0 p1", 0},      /* PIC AOT: mov r0, pool[ref] */
+  /* Linux ELF AOT PIC only — Mach-O keeps in-function pool + UNSIGNED (b2objmac). */
+  {MIR_MOV, "r j", "X 8B r0 p1", 0}, /* PIC AOT: mov r0, pool[ref] */
   {MIR_MOV, "r i3", "X B8 +0 J1", 0},     /* mov r0,i64 */
 
   {MIR_MOV, "m0 r", "Z 88 r1 m0", 0},    /* mov m0, r1 */
@@ -2068,16 +2072,16 @@ static int pattern_match_p (gen_ctx_t gen_ctx, const struct pattern *pat, MIR_in
         return FALSE;
       ch = *++p;
       gen_assert ('0' <= ch && ch <= '3');
-      /* AOT object: item addresses only match imm64/pool patterns that can relocate. */
-      if (op_ref->mode == MIR_OP_REF && gen_ctx->gen_object_file && ch != '3') return FALSE;
+      /* Linux PIC AOT: item addresses only match imm64/pool patterns that relocate. */
+      if (op_ref->mode == MIR_OP_REF && aot_pic_addrpool_p (gen_ctx) && ch != '3') return FALSE;
       int64_t n = int_value (gen_ctx, op_ref);
       if ((ch == '0' && !int8_p (n)) || (ch == '1' && !int16_p (n)) || (ch == '2' && !int32_p (n)))
         return FALSE;
       break;
     }
     case 'j':
-      /* AOT PIC: item reference via .mir.addrpool (listed before r i3 so it wins). */
-      if (op_ref->mode != MIR_OP_REF || !gen_ctx->gen_object_file) return FALSE;
+      /* Linux PIC AOT: item reference via .mir.addrpool (before r i3 so it wins). */
+      if (op_ref->mode != MIR_OP_REF || !aot_pic_addrpool_p (gen_ctx)) return FALSE;
       break;
     case 's':
       if ((op_ref->mode != MIR_OP_INT && op_ref->mode != MIR_OP_UINT)
@@ -2416,6 +2420,15 @@ static int setup_imm_addr (struct gen_ctx *gen_ctx, uint64_t v, int *mod, int *r
   cr.symbol_name = symbol_name;
   VARR_PUSH (const_ref_t, const_refs, cr);
   return (int) VARR_LENGTH (const_ref_t, const_refs) - 1;
+}
+
+static int aot_pic_addrpool_p (gen_ctx_t gen_ctx) {
+#if defined(__APPLE__)
+  (void) gen_ctx;
+  return 0;
+#else
+  return gen_ctx->gen_object_file;
+#endif
 }
 
 /* Module-level .mir.addrpool slot (16-byte), shared across functions. */
@@ -2970,8 +2983,8 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
   while (VARR_LENGTH (uint8_t, result_code) % 8 != 0) put_byte (gen_ctx, 0); /* align the table */
   gen_assert (insn->code == MIR_SWITCH
               && (int) VARR_LENGTH (uint8_t, result_code) > switch_table_addr_start_offset);
-  if (gen_ctx->gen_object_file) {
-    /* PIC: table moves to .mir.addrpool; leave disp32 zero for PC32 reloc. */
+  if (aot_pic_addrpool_p (gen_ctx)) {
+    /* Linux PIC: table moves to .mir.addrpool; leave disp32 zero for PC32 reloc. */
     switch_table_desc_t std;
     std.disp32_pc = (size_t) switch_table_addr_start_offset;
     std.table_off = VARR_LENGTH (uint8_t, result_code);
@@ -3032,7 +3045,16 @@ static uint8_t *translate_finish (gen_ctx_t gen_ctx, size_t *len) {
       int64_t label_disp = (int64_t) get_label_disp (gen_ctx, lr.u.label);
       set_int64 (&VARR_ADDR (uint8_t, result_code)[lr.label_val_disp], label_disp, 8);
       VARR_PUSH (uint64_t, abs_address_locs, lr.label_val_disp);
-      /* Object PIC: switch-table ABS64 moves to .mir.addrpool below (no text ABS64). */
+      if (gen_ctx->gen_object_file && !aot_pic_addrpool_p (gen_ctx)) {
+        /* Mach-O / classic object: ABS64 in text against this function. */
+        MIR_code_reloc_t reloc;
+        reloc.offset = lr.label_val_disp;
+        reloc.symbol = curr_func_item->u.func->name;
+        reloc.type = R_X86_64_64;
+        reloc.addend = label_disp;
+        reloc.value = NULL;
+        VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+      }
     } else if (lr.short_p) {
       int64_t disp = (int64_t) get_label_disp (gen_ctx, lr.u.label) - (int64_t) lr.next_insn_disp;
       gen_assert (-128 <= disp && disp < 128);
@@ -3043,8 +3065,8 @@ static uint8_t *translate_finish (gen_ctx_t gen_ctx, size_t *len) {
     }
   }
 
-  if (gen_ctx->gen_object_file) {
-    /* PIC AOT: const pool and switch tables live in module .mir.addrpool.
+  if (aot_pic_addrpool_p (gen_ctx)) {
+    /* Linux PIC AOT: const pool and switch tables live in module .mir.addrpool.
        Text only has PC32 into the pool — no ABS64 in .text. */
     size_t n_pool = VARR_LENGTH (uint64_t, const_pool);
     size_t *slot_off = n_pool ? alloca (n_pool * sizeof (size_t)) : NULL;
@@ -3106,14 +3128,27 @@ static uint8_t *translate_finish (gen_ctx_t gen_ctx, size_t *len) {
       exit (1);
     }
   } else {
+    /* JIT or Mach-O AOT: const pool appended to the function blob. */
     while (VARR_LENGTH (uint8_t, result_code) % 16 != 0) /* Align the pool */
       VARR_PUSH (uint8_t, result_code, 0);
     for (size_t i = 0; i < VARR_LENGTH (const_ref_t, const_refs); i++) {
       const_ref_t cr = VARR_GET (const_ref_t, const_refs, i);
+      size_t pool_slot_disp;
+
       set_int64 (VARR_ADDR (uint8_t, result_code) + cr.pc,
                  VARR_LENGTH (uint8_t, result_code) - cr.next_insn_disp, 4);
+      pool_slot_disp = VARR_LENGTH (uint8_t, result_code);
       put_uint64 (gen_ctx, VARR_GET (uint64_t, const_pool, cr.const_num), 8);
       put_uint64 (gen_ctx, 0, 8); /* keep 16 bytes align */
+      if (gen_ctx->gen_object_file && cr.symbol_name != NULL) {
+        MIR_code_reloc_t reloc;
+        reloc.offset = pool_slot_disp;
+        reloc.symbol = cr.symbol_name;
+        reloc.type = R_X86_64_64;
+        reloc.addend = 0;
+        reloc.value = NULL;
+        VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+      }
     }
   }
   *len = VARR_LENGTH (uint8_t, result_code);
