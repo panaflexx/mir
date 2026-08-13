@@ -2337,10 +2337,10 @@ struct ssa_ctx {
   VARR (bb_insn_t) * arg_bb_insns, *undef_insns;
   VARR (bb_insn_t) * phis, *deleted_phis;
   HTAB (def_tab_el_t) * def_tab; /* reg,bb -> insn defining reg  */
-  /* Semi-pruned SSA: only multi-def regs need φs.  unique_def[reg] is the sole
-     defining bb_insn when def_count==1 (NULL if zero body defs). */
-  bitmap_t multi_def_regs;
-  VARR (bb_insn_t) * unique_defs;
+  /* Semi-pruned SSA: only non-local regs need φs (used outside a unique def
+     block, or defined in more than one block).  Local-only regs are handled by
+     in-block def_tab ordering without φ placement. */
+  bitmap_t non_local_regs;
   /* used for renaming: */
   VARR (ssa_edge_t) * ssa_edges_to_process;
   VARR (size_t) * curr_reg_indexes;
@@ -2352,8 +2352,7 @@ struct ssa_ctx {
 #define phis gen_ctx->ssa_ctx->phis
 #define deleted_phis gen_ctx->ssa_ctx->deleted_phis
 #define def_tab gen_ctx->ssa_ctx->def_tab
-#define multi_def_regs gen_ctx->ssa_ctx->multi_def_regs
-#define unique_defs gen_ctx->ssa_ctx->unique_defs
+#define non_local_regs gen_ctx->ssa_ctx->non_local_regs
 #define ssa_edges_to_process gen_ctx->ssa_ctx->ssa_edges_to_process
 #define curr_reg_indexes gen_ctx->ssa_ctx->curr_reg_indexes
 #define reg_name gen_ctx->ssa_ctx->reg_name
@@ -2427,9 +2426,6 @@ static bb_insn_t create_phi (gen_ctx_t gen_ctx, bb_t bb, MIR_op_t op) {
   } else {
     gen_add_insn_before (gen_ctx, bb_insn->insn, phi_insn);
   }
-  /* ops[0].data is the phi bb_insn (self) until minimize_ssa rewrites trivial
-     phis; Braun try_remove uses the same convention.  Not pushed to `phis`
-     until known non-trivial -- see get_def. */
   phi_insn->ops[0].data = phi = phi_insn->data;
   return phi;
 }
@@ -2446,51 +2442,27 @@ static MIR_insn_t get_last_bb_phi_insn (MIR_insn_t phi_insn) {
   return curr_insn;
 }
 
-/* Braun et al.: drop φ if all operands are the same value (or self).  Updates
-   def_tab so later lookups see the replacement.  Returns the surviving def. */
-static bb_insn_t try_remove_trivial_phi (gen_ctx_t gen_ctx, MIR_reg_t reg, bb_insn_t phi) {
-  bb_insn_t def, same = NULL;
-  def_tab_el_t el, tab_el;
-  size_t op_num;
-
-  gen_assert (phi->insn->code == MIR_PHI);
-  for (op_num = 1; op_num < phi->insn->nops; op_num++) {
-    def = phi->insn->ops[op_num].data;
-    if (def == NULL || def == phi) continue;
-    if (same == NULL)
-      same = def;
-    else if (same != def)
-      return phi; /* non-trivial */
-  }
-  if (same == NULL) same = get_fake_insn (gen_ctx, undef_insns, reg);
-  /* Redirect (bb,reg) to the surviving def before deleting the φ. */
-  el.bb = phi->bb;
-  el.reg = reg;
-  el.def = same;
-  HTAB_DO (def_tab_el_t, def_tab, el, HTAB_REPLACE, tab_el);
-  phi->insn->ops[0].data = same; /* union-find parent for minimize_ssa */
-  gen_delete_insn (gen_ctx, phi->insn);
-  return same;
-}
-
-/* Semi-pruned + Braun-style read:
-   - Single-def regs never get φs (walk preds / local def_tab only).
-   - Multi-def: recursive get with φ at multi-pred BBs, operands filled
-     immediately, trivial φs removed before return (avoids the deferred
-     add_phi_operands explosion on huge CFGs). */
+/* Semi-pruned SSA construction (multi-def vars only get φs).
+ *
+ * Multi-def path matches classic MIR: create φ at multi-pred BBs, defer
+ * operand fill to add_phi_operands (second pass).  Semi-pruning alone stops
+ * the OOM: single-def vars never call create_phi.
+ *
+ * Single-def multi-pred path must still break CFG cycles with a provisional
+ * def_tab entry (otherwise get_def loops forever on back edges).
+ */
 static bb_insn_t get_def (gen_ctx_t gen_ctx, MIR_reg_t reg, bb_t bb) {
   MIR_context_t ctx = gen_ctx->ctx;
   bb_t src;
-  bb_insn_t def, phi, same;
+  bb_insn_t def, same;
   def_tab_el_t el, tab_el;
   MIR_op_t op;
   edge_t in_edge;
-  size_t nop, npreds;
-  int multi_p = bitmap_bit_p (multi_def_regs, reg);
+  size_t npreds;
+  int needs_phi_p = bitmap_bit_p (non_local_regs, reg);
 
   el.bb = bb;
   el.reg = reg;
-  /* Local def already processed in this BB (defs update def_tab after uses). */
   if (HTAB_DO (def_tab_el_t, def_tab, el, HTAB_FIND, tab_el)) return tab_el.def;
 
   npreds = DLIST_LENGTH (in_edge_t, bb->in_edges);
@@ -2502,36 +2474,43 @@ static bb_insn_t get_def (gen_ctx_t gen_ctx, MIR_reg_t reg, bb_t bb) {
     return get_def (gen_ctx, reg, src);
   }
 
-  if (!multi_p) {
-    /* Semi-pruned: no φ.  All preds should agree; if not, prefer a real def. */
+  if (!needs_phi_p) {
+    /* No φ for local-only vars.  Provisional entry breaks loops among multi-pred BBs. */
+    el.def = get_fake_insn (gen_ctx, undef_insns, reg);
+    HTAB_DO (def_tab_el_t, def_tab, el, HTAB_INSERT, tab_el);
     same = NULL;
     for (in_edge = DLIST_HEAD (in_edge_t, bb->in_edges); in_edge != NULL;
          in_edge = DLIST_NEXT (in_edge_t, in_edge)) {
       def = get_def (gen_ctx, reg, in_edge->src);
       if (same == NULL)
         same = def;
-      else if (same != def && !fake_insn_p (def))
+      else if (fake_insn_p (same) && !fake_insn_p (def))
         same = def;
     }
-    return same != NULL ? same : get_fake_insn (gen_ctx, arg_bb_insns, reg);
+    if (same == NULL) same = get_fake_insn (gen_ctx, arg_bb_insns, reg);
+    el.def = same;
+    HTAB_DO (def_tab_el_t, def_tab, el, HTAB_REPLACE, tab_el);
+    return same;
   }
 
-  /* Multi-def, multi-pred: Braun place φ, publish first (breaks cycles), fill. */
+  /* Multi-def, multi-pred: classic MIR — φ now, fill operands in 2nd pass. */
   op = _MIR_new_var_op (ctx, reg);
-  phi = create_phi (gen_ctx, bb, op);
-  el.def = phi;
+  el.def = create_phi (gen_ctx, bb, op);
   HTAB_DO (def_tab_el_t, def_tab, el, HTAB_INSERT, tab_el);
+  VARR_PUSH (bb_insn_t, phis, el.def);
+  return el.def;
+}
 
-  nop = 1;
+static void add_phi_operands (gen_ctx_t gen_ctx, MIR_reg_t reg, bb_insn_t phi) {
+  size_t nop = 1;
+  bb_insn_t def;
+  edge_t in_edge;
+
   for (in_edge = DLIST_HEAD (in_edge_t, phi->bb->in_edges); in_edge != NULL;
        in_edge = DLIST_NEXT (in_edge_t, in_edge)) {
     def = get_def (gen_ctx, reg, in_edge->src);
     phi->insn->ops[nop++].data = def;
   }
-  def = try_remove_trivial_phi (gen_ctx, reg, phi);
-  if (def == phi) /* survived: record for minimize_ssa */
-    VARR_PUSH (bb_insn_t, phis, phi);
-  return def;
 }
 
 static bb_insn_t skip_redundant_phis (bb_insn_t def) {
@@ -2922,47 +2901,63 @@ static void process_bb_insn_for_ssa (gen_ctx_t gen_ctx, bb_insn_t bb_insn) {
 }
 
 static void collect_semi_pruned_defs (gen_ctx_t gen_ctx) {
+  /* Mark non-local vars (Briggs semi-pruned without full liveness): a reg needs
+     φ placement if defined in more than one BB, or used in a BB other than its
+     sole defining BB.  Purely local regs never need φs. */
   MIR_reg_t max_var = get_max_var (gen_ctx), var;
   size_t i;
   int op_num;
   bb_insn_t bb_insn;
   insn_var_iterator_t iter;
-  unsigned *def_counts;
+  size_t *def_bb; /* def_bb[v] = bb->index+1, 0=none, (size_t)-1=multi-BB */
+  size_t n = (size_t) max_var + 1;
 
-  def_counts = gen_malloc (gen_ctx, ((size_t) max_var + 1) * sizeof (unsigned));
-  memset (def_counts, 0, ((size_t) max_var + 1) * sizeof (unsigned));
-  VARR_TRUNC (bb_insn_t, unique_defs, 0);
-  for (i = 0; i <= max_var; i++) VARR_PUSH (bb_insn_t, unique_defs, NULL);
-  bitmap_clear (multi_def_regs);
-  for (bb_t bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb))
+  def_bb = gen_malloc (gen_ctx, n * sizeof (size_t));
+  memset (def_bb, 0, n * sizeof (size_t));
+  bitmap_clear (non_local_regs);
+
+  for (bb_t bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb)) {
+    size_t bbi = (size_t) bb->index + 1;
     for (bb_insn = DLIST_HEAD (bb_insn_t, bb->bb_insns); bb_insn != NULL;
          bb_insn = DLIST_NEXT (bb_insn_t, bb_insn)) {
       if (bb_insn->insn->code == MIR_PHI || bb_insn->insn->code == MIR_LABEL) continue;
       FOREACH_OUT_INSN_VAR (gen_ctx, iter, bb_insn->insn, var, op_num) {
-        unsigned c;
         if (var <= MAX_HARD_REG || var > max_var) continue;
-        c = ++def_counts[var];
-        VARR_SET (bb_insn_t, unique_defs, var, bb_insn);
-        if (c == 2) bitmap_set_bit_p (multi_def_regs, var);
+        if (def_bb[var] == 0)
+          def_bb[var] = bbi;
+        else if (def_bb[var] != bbi)
+          def_bb[var] = (size_t) -1;
       }
     }
-  if (gen_profile_enabled ()) {
-    size_t multi = 0, single = 0, zero = 0;
-    for (i = MAX_HARD_REG + 1; i <= max_var; i++) {
-      unsigned c = def_counts[i];
-      if (c == 0)
-        zero++;
-      else if (c == 1)
-        single++;
-      else
-        multi++;
+  }
+  for (bb_t bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb)) {
+    size_t bbi = (size_t) bb->index + 1;
+    for (bb_insn = DLIST_HEAD (bb_insn_t, bb->bb_insns); bb_insn != NULL;
+         bb_insn = DLIST_NEXT (bb_insn_t, bb_insn)) {
+      if (bb_insn->insn->code == MIR_PHI || bb_insn->insn->code == MIR_LABEL) continue;
+      FOREACH_IN_INSN_VAR (gen_ctx, iter, bb_insn->insn, var, op_num) {
+        if (var <= MAX_HARD_REG || var > max_var) continue;
+        if (def_bb[var] == (size_t) -1 || (def_bb[var] != 0 && def_bb[var] != bbi))
+          bitmap_set_bit_p (non_local_regs, var);
+      }
     }
-    fprintf (stderr,
-             "  PROF   semi-pruned: multi_def=%zu single_def=%zu zero_def=%zu max_var=%u\n", multi,
-             single, zero, (unsigned) max_var);
+  }
+  for (i = MAX_HARD_REG + 1; i <= max_var; i++)
+    if (def_bb[i] == (size_t) -1) bitmap_set_bit_p (non_local_regs, i);
+
+  if (gen_profile_enabled ()) {
+    size_t nl = 0, loc = 0;
+    for (i = MAX_HARD_REG + 1; i <= max_var; i++) {
+      if (bitmap_bit_p (non_local_regs, i))
+        nl++;
+      else if (def_bb[i] != 0)
+        loc++;
+    }
+    fprintf (stderr, "  PROF   semi-pruned: non_local=%zu local_only=%zu max_var=%u\n", nl, loc,
+             (unsigned) max_var);
     fflush (stderr);
   }
-  gen_free (gen_ctx, def_counts);
+  gen_free (gen_ctx, def_bb);
 }
 
 static void build_ssa (gen_ctx_t gen_ctx, int rename_p) {
@@ -3009,11 +3004,26 @@ static void build_ssa (gen_ctx_t gen_ctx, int rename_p) {
       fflush (stderr);
     }
   }
-  gen_profile_mark ("  SSA.process_bbs+braun", _pt);
+  gen_profile_mark ("  SSA.process_bbs", _pt);
   if (gen_profile_enabled ())
-    fprintf (stderr, "  PROF   after Braun SSA: insns=%zu phis=%zu max_var=%u rss=%ld KB\n",
+    fprintf (stderr, "  PROF   after process: insns=%zu phis=%zu max_var=%u rss=%ld KB\n",
              insns_num, VARR_LENGTH (bb_insn_t, phis), (unsigned) get_max_var (gen_ctx),
              gen_profile_rss_kb ());
+  /* Fill φ operands (may create more multi-def φs only — semi-pruned). */
+  _pt = real_usec_time ();
+  for (i = 0; i < VARR_LENGTH (bb_insn_t, phis); i++) {
+    bb_insn_t phi = VARR_GET (bb_insn_t, phis, i);
+    add_phi_operands (gen_ctx, phi->insn->ops[0].u.var, phi);
+    if (gen_profile_enabled () && (i + 1) % 50000 == 0) {
+      fprintf (stderr, "  PROF   SSA.add_phi_ops %zu/%zu rss=%ld KB\n", i + 1,
+               VARR_LENGTH (bb_insn_t, phis), gen_profile_rss_kb ());
+      fflush (stderr);
+    }
+  }
+  gen_profile_mark ("  SSA.add_phi_operands", _pt);
+  if (gen_profile_enabled ())
+    fprintf (stderr, "  PROF   after add_phi: phis=%zu rss=%ld KB\n",
+             VARR_LENGTH (bb_insn_t, phis), gen_profile_rss_kb ());
   /* minimization can not be switched off for def_use representation
      building as it clears ops[0].data: */
   _pt = real_usec_time ();
@@ -3149,8 +3159,7 @@ static void init_ssa (gen_ctx_t gen_ctx) {
   VARR_CREATE (bb_insn_t, phis, alloc, 0);
   VARR_CREATE (bb_insn_t, deleted_phis, alloc, 0);
   HTAB_CREATE (def_tab_el_t, def_tab, alloc, 1024, def_tab_el_hash, def_tab_el_eq, gen_ctx);
-  multi_def_regs = bitmap_create2 (alloc, 1024);
-  VARR_CREATE (bb_insn_t, unique_defs, alloc, 0);
+  non_local_regs = bitmap_create2 (alloc, 1024);
   VARR_CREATE (ssa_edge_t, ssa_edges_to_process, alloc, 512);
   VARR_CREATE (size_t, curr_reg_indexes, alloc, 4096);
   VARR_CREATE (char, reg_name, alloc, 20);
@@ -3162,8 +3171,7 @@ static void finish_ssa (gen_ctx_t gen_ctx) {
   VARR_DESTROY (bb_insn_t, phis);
   VARR_DESTROY (bb_insn_t, deleted_phis);
   HTAB_DESTROY (def_tab_el_t, def_tab);
-  bitmap_destroy (multi_def_regs);
-  VARR_DESTROY (bb_insn_t, unique_defs);
+  bitmap_destroy (non_local_regs);
   VARR_DESTROY (ssa_edge_t, ssa_edges_to_process);
   VARR_DESTROY (size_t, curr_reg_indexes);
   VARR_DESTROY (char, reg_name);
