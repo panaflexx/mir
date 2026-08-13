@@ -54,6 +54,9 @@ Commit per phase (or per cherry-pick group) so regressions can be bisected.
 | | | done | all Phase 3 commits including `e2c0ae95`+`731c2234` unprototyped call ABI |
 | | | note | `bde8658d` superseded by `9c7e7f3b`; unprototyped uses VARARG proto with fixed actual args |
 | | | validation | build OK; cy-validate 58/58; unproto add3 + undeclared printf PASS; JIT smoke OK |
+| 2026-08-13 | 4 | **DEFERRED** | keep `src/b2obj.c` AOT path; do **not** import MadC `mir-debug.c` yet |
+| | | rationale | Header API already present (`mir-debug.h`); CMake deliberately omits `mir-debug.c`. ClassyC has working ELF `b2obj` (~2.6k LOC) + `b2objmac` + `classyc.aot`. MadC layer is ~3.4k LOC + gen capture hooks + dual debug-info reconciliation with `mir-dbinfo`/`dwarf-gen`. High risk, low urgency while b2obj works. |
+| | | optional later | Mine RELRO/PIE/addrpool ideas for b2obj; consider `.debug_frame` CFI (`39963953`) for JIT unwind without full object layer |
 
 ---
 
@@ -134,8 +137,25 @@ ClassyC equivalent under `cy-validate/`.
 
 ## Phase 4 — `mir-debug.c` + AOT object layer (decision point, then import)
 
+**Status: DEFERRED (2026-08-13).** Keep ClassyC `src/b2obj.c` / `b2objmac` as
+the AOT object path. Do not import MadC `mir-debug.c` in this merge wave.
+
+Evaluation (Step 4a):
+- ClassyC already ships a full AOT toolchain: `.bmir` → `b2obj` → ELF `.o`,
+  plus Mach-O via `b2objmac`, driven by `classyc.aot`. Validated post Phase 1–3.
+- `mir-debug.h` already declares the full `MIR_object_*` + `MIR_debug_*` API
+  (imported with the GDB path), but `ext/mir/CMakeLists.txt` **deliberately
+  excludes** `mir-debug.c` ("companion DWARF/object builder … NOT linked").
+- MadC's implementation is large (~3.4k lines) and pulls gen capture mode
+  (`object_mode_p`, `MIR_gen_set_object_mode`, target_object_capture) that
+  ClassyC gen does not have. Reconciling with `mir-dbinfo.h` / `dwarf-gen.h`
+  (used for JIT `-g` / `.bmir` debug) is a separate design problem.
+- Decision matches plan Step 4c: reject full import for now; mine
+  RELRO/PIE/addrpool/`DT_DEBUG` ideas for b2obj later; revisit `.debug_frame`
+  CFI (`39963953`) independently if JIT unwind is needed.
+
 We imported `mir-debug.h` + `mir-debug-gdb.c` (`c0017607`) but **not**
-`mir-debug.c` (~1,400 lines: DWARF builder *and* the `MIR_object_*` AOT layer).
+`mir-debug.c` (~3,400 lines: DWARF builder *and* the `MIR_object_*` AOT layer).
 
 Step 4a — **Evaluate against `b2obj`/`b2objmac`** first. MadC's layer provides:
 ELF `.o` capture (x86-64 `187e41c6`, aarch64 PIC addrpool `e2a43ee5`),
