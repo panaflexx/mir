@@ -2927,15 +2927,12 @@ static void collect_semi_pruned_defs (gen_ctx_t gen_ctx) {
   int op_num;
   bb_insn_t bb_insn;
   insn_var_iterator_t iter;
-  VARR (unsigned) * def_counts;
-  MIR_alloc_t alloc = gen_alloc (gen_ctx);
+  unsigned *def_counts;
 
-  VARR_CREATE (unsigned, def_counts, alloc, max_var + 1);
+  def_counts = gen_malloc (gen_ctx, ((size_t) max_var + 1) * sizeof (unsigned));
+  memset (def_counts, 0, ((size_t) max_var + 1) * sizeof (unsigned));
   VARR_TRUNC (bb_insn_t, unique_defs, 0);
-  for (i = 0; i <= max_var; i++) {
-    VARR_PUSH (unsigned, def_counts, 0);
-    VARR_PUSH (bb_insn_t, unique_defs, NULL);
-  }
+  for (i = 0; i <= max_var; i++) VARR_PUSH (bb_insn_t, unique_defs, NULL);
   bitmap_clear (multi_def_regs);
   for (bb_t bb = DLIST_HEAD (bb_t, curr_cfg->bbs); bb != NULL; bb = DLIST_NEXT (bb_t, bb))
     for (bb_insn = DLIST_HEAD (bb_insn_t, bb->bb_insns); bb_insn != NULL;
@@ -2944,8 +2941,7 @@ static void collect_semi_pruned_defs (gen_ctx_t gen_ctx) {
       FOREACH_OUT_INSN_VAR (gen_ctx, iter, bb_insn->insn, var, op_num) {
         unsigned c;
         if (var <= MAX_HARD_REG || var > max_var) continue;
-        c = VARR_GET (unsigned, def_counts, var) + 1;
-        VARR_SET (unsigned, def_counts, var, c);
+        c = ++def_counts[var];
         VARR_SET (bb_insn_t, unique_defs, var, bb_insn);
         if (c == 2) bitmap_set_bit_p (multi_def_regs, var);
       }
@@ -2953,7 +2949,7 @@ static void collect_semi_pruned_defs (gen_ctx_t gen_ctx) {
   if (gen_profile_enabled ()) {
     size_t multi = 0, single = 0, zero = 0;
     for (i = MAX_HARD_REG + 1; i <= max_var; i++) {
-      unsigned c = VARR_GET (unsigned, def_counts, i);
+      unsigned c = def_counts[i];
       if (c == 0)
         zero++;
       else if (c == 1)
@@ -2966,7 +2962,7 @@ static void collect_semi_pruned_defs (gen_ctx_t gen_ctx) {
              single, zero, (unsigned) max_var);
     fflush (stderr);
   }
-  VARR_DESTROY (unsigned, def_counts);
+  gen_free (gen_ctx, def_counts);
 }
 
 static void build_ssa (gen_ctx_t gen_ctx, int rename_p) {
