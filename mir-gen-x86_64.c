@@ -638,6 +638,15 @@ struct const_ref {
 typedef struct const_ref const_ref_t;
 DEF_VARR (const_ref_t);
 
+/* Object PIC: switch table moved into .mir.addrpool. */
+struct switch_table_desc {
+  size_t disp32_pc; /* table-address disp32 in result_code */
+  size_t table_off; /* first label slot in result_code (dead padding after move) */
+  size_t n_slots;
+};
+typedef struct switch_table_desc switch_table_desc_t;
+DEF_VARR (switch_table_desc_t);
+
 struct label_ref {
   char abs_addr_p, short_p; /* 8 or 32-bit target */
   size_t label_val_disp, next_insn_disp;
@@ -669,12 +678,14 @@ struct target_ctx {
   VARR (insn_pattern_info_t) * insn_pattern_info;
   VARR (uint8_t) * result_code;
   VARR (uint64_t) * const_pool;
+  VARR (void_ptr_t) * const_pool_syms; /* parallel to const_pool: symbol or NULL */
   VARR (const_ref_t) * const_refs;
   VARR (label_ref_t) * label_refs;
   VARR (uint64_t) * abs_address_locs;
   VARR (MIR_code_reloc_t) * relocs;
   VARR (MIR_code_reloc_t) * obj_relocs; /* object-file relocations for current function (func-relative offsets) */
   VARR (call_ref_t) * call_refs;
+  VARR (switch_table_desc_t) * switch_table_descs;
 };
 
 #define alloca_p gen_ctx->target_ctx->alloca_p
@@ -689,11 +700,13 @@ struct target_ctx {
 #define insn_pattern_info gen_ctx->target_ctx->insn_pattern_info
 #define result_code gen_ctx->target_ctx->result_code
 #define const_pool gen_ctx->target_ctx->const_pool
+#define const_pool_syms gen_ctx->target_ctx->const_pool_syms
 #define const_refs gen_ctx->target_ctx->const_refs
 #define label_refs gen_ctx->target_ctx->label_refs
 #define abs_address_locs gen_ctx->target_ctx->abs_address_locs
 #define relocs gen_ctx->target_ctx->relocs
 #define obj_relocs gen_ctx->target_ctx->obj_relocs
+#define switch_table_descs gen_ctx->target_ctx->switch_table_descs
 
 static void prohibit_omitting_fp (gen_ctx_t gen_ctx) { keep_fp_p = TRUE; }
 
@@ -1620,6 +1633,7 @@ static struct pattern patterns[] = {
   {MIR_MOV, "m3 r", "X 89 r1 m0", 0},     /* mov m0,r1 */
   {MIR_MOV, "r i2", "X C7 /0 R0 I1", 0},  /* mov r0,i32 */
   {MIR_MOV, "m3 i2", "X C7 /0 m0 I1", 0}, /* mov m0,i32 */
+  {MIR_MOV, "r j", "X 8B r0 p1", 0},      /* PIC AOT: mov r0, pool[ref] */
   {MIR_MOV, "r i3", "X B8 +0 J1", 0},     /* mov r0,i64 */
 
   {MIR_MOV, "m0 r", "Z 88 r1 m0", 0},    /* mov m0, r1 */
@@ -2054,11 +2068,17 @@ static int pattern_match_p (gen_ctx_t gen_ctx, const struct pattern *pat, MIR_in
         return FALSE;
       ch = *++p;
       gen_assert ('0' <= ch && ch <= '3');
+      /* AOT object: item addresses only match imm64/pool patterns that can relocate. */
+      if (op_ref->mode == MIR_OP_REF && gen_ctx->gen_object_file && ch != '3') return FALSE;
       int64_t n = int_value (gen_ctx, op_ref);
       if ((ch == '0' && !int8_p (n)) || (ch == '1' && !int16_p (n)) || (ch == '2' && !int32_p (n)))
         return FALSE;
       break;
     }
+    case 'j':
+      /* AOT PIC: item reference via .mir.addrpool (listed before r i3 so it wins). */
+      if (op_ref->mode != MIR_OP_REF || !gen_ctx->gen_object_file) return FALSE;
+      break;
     case 's':
       if ((op_ref->mode != MIR_OP_INT && op_ref->mode != MIR_OP_UINT)
           || (op_ref->u.i != 1 && op_ref->u.i != 2 && op_ref->u.i != 4 && op_ref->u.i != 8))
@@ -2364,13 +2384,20 @@ static int64_t get_int64 (uint8_t *addr, int nb) {
   return v;
 }
 
-static size_t add_to_const_pool (struct gen_ctx *gen_ctx, uint64_t v) {
+/* Dedup on (value, symbol): distinct imports may share a sentinel value. */
+static size_t add_to_const_pool (struct gen_ctx *gen_ctx, uint64_t v, const char *symbol_name) {
   uint64_t *addr = VARR_ADDR (uint64_t, const_pool);
   size_t n, len = VARR_LENGTH (uint64_t, const_pool);
 
-  for (n = 0; n < len; n++)
-    if (addr[n] == v) return n;
+  for (n = 0; n < len; n++) {
+    const char *s = (const char *) VARR_GET (void_ptr_t, const_pool_syms, n);
+    if (addr[n] == v
+        && ((s == NULL && symbol_name == NULL)
+            || (s != NULL && symbol_name != NULL && strcmp (s, symbol_name) == 0)))
+      return n;
+  }
   VARR_PUSH (uint64_t, const_pool, v);
+  VARR_PUSH (void_ptr_t, const_pool_syms, (void *) symbol_name);
   return len;
 }
 
@@ -2379,7 +2406,7 @@ static int setup_imm_addr (struct gen_ctx *gen_ctx, uint64_t v, int *mod, int *r
   const_ref_t cr;
   size_t n;
 
-  n = add_to_const_pool (gen_ctx, v);
+  n = add_to_const_pool (gen_ctx, v, symbol_name);
   setup_rip_rel_addr (0, mod, rm, disp32);
   cr.call_p = call_p;
   cr.func_item = func_item;
@@ -2389,6 +2416,39 @@ static int setup_imm_addr (struct gen_ctx *gen_ctx, uint64_t v, int *mod, int *r
   cr.symbol_name = symbol_name;
   VARR_PUSH (const_ref_t, const_refs, cr);
   return (int) VARR_LENGTH (const_ref_t, const_refs) - 1;
+}
+
+/* Module-level .mir.addrpool slot (16-byte), shared across functions. */
+static size_t aot_addrpool_slot (gen_ctx_t gen_ctx, uint64_t val, const char *sym) {
+  size_t i, n = VARR_LENGTH (uint64_t, gen_ctx->aot_pool_vals);
+  uint64_t key_val = sym != NULL ? 0 : val;
+  for (i = 0; i < n; i++) {
+    const char *s = (const char *) VARR_GET (void_ptr_t, gen_ctx->aot_pool_syms, i);
+    if (VARR_GET (uint64_t, gen_ctx->aot_pool_vals, i) == key_val
+        && ((s == NULL && sym == NULL) || (s != NULL && sym != NULL && strcmp (s, sym) == 0)))
+      return i * 16;
+  }
+  size_t off = VARR_LENGTH (uint8_t, gen_ctx->aot_addrpool);
+  while (off % 16 != 0) {
+    VARR_PUSH (uint8_t, gen_ctx->aot_addrpool, 0);
+    off++;
+  }
+  for (i = 0; i < 16; i++) VARR_PUSH (uint8_t, gen_ctx->aot_addrpool, 0);
+  if (sym == NULL) {
+    uint8_t *p = VARR_ADDR (uint8_t, gen_ctx->aot_addrpool) + off;
+    memcpy (p, &val, 8);
+  } else {
+    MIR_code_reloc_t r;
+    r.offset = off;
+    r.value = NULL;
+    r.symbol = sym;
+    r.type = R_X86_64_64;
+    r.addend = 0;
+    VARR_PUSH (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs, r);
+  }
+  VARR_PUSH (uint64_t, gen_ctx->aot_pool_vals, key_val);
+  VARR_PUSH (void_ptr_t, gen_ctx->aot_pool_syms, (void *) sym);
+  return off;
 }
 
 static int get_max_insn_size (gen_ctx_t gen_ctx MIR_UNUSED, const char *replacement) {
@@ -2488,6 +2548,7 @@ static int get_max_insn_size (gen_ctx_t gen_ctx MIR_UNUSED, const char *replacem
         gen_assert ('0' <= ch && ch <= '2');
         break;
       case 'P':
+      case 'p':
         ch = *++p;
         gen_assert ('0' <= ch && ch <= '7');
         modrm_p = TRUE;
@@ -2763,6 +2824,9 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
         VARR_PUSH (label_ref_t, label_refs, lr);
         break;
       case 'P':
+      case 'p': {
+        /* 'P': call/jump target via pool; 'p': plain PIC load of item address. */
+        int pool_call_p = start_ch == 'P';
         ch = *++p;
         gen_assert ('0' <= ch && ch <= '7');
         op_ref = &insn->ops[ch - '0'];
@@ -2773,14 +2837,15 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
         MIR_item_t func_item
           = op_ref->mode != MIR_OP_REF || op_ref->u.ref->item_type != MIR_func_item ? NULL
                                                                                     : op_ref->u.ref;
-        /* For object-file generation, record the callee symbol name so the call
-           target (kept as an indirect call through the constant pool) can be
-           emitted as a relocation. */
+        /* For object-file generation, record the callee/item symbol name so the
+           pool slot can be emitted as an absolute relocation. */
         const char *call_symbol
           = (gen_ctx->gen_object_file && op_ref->mode == MIR_OP_REF) ? MIR_item_name (ctx, op_ref->u.ref)
                                                                      : NULL;
-        const_ref_num = setup_imm_addr (gen_ctx, v, &mod, &rm, &disp32, TRUE, func_item, call_symbol);
+        const_ref_num
+          = setup_imm_addr (gen_ctx, v, &mod, &rm, &disp32, pool_call_p, func_item, call_symbol);
         break;
+      }
       case '/':
         ch = *++p;
         gen_assert ('0' <= ch && ch <= '7');
@@ -2905,8 +2970,17 @@ static void out_insn (gen_ctx_t gen_ctx, MIR_insn_t insn, const char *replacemen
   while (VARR_LENGTH (uint8_t, result_code) % 8 != 0) put_byte (gen_ctx, 0); /* align the table */
   gen_assert (insn->code == MIR_SWITCH
               && (int) VARR_LENGTH (uint8_t, result_code) > switch_table_addr_start_offset);
-  set_int64 (&VARR_ADDR (uint8_t, result_code)[switch_table_addr_start_offset],
-             (int64_t) VARR_LENGTH (uint8_t, result_code) - switch_table_addr_start_offset - 4, 4);
+  if (gen_ctx->gen_object_file) {
+    /* PIC: table moves to .mir.addrpool; leave disp32 zero for PC32 reloc. */
+    switch_table_desc_t std;
+    std.disp32_pc = (size_t) switch_table_addr_start_offset;
+    std.table_off = VARR_LENGTH (uint8_t, result_code);
+    std.n_slots = insn->nops - 1;
+    VARR_PUSH (switch_table_desc_t, switch_table_descs, std);
+  } else {
+    set_int64 (&VARR_ADDR (uint8_t, result_code)[switch_table_addr_start_offset],
+               (int64_t) VARR_LENGTH (uint8_t, result_code) - switch_table_addr_start_offset - 4, 4);
+  }
   for (size_t i = 1; i < insn->nops; i++) {
     gen_assert (insn->ops[i].mode == MIR_OP_LABEL);
     lr.abs_addr_p = TRUE;
@@ -2941,10 +3015,12 @@ static int target_insn_ok_p (gen_ctx_t gen_ctx, MIR_insn_t insn) {
 static void translate_init (gen_ctx_t gen_ctx) {
   VARR_TRUNC (uint8_t, result_code, 0);
   VARR_TRUNC (uint64_t, const_pool, 0);
+  VARR_TRUNC (void_ptr_t, const_pool_syms, 0);
   VARR_TRUNC (const_ref_t, const_refs, 0);
   VARR_TRUNC (label_ref_t, label_refs, 0);
   VARR_TRUNC (uint64_t, abs_address_locs, 0);
   VARR_TRUNC (MIR_code_reloc_t, obj_relocs, 0);
+  VARR_TRUNC (switch_table_desc_t, switch_table_descs, 0);
 }
 
 static uint8_t *translate_finish (gen_ctx_t gen_ctx, size_t *len) {
@@ -2956,17 +3032,7 @@ static uint8_t *translate_finish (gen_ctx_t gen_ctx, size_t *len) {
       int64_t label_disp = (int64_t) get_label_disp (gen_ctx, lr.u.label);
       set_int64 (&VARR_ADDR (uint8_t, result_code)[lr.label_val_disp], label_disp, 8);
       VARR_PUSH (uint64_t, abs_address_locs, lr.label_val_disp);
-      if (gen_ctx->gen_object_file) {
-        /* object-file: the absolute label address resolves to this function's code
-           plus the label displacement, so relocate against the function symbol. */
-        MIR_code_reloc_t reloc;
-        reloc.offset = lr.label_val_disp;
-        reloc.symbol = curr_func_item->u.func->name;
-        reloc.type = R_X86_64_64;
-        reloc.addend = label_disp;
-        reloc.value = NULL;
-        VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
-      }
+      /* Object PIC: switch-table ABS64 moves to .mir.addrpool below (no text ABS64). */
     } else if (lr.short_p) {
       int64_t disp = (int64_t) get_label_disp (gen_ctx, lr.u.label) - (int64_t) lr.next_insn_disp;
       gen_assert (-128 <= disp && disp < 128);
@@ -2976,27 +3042,78 @@ static uint8_t *translate_finish (gen_ctx_t gen_ctx, size_t *len) {
                  (int64_t) get_label_disp (gen_ctx, lr.u.label) - (int64_t) lr.next_insn_disp, 4);
     }
   }
-  while (VARR_LENGTH (uint8_t, result_code) % 16 != 0) /* Align the pool */
-    VARR_PUSH (uint8_t, result_code, 0);
-  for (size_t i = 0; i < VARR_LENGTH (const_ref_t, const_refs); i++) { /* Add pool constants */
-    const_ref_t cr = VARR_GET (const_ref_t, const_refs, i);
-    size_t pool_slot_disp;
 
-    set_int64 (VARR_ADDR (uint8_t, result_code) + cr.pc,
-               VARR_LENGTH (uint8_t, result_code) - cr.next_insn_disp, 4);
-    pool_slot_disp = VARR_LENGTH (uint8_t, result_code);
-    put_uint64 (gen_ctx, VARR_GET (uint64_t, const_pool, cr.const_num), 8);
-    put_uint64 (gen_ctx, 0, 8); /* keep 16 bytes align */
-    if (gen_ctx->gen_object_file && cr.symbol_name != NULL) {
-      /* object-file: the call/jump stays an indirect reference through the pool;
-         relocate the 8-byte pool slot to hold the symbol's absolute address. */
+  if (gen_ctx->gen_object_file) {
+    /* PIC AOT: const pool and switch tables live in module .mir.addrpool.
+       Text only has PC32 into the pool — no ABS64 in .text. */
+    size_t n_pool = VARR_LENGTH (uint64_t, const_pool);
+    size_t *slot_off = n_pool ? alloca (n_pool * sizeof (size_t)) : NULL;
+    for (size_t i = 0; i < n_pool; i++) {
+      const char *sym = (const char *) VARR_GET (void_ptr_t, const_pool_syms, i);
+      uint64_t val = VARR_GET (uint64_t, const_pool, i);
+      slot_off[i] = aot_addrpool_slot (gen_ctx, val, sym);
+    }
+    for (size_t i = 0; i < VARR_LENGTH (const_ref_t, const_refs); i++) {
+      const_ref_t cr = VARR_GET (const_ref_t, const_refs, i);
+      /* Leave disp32 zero; linker fills via PC32. */
+      set_int64 (VARR_ADDR (uint8_t, result_code) + cr.pc, 0, 4);
       MIR_code_reloc_t reloc;
-      reloc.offset = pool_slot_disp;
-      reloc.symbol = cr.symbol_name;
-      reloc.type = R_X86_64_64;
-      reloc.addend = 0;
+      reloc.offset = cr.pc;
+      reloc.symbol = MIR_AOT_ADDRPOOL_NAME;
+      reloc.type = R_X86_64_PC32;
+      reloc.addend
+        = (int64_t) slot_off[cr.const_num] - (int64_t) (cr.next_insn_disp - cr.pc);
       reloc.value = NULL;
       VARR_PUSH (MIR_code_reloc_t, obj_relocs, reloc);
+    }
+    /* Switch tables: ABS64 label slots in pool, PC32 for table address, zero dead text. */
+    size_t abs_i = 0;
+    for (size_t t = 0; t < VARR_LENGTH (switch_table_desc_t, switch_table_descs); t++) {
+      switch_table_desc_t std = VARR_GET (switch_table_desc_t, switch_table_descs, t);
+      size_t toff = VARR_LENGTH (uint8_t, gen_ctx->aot_addrpool);
+      while (toff % 8 != 0) {
+        VARR_PUSH (uint8_t, gen_ctx->aot_addrpool, 0);
+        toff++;
+      }
+      for (size_t j = 0; j < std.n_slots; j++, abs_i++) {
+        gen_assert (abs_i < VARR_LENGTH (uint64_t, abs_address_locs));
+        size_t text_off = VARR_GET (uint64_t, abs_address_locs, abs_i);
+        int64_t label_disp = get_int64 (VARR_ADDR (uint8_t, result_code) + text_off, 8);
+        size_t slot = VARR_LENGTH (uint8_t, gen_ctx->aot_addrpool);
+        for (int k = 0; k < 8; k++) VARR_PUSH (uint8_t, gen_ctx->aot_addrpool, 0);
+        MIR_code_reloc_t r;
+        r.offset = slot;
+        r.value = NULL;
+        r.symbol = curr_func_item->u.func->name;
+        r.type = R_X86_64_64;
+        r.addend = label_disp;
+        VARR_PUSH (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs, r);
+        memset (VARR_ADDR (uint8_t, result_code) + text_off, 0, 8);
+      }
+      set_int64 (VARR_ADDR (uint8_t, result_code) + std.disp32_pc, 0, 4);
+      MIR_code_reloc_t tr;
+      tr.offset = std.disp32_pc;
+      tr.symbol = MIR_AOT_ADDRPOOL_NAME;
+      tr.type = R_X86_64_PC32;
+      tr.addend = (int64_t) toff - 4;
+      tr.value = NULL;
+      VARR_PUSH (MIR_code_reloc_t, obj_relocs, tr);
+    }
+    if (abs_i != VARR_LENGTH (uint64_t, abs_address_locs)) {
+      fprintf (stderr,
+               "AOT PIC: absolute address slot not covered by switch table (func %s)\n",
+               curr_func_item->u.func->name);
+      exit (1);
+    }
+  } else {
+    while (VARR_LENGTH (uint8_t, result_code) % 16 != 0) /* Align the pool */
+      VARR_PUSH (uint8_t, result_code, 0);
+    for (size_t i = 0; i < VARR_LENGTH (const_ref_t, const_refs); i++) {
+      const_ref_t cr = VARR_GET (const_ref_t, const_refs, i);
+      set_int64 (VARR_ADDR (uint8_t, result_code) + cr.pc,
+                 VARR_LENGTH (uint8_t, result_code) - cr.next_insn_disp, 4);
+      put_uint64 (gen_ctx, VARR_GET (uint64_t, const_pool, cr.const_num), 8);
+      put_uint64 (gen_ctx, 0, 8); /* keep 16 bytes align */
     }
   }
   *len = VARR_LENGTH (uint8_t, result_code);
@@ -3332,10 +3449,12 @@ static void target_init_bb_version_data (target_bb_version_t data) {
 static void target_bb_translate_start (gen_ctx_t gen_ctx) {
   VARR_TRUNC (uint8_t, result_code, 0);
   VARR_TRUNC (uint64_t, const_pool, 0);
+  VARR_TRUNC (void_ptr_t, const_pool_syms, 0);
   VARR_TRUNC (const_ref_t, const_refs, 0);
   VARR_TRUNC (label_ref_t, label_refs, 0);
   VARR_TRUNC (uint64_t, abs_address_locs, 0);
   VARR_TRUNC (MIR_code_reloc_t, obj_relocs, 0);
+  VARR_TRUNC (switch_table_desc_t, switch_table_descs, 0);
 }
 
 static void target_bb_insn_translate (gen_ctx_t gen_ctx, MIR_insn_t insn, void **jump_addrs) {
@@ -3437,12 +3556,14 @@ static void target_init (gen_ctx_t gen_ctx) {
   VARR_CREATE (uint8_t, result_code, alloc, 0);
   VARR_CREATE (int, insn_pattern_indexes, alloc, 0);
   VARR_CREATE (uint64_t, const_pool, alloc, 0);
+  VARR_CREATE (void_ptr_t, const_pool_syms, alloc, 0);
   VARR_CREATE (const_ref_t, const_refs, alloc, 0);
   VARR_CREATE (label_ref_t, label_refs, alloc, 0);
   VARR_CREATE (uint64_t, abs_address_locs, alloc, 0);
   VARR_CREATE (MIR_code_reloc_t, relocs, alloc, 0);
   VARR_CREATE (MIR_code_reloc_t, obj_relocs, alloc, 0);
   VARR_CREATE (call_ref_t, gen_ctx->target_ctx->call_refs, alloc, 0);
+  VARR_CREATE (switch_table_desc_t, switch_table_descs, alloc, 0);
   MIR_type_t res = MIR_T_D;
   MIR_var_t args[] = {{MIR_T_D, "src", 0}};
   _MIR_register_unspec_insn (gen_ctx->ctx, MOVDQA_CODE, "movdqa", 1, &res, 1, FALSE, args);
@@ -3458,12 +3579,14 @@ static void target_finish (gen_ctx_t gen_ctx) {
   VARR_DESTROY (uint8_t, result_code);
   VARR_DESTROY (int, insn_pattern_indexes);
   VARR_DESTROY (uint64_t, const_pool);
+  VARR_DESTROY (void_ptr_t, const_pool_syms);
   VARR_DESTROY (const_ref_t, const_refs);
   VARR_DESTROY (label_ref_t, label_refs);
   VARR_DESTROY (uint64_t, abs_address_locs);
   VARR_DESTROY (MIR_code_reloc_t, relocs);
   VARR_DESTROY (MIR_code_reloc_t, obj_relocs);
   VARR_DESTROY (call_ref_t, gen_ctx->target_ctx->call_refs);
+  VARR_DESTROY (switch_table_desc_t, switch_table_descs);
   MIR_free (alloc, gen_ctx->target_ctx);
   gen_ctx->target_ctx = NULL;
 }

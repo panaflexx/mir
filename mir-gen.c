@@ -202,6 +202,8 @@ DEF_VARR (spot_attr_t);
 
 DEF_VARR (MIR_op_t);
 DEF_VARR (MIR_insn_t);
+DEF_VARR (uint8_t);
+DEF_VARR (uint64_t);
 
 struct gen_ctx {
   MIR_context_t ctx;
@@ -251,6 +253,11 @@ struct gen_ctx {
   VARR (spot_attr_t) * spot2attr;  /* map: spot number -> spot_attr */
   VARR (spot_attr_t) * spot_attrs; /* spot attrs wit only non-zero properies */
   int gen_object_file;
+  /* Module-level PIC address pool (x86-64 AOT): filled when gen_object_file. */
+  VARR (uint8_t) * aot_addrpool;
+  VARR (MIR_code_reloc_t) * aot_addrpool_relocs;
+  VARR (uint64_t) * aot_pool_vals;   /* dedup key: value (0 when sym set) */
+  VARR (void_ptr_t) * aot_pool_syms; /* dedup key: symbol or NULL */
 };
 
 #define optimize_level gen_ctx->optimize_level
@@ -315,9 +322,8 @@ DEF_VARR (func_or_bb_t);
 static inline gen_ctx_t *gen_ctx_loc (MIR_context_t ctx) { return (gen_ctx_t *) ctx; }
 
 DEF_VARR (int);
-DEF_VARR (uint8_t);
-DEF_VARR (uint64_t);
 //DEF_VARR (MIR_code_reloc_t); // Moved to mir.h
+/* uint8_t / uint64_t VARR defined above gen_ctx (AOT addrpool). */
 
 #include "mir-gen-atomic.c"
 #include "mir-gen-tls.c"
@@ -10008,6 +10014,22 @@ void MIR_gen_set_save_relocs (MIR_context_t ctx, unsigned int level) {
   gen_ctx->gen_object_file = level != 0;
 }
 
+void MIR_gen_get_addrpool (MIR_context_t ctx, const uint8_t **bytes, size_t *len,
+                           const MIR_code_reloc_t **out_relocs, size_t *nrelocs) {
+  gen_ctx_t gen_ctx = *gen_ctx_loc (ctx);
+  if (gen_ctx == NULL) {
+    if (bytes) *bytes = NULL;
+    if (len) *len = 0;
+    if (out_relocs) *out_relocs = NULL;
+    if (nrelocs) *nrelocs = 0;
+    return;
+  }
+  if (bytes) *bytes = VARR_ADDR (uint8_t, gen_ctx->aot_addrpool);
+  if (len) *len = VARR_LENGTH (uint8_t, gen_ctx->aot_addrpool);
+  if (out_relocs) *out_relocs = VARR_ADDR (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs);
+  if (nrelocs) *nrelocs = VARR_LENGTH (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs);
+}
+
 
 static void generate_bb_version_machine_code (gen_ctx_t gen_ctx, bb_version_t bb_version);
 static void *bb_version_generator (gen_ctx_t gen_ctx, bb_version_t bb_version);
@@ -10127,6 +10149,10 @@ void MIR_gen_init (MIR_context_t ctx) {
   gen_ctx->ra_ctx = NULL;
   gen_ctx->combine_ctx = NULL;
   gen_ctx->gen_object_file = 0;
+  VARR_CREATE (uint8_t, gen_ctx->aot_addrpool, alloc, 0);
+  VARR_CREATE (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs, alloc, 0);
+  VARR_CREATE (uint64_t, gen_ctx->aot_pool_vals, alloc, 0);
+  VARR_CREATE (void_ptr_t, gen_ctx->aot_pool_syms, alloc, 0);
 #if !MIR_NO_GEN_DEBUG
   debug_file = NULL;
   debug_level = 100;
@@ -10205,6 +10231,10 @@ void MIR_gen_finish (MIR_context_t ctx) {
   bitmap_destroy (insn_to_consider);
   bitmap_destroy (func_used_hard_regs);
   target_finish (gen_ctx);
+  VARR_DESTROY (uint8_t, gen_ctx->aot_addrpool);
+  VARR_DESTROY (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs);
+  VARR_DESTROY (uint64_t, gen_ctx->aot_pool_vals);
+  VARR_DESTROY (void_ptr_t, gen_ctx->aot_pool_syms);
   finish_dead_vars (gen_ctx);
   gen_free (gen_ctx, gen_ctx->data_flow_ctx);
   bitmap_destroy (temp_bitmap);

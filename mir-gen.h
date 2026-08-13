@@ -22,6 +22,12 @@ extern void MIR_gen_set_debug_level (MIR_context_t ctx, int debug_level);
 extern void MIR_gen_set_save_relocs (MIR_context_t ctx, unsigned int level);
 extern void MIR_gen_set_optimize_level (MIR_context_t ctx, unsigned int level);
 extern void *MIR_gen (MIR_context_t ctx, MIR_item_t func_item);
+/* After MIR_gen of all funcs with save_relocs: module-level .mir.addrpool
+   (PIC GOT-shaped slots).  bytes/relocs valid until MIR_gen_finish. */
+extern void MIR_gen_get_addrpool (MIR_context_t ctx, const uint8_t **bytes, size_t *len,
+                                 const MIR_code_reloc_t **out_relocs, size_t *nrelocs);
+/* Symbol name used in func relocs for PC32 against the addrpool section. */
+#define MIR_AOT_ADDRPOOL_NAME ".mir.addrpool"
 extern void MIR_set_gen_interface (MIR_context_t ctx, MIR_item_t func_item);
 extern void MIR_set_lazy_gen_interface (MIR_context_t ctx, MIR_item_t func_item);
 extern void MIR_set_lazy_bb_gen_interface (MIR_context_t ctx, MIR_item_t func_item);

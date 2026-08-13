@@ -54,9 +54,11 @@ Commit per phase (or per cherry-pick group) so regressions can be bisected.
 | | | done | all Phase 3 commits including `e2c0ae95`+`731c2234` unprototyped call ABI |
 | | | note | `bde8658d` superseded by `9c7e7f3b`; unprototyped uses VARARG proto with fixed actual args |
 | | | validation | build OK; cy-validate 58/58; unproto add3 + undeclared printf PASS; JIT smoke OK |
-| 2026-08-13 | 4 | **DEFERRED** | keep `src/b2obj.c` AOT path; do **not** import MadC `mir-debug.c` yet |
-| | | rationale | Header API already present (`mir-debug.h`); CMake deliberately omits `mir-debug.c`. ClassyC has working ELF `b2obj` (~2.6k LOC) + `b2objmac` + `classyc.aot`. MadC layer is ~3.4k LOC + gen capture hooks + dual debug-info reconciliation with `mir-dbinfo`/`dwarf-gen`. High risk, low urgency while b2obj works. |
-| | | optional later | Mine RELRO/PIE/addrpool ideas for b2obj; consider `.debug_frame` CFI (`39963953`) for JIT unwind without full object layer |
+| 2026-08-13 | 4 | **DONE (4c path)** | keep `src/b2obj.c` AOT path; do **not** import MadC `mir-debug.c` |
+| | | 4a | evaluated: reject full `mir-debug.c` / `MIR_object_*` stack |
+| | | 4c | `.debug_frame` CFI (b2obj + b2objmac); full DWARF on b2objmac (single MH_OBJECT segment); **PIC `.mir.addrpool`** on x86-64 Linux (gen + b2obj); `classyc-aot.sh` drops `-no-pie` |
+| | | not taken | RELRO/`DT_DEBUG`/ET_EXEC emitter — system linker already provides final hardening |
+| | | optional later | aarch64 Linux switch-table → addrpool; weak/linkonce if ClassyC gains real weak attrs |
 
 ---
 
@@ -137,8 +139,8 @@ ClassyC equivalent under `cy-validate/`.
 
 ## Phase 4 — `mir-debug.c` + AOT object layer (decision point, then import)
 
-**Status: DEFERRED (2026-08-13).** Keep ClassyC `src/b2obj.c` / `b2objmac` as
-the AOT object path. Do not import MadC `mir-debug.c` in this merge wave.
+**Status: DONE via Step 4c (2026-08-13).** Keep ClassyC `src/b2obj.c` /
+`b2objmac` as the AOT object path. Do not import MadC `mir-debug.c`.
 
 Evaluation (Step 4a):
 - ClassyC already ships a full AOT toolchain: `.bmir` → `b2obj` → ELF `.o`,
