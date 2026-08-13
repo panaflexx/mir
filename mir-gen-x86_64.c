@@ -901,41 +901,14 @@ static void target_machinize (gen_ctx_t gen_ctx) {
       MIR_op_t va_op = insn->ops[0];
       MIR_reg_t va_reg;
 #ifndef _WIN32
-      int gp_offset, fp_offset, mem_offset = 0;
-      int va_int = 0, va_fp = 0; /* GP/FP arg registers consumed by the named args */
-      MIR_var_t var;
+      /* Use the arg passing state left by the prologue walk above: it is the
+         only way to agree with the actual layout (register classes of block
+         args, 8-byte rounding of memory-passed blocks, reg exhaustion). */
+      int gp_offset = (int) (int_arg_num > 6 ? 48 : int_arg_num * 8);
+      int fp_offset = (int) (48 + (fp_arg_num > 8 ? 128 : fp_arg_num * 16));
+      int64_t mem_offset = (int64_t) (mem_size - spill_space_size);
 
       assert (func->vararg_p && va_op.mode == MIR_OP_VAR);
-      /* Compute the va_list reg_save_area offsets exactly as the prologue
-         (target_machinize arg loop) and machinize_call assign argument
-         registers.  Small aggregates passed in registers use the block types
-         MIR_T_BLK+1..+4; only a plain MIR_T_BLK is passed in memory.  Lumping
-         the register-passed blocks into mem_offset (the old behaviour) left
-         gp_offset/fp_offset too low, so the first va_arg wrongly read a named
-         struct parameter's register-save slot. */
-      for (uint32_t narg = 0; narg < func->nargs; narg++) {
-        var = VARR_GET (MIR_var_t, func->vars, narg);
-        if (var.type == MIR_T_F || var.type == MIR_T_D) {
-          if (va_fp < 8) va_fp++; else mem_offset += 8;
-        } else if (var.type == MIR_T_LD) {
-          mem_offset += 16;
-        } else if (var.type == MIR_T_BLK + 1) { /* aggregate fully in GPRs */
-          int nq = (int) ((var.size + 7) / 8);
-          if (va_int + nq <= 6) va_int += nq; else mem_offset += nq * 8;
-        } else if (var.type == MIR_T_BLK + 2) { /* aggregate fully in FPRs */
-          int nq = (int) ((var.size + 7) / 8);
-          if (va_fp + nq <= 8) va_fp += nq; else mem_offset += nq * 8;
-        } else if (var.type == MIR_T_BLK + 3 || var.type == MIR_T_BLK + 4) {
-          /* mixed aggregate: one GPR and one FPR */
-          if (va_int < 6 && va_fp < 8) { va_int++; va_fp++; } else mem_offset += 16;
-        } else if (MIR_blk_type_p (var.type)) { /* plain MIR_T_BLK: passed in memory */
-          mem_offset += var.size;
-        } else { /* scalar or RBLK: one GPR */
-          if (va_int < 6) va_int++; else mem_offset += 8;
-        }
-      }
-      gp_offset = va_int * 8;
-      fp_offset = 48 + va_fp * 16;
       va_reg = va_op.u.var;
       /* Insns can be not simplified as soon as they match a machine insn.  */
       /* mem32[va_reg] = gp_offset; mem32[va_reg] = fp_offset */

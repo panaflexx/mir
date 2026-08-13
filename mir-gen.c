@@ -1695,6 +1695,7 @@ static void build_func_cfg (gen_ctx_t gen_ctx) {
   curr_cfg->max_var = MAX_HARD_REG;
   curr_cfg->root_loop_node = NULL;
   curr_bb_index = 0;
+  jmpi_p = FALSE;
   for (i = 0; i < VARR_LENGTH (MIR_var_t, func->vars); i++) {
     mir_var = VARR_GET (MIR_var_t, func->vars, i);
     update_max_var (gen_ctx, MIR_reg (ctx, mir_var.name, func) + MAX_HARD_REG);
@@ -1960,8 +1961,7 @@ static void build_func_cfg (gen_ctx_t gen_ctx) {
   }
   for (MIR_lref_data_t lref = func->first_lref; lref != NULL; lref = lref->next) {
     VARR_PUSH (MIR_insn_t, temp_insns2, lref->label);
-    if (lref->label2 != NULL)
-      VARR_PUSH (MIR_insn_t, temp_insns2, lref->label2);
+    if (lref->label2 != NULL) VARR_PUSH (MIR_insn_t, temp_insns2, lref->label2);
   }
   qsort (VARR_ADDR (MIR_insn_t, temp_insns2), VARR_LENGTH (MIR_insn_t, temp_insns2),
          sizeof (MIR_insn_t), label_cmp);
@@ -2388,8 +2388,7 @@ static MIR_insn_t get_last_bb_phi_insn (MIR_insn_t phi_insn) {
   for (curr_insn = phi_insn;
        (next_insn = DLIST_NEXT (MIR_insn_t, curr_insn)) != NULL
        && ((bb_insn_t) next_insn->data)->bb == bb && next_insn->code == MIR_PHI;
-       curr_insn = next_insn)
-    ;
+       curr_insn = next_insn);
   return curr_insn;
 }
 
@@ -2580,8 +2579,7 @@ static void remove_insn_ssa_edges (gen_ctx_t gen_ctx, MIR_insn_t insn) {
   ssa_edge_t ssa_edge;
   for (size_t i = 0; i < insn->nops; i++) {
     /* output operand refers to chain of ssa edges -- remove them all: */
-    while ((ssa_edge = insn->ops[i].data) != NULL)
-      remove_ssa_edge (gen_ctx, ssa_edge);
+    while ((ssa_edge = insn->ops[i].data) != NULL) remove_ssa_edge (gen_ctx, ssa_edge);
   }
 }
 
@@ -2889,8 +2887,7 @@ static void make_conventional_ssa (gen_ctx_t gen_ctx) { /* requires life info */
         if ((tail = DLIST_TAIL (bb_insn_t, e->src->bb_insns)) == NULL) {
           for (prev_bb = DLIST_PREV (bb_t, e->src), after = NULL;
                prev_bb != NULL && (after = DLIST_TAIL (bb_insn_t, prev_bb->bb_insns)) == NULL;
-               prev_bb = DLIST_PREV (bb_t, prev_bb))
-            ;
+               prev_bb = DLIST_PREV (bb_t, prev_bb));
           if (after != NULL)
             MIR_insert_insn_after (ctx, curr_func_item, after->insn, new_insn);
           else
@@ -3153,8 +3150,7 @@ static void transform_addrs (gen_ctx_t gen_ctx) {
             gen_add_insn_after (gen_ctx, insn, new_insn);
             gen_assert (insn->ops[op_num].mode == MIR_OP_VAR);
             insn->ops[op_num].u.var = new_reg;
-            while ((se = insn->ops[op_num].data) != NULL)
-              remove_ssa_edge (gen_ctx, se);
+            while ((se = insn->ops[op_num].data) != NULL) remove_ssa_edge (gen_ctx, se);
             if (!ssa_rebuild_p) {
               add_ssa_edge (gen_ctx, addr_insn->data, 0, new_insn->data, 0);
               add_ssa_edge (gen_ctx, bb_insn, op_num, new_insn->data, 1);
@@ -3170,8 +3166,7 @@ static void transform_addrs (gen_ctx_t gen_ctx) {
                           && insn->ops[op_num].u.var_mem.base == reg);
               insn->ops[op_num].u.var_mem.base = new_reg;
             }
-            if (insn->ops[op_num].data != NULL)
-              remove_ssa_edge (gen_ctx,insn->ops[op_num].data);
+            if (insn->ops[op_num].data != NULL) remove_ssa_edge (gen_ctx, insn->ops[op_num].data);
             if (!ssa_rebuild_p) {
               add_ssa_edge (gen_ctx, addr_insn->data, 0, new_insn->data, 1);
               add_ssa_edge (gen_ctx, new_insn->data, 0, bb_insn, op_num);
@@ -3228,8 +3223,7 @@ static int64_t gen_int_log2 (int64_t i) {
   int64_t n;
 
   if (i <= 0) return -1;
-  for (n = 0; (i & 1) == 0; n++, i >>= 1)
-    ;
+  for (n = 0; (i & 1) == 0; n++, i >>= 1);
   return i == 1 ? n : -1;
 }
 
@@ -3516,7 +3510,7 @@ static void copy_prop (gen_ctx_t gen_ctx) {
                                  _MIR_new_var_op (ctx, def_insn->ops[1].u.var),
                                  _MIR_new_var_op (ctx, new_reg));
         gen_add_insn_before (gen_ctx, insn, new_insn);
-        remove_ssa_edge (gen_ctx, se);                                         /* r1 */
+        remove_ssa_edge (gen_ctx, se);                                /* r1 */
         add_ssa_edge (gen_ctx, mov_insn->data, 0, new_insn->data, 2); /* t */
         se = def_insn->ops[1].data;
         add_ssa_edge (gen_ctx, se->def, se->def_op_num, new_insn->data, 1); /* r2 */
@@ -4247,15 +4241,13 @@ static void remove_edge_phi_ops (gen_ctx_t gen_ctx, edge_t e) {
   ssa_edge_t se;
 
   for (nop = 1, e2 = DLIST_HEAD (in_edge_t, e->dst->in_edges); e2 != NULL && e2 != e;
-       e2 = DLIST_NEXT (in_edge_t, e2), nop++)
-    ;
+       e2 = DLIST_NEXT (in_edge_t, e2), nop++);
   gen_assert (e2 != NULL);
   for (bb_insn_t bb_insn = DLIST_HEAD (bb_insn_t, e->dst->bb_insns); bb_insn != NULL;
        bb_insn = DLIST_NEXT (bb_insn_t, bb_insn)) {
     if ((insn = bb_insn->insn)->code == MIR_LABEL) continue;
     if (insn->code != MIR_PHI) break;
-    if ((se = insn->ops[nop].data) != NULL)
-      remove_ssa_edge (gen_ctx, se);
+    if ((se = insn->ops[nop].data) != NULL) remove_ssa_edge (gen_ctx, se);
     for (i = nop; i + 1 < insn->nops; i++) {
       insn->ops[i] = insn->ops[i + 1];
       /* se can be null from some previously removed BB insn: */
@@ -6895,6 +6887,12 @@ static void jump_opt (gen_ctx_t gen_ctx) {
     }
     for (i = start_nop; i < bound_nop; i++)
       bitmap_set_bit_p (temp_bitmap, bb_insn->insn->ops[i].u.label->ops[0].u.u);
+  }
+  /* The same holds for labels whose address is stored in lref data, and
+     gen_setup_lrefs would read the freed label insns (issue #424): */
+  for (MIR_lref_data_t lref = curr_func_item->u.func->first_lref; lref != NULL; lref = lref->next) {
+    bitmap_set_bit_p (temp_bitmap, lref->label->ops[0].u.u);
+    if (lref->label2 != NULL) bitmap_set_bit_p (temp_bitmap, lref->label2->ops[0].u.u);
   }
   for (bb = DLIST_EL (bb_t, curr_cfg->bbs, 2); bb != NULL; bb = next_bb) {
     edge_t e, out_e;
@@ -10054,8 +10052,7 @@ static void create_bb_stubs (gen_ctx_t gen_ctx) {
       last_lab_insn = insn;
       if (insn->code == MIR_LABEL)
         for (insn = DLIST_NEXT (MIR_insn_t, insn); insn != NULL && insn->code == MIR_LABEL;
-             last_lab_insn = insn, insn = DLIST_NEXT (MIR_insn_t, insn))
-          ;
+             last_lab_insn = insn, insn = DLIST_NEXT (MIR_insn_t, insn));
       insn = last_lab_insn;
       n_bbs++;
     }

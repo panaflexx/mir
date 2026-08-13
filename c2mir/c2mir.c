@@ -404,9 +404,7 @@ typedef struct {
 #error "undefined or unsupported generation target for C"
 #endif
 
-static inline MIR_alloc_t c2m_alloc (c2m_ctx_t c2m_ctx) {
-  return MIR_get_alloc (c2m_ctx->ctx);
-}
+static inline MIR_alloc_t c2m_alloc (c2m_ctx_t c2m_ctx) { return MIR_get_alloc (c2m_ctx->ctx); }
 
 static void *reg_malloc (c2m_ctx_t c2m_ctx, size_t s) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
@@ -1096,7 +1094,8 @@ static void finish_streams (c2m_ctx_t c2m_ctx) {
   VARR_DESTROY (stream_t, streams);
 }
 
-static stream_t new_stream (MIR_alloc_t alloc, FILE *f, const char *fname, int (*getc_func) (c2m_ctx_t)) {
+static stream_t new_stream (MIR_alloc_t alloc, FILE *f, const char *fname,
+                            int (*getc_func) (c2m_ctx_t)) {
   stream_t s = MIR_malloc (alloc, sizeof (struct stream));
 
   VARR_CREATE (char, s->ln, alloc, 128);
@@ -3185,14 +3184,12 @@ static void transform_to_header (c2m_ctx_t c2m_ctx, VARR (token_t) * buffer) {
   token_t t;
   pos_t pos;
 
-  for (i = 0; i < VARR_LENGTH (token_t, buffer) && VARR_GET (token_t, buffer, i)->code == ' '; i++)
-    ;
+  for (i = 0; i < VARR_LENGTH (token_t, buffer) && VARR_GET (token_t, buffer, i)->code == ' '; i++);
   if (i >= VARR_LENGTH (token_t, buffer)) return;
   if ((t = VARR_GET (token_t, buffer, i))->node_code != N_LT) return;
   pos = t->pos;
   for (j = i + 1;
-       j < VARR_LENGTH (token_t, buffer) && VARR_GET (token_t, buffer, j)->node_code != N_GT; j++)
-    ;
+       j < VARR_LENGTH (token_t, buffer) && VARR_GET (token_t, buffer, j)->node_code != N_GT; j++);
   if (j >= VARR_LENGTH (token_t, buffer)) return;
   VARR_TRUNC (char, symbol_text, 0);
   VARR_TRUNC (char, temp_string, 0);
@@ -6524,8 +6521,8 @@ static void symbol_clear (symbol_t sym, void *arg MIR_UNUSED) { VARR_DESTROY (no
 
 static void symbol_init (c2m_ctx_t c2m_ctx) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
-  HTAB_CREATE_WITH_FREE_FUNC (symbol_t, symbol_tab, alloc, 5000, symbol_hash, symbol_eq, symbol_clear,
-                              NULL);
+  HTAB_CREATE_WITH_FREE_FUNC (symbol_t, symbol_tab, alloc, 5000, symbol_hash, symbol_eq,
+                              symbol_clear, NULL);
 }
 
 static int symbol_find (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
@@ -7404,8 +7401,7 @@ static int incomplete_type_p (c2m_ctx_t c2m_ctx, struct type *type) {
 
     if (NL_EL (n->u.ops, 1)->code == N_IGNORE) return TRUE;
     for (scope = curr_scope; scope != NULL && scope != top_scope && scope != n;
-         scope = ((struct node_scope *) scope->attr)->scope)
-      ;
+         scope = ((struct node_scope *) scope->attr)->scope);
     return scope == n;
   }
   case TM_PTR: return FALSE;
@@ -11608,8 +11604,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         error (c2m_ctx, POS (r), "asm register decl should be at the top level");
       } else {
         asm_str = NL_HEAD (asm_part->u.ops)->u.s.s;
-        for (i = 0; asm_str[i] != '\0' && _MIR_name_char_p (c2m_ctx->ctx, asm_str[i], i == 0); i++)
-          ;
+        for (i = 0; asm_str[i] != '\0' && _MIR_name_char_p (c2m_ctx->ctx, asm_str[i], i == 0); i++);
         if (asm_str[i] != '\0') {
           error (c2m_ctx, POS (r), "asm register name %s contains wrong char '%c'", asm_str,
                  asm_str[i]);
@@ -15240,7 +15235,7 @@ static MIR_item_t get_string_data (c2m_ctx_t c2m_ctx, node_t n) {
 
   _MIR_get_temp_item_name (ctx, module, buff, sizeof (buff));
   if (n->code == N_STR) {
-    data = MIR_new_string_data (ctx, buff, (MIR_str_t){n->u.s.len, n->u.s.s});
+    data = MIR_new_string_data (ctx, buff, (MIR_str_t) {n->u.s.len, n->u.s.s});
   } else {
     assert (n->code == N_STR16 || n->code == N_STR32);
     if (n->code == N_STR16) {
