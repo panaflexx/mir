@@ -12942,10 +12942,8 @@ static void add_union_member_conflicts (c2m_ctx_t c2m_ctx, struct type *type,
 
   switch (type->mode) {
   case TM_ARR: add_union_member_conflicts (c2m_ctx, type->u.arr_type->el_type, union_alias); break;
-  case TM_VECTOR:
-    add_union_member_conflicts (c2m_ctx, type->u.vector_type->el_type, union_alias);
-    break;
   case TM_STRUCT:
+  case TM_CLASS:
   case TM_UNION:
     if (type->mode == TM_UNION && (alias = get_type_alias (c2m_ctx, type)) != 0)
       MIR_add_alias_conflict (ctx, union_alias, alias);
