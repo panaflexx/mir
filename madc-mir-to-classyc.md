@@ -45,7 +45,11 @@ Commit per phase (or per cherry-pick group) so regressions can be bisected.
 | | | validation | build classyc/lsp/b2obj/c2m OK; 10/10 new MIR c-tests PASS; cy-validate 58/58 PASS; JIT example + b2obj AOT smoke OK |
 | | | conflicts | `mir-gen.c` (kept ClassyC atomics/TLS/dbinfo + upstream opts); `mir.c` (kept TLS/isolation + code reserve); `c2mir/c2mir.c` (kept ClassyC-extended c2mir — already had MIR #448/#449/#451/#452/#459 backports with `TM_CLASS`) |
 | | | note | Working-tree `mir.c` was truncated mid-merge (lost first ~945 lines); rebuilt via clean 3-way. Arch backends (aarch64/x86_64/ppc/riscv/s390x) already carried the upstream ABI fixes in ClassyC HEAD. |
-| | 2 | in progress | cherry-picks from `madc` branch |
+| 2026-08-13 | 2 | **DONE** | cherry-picks on `madc-import` (see below) |
+| | | applied | `ebf825f7` → `037154c8`; `5df536f6` → `85bf6a39`; `d3a5cced` → `948bc73a`; `7a909601` → `58cd3f91` + ClassyC adapt `2e018fb0` |
+| | | skipped | `c40ed469` (empty — already covered by Phase 1 `ded4b82c`/`940eeacf`); `8864a739` (all 5 fixes already present) |
+| | | classyc.c | ported `MIR_add_alias_conflict` registration (`get_type_alias` / `add_union_member_conflicts` / `union_alias_done`) — uncommitted in parent until parent commit |
+| | | validation | build OK; cy-validate 58/58 PASS; struct-ret-multi-return + va-struct-args + issue456/458 PASS; JIT + b2obj smoke OK |
 
 ---
 
@@ -89,16 +93,16 @@ matter for classyc but keep `c2m` building.
 
 ## Phase 2 — Backend (mir/mir-gen) cherry-picks from `madc`
 
-Apply after Phase 1. Ordered by risk (low first).
+**Status: DONE** on `madc-import`.
 
-| Commit | What | Files | Conflict risk / notes |
-|---|---|---|---|
-| `ebf825f7` | vararg functions with no named parameter | `mir.c` (−3 lines) | trivial |
-| `5df536f6` | x86-64: skip code-holder reservation (rel32 ±2 GB) | `mir.c` | low; **supersedes** upstream `9f8dbce7` on x86-64 — verify they compose |
-| `c40ed469` | SysV varargs register-save-area boundary + mixed-class struct va_arg | `mir-gen-x86_64.c`, `mir-x86_64.c` | low; complements upstream `940eeacf` |
-| `d3a5cced` | canonical result regs for multi-RET (struct-by-value) | `mir.c` + test | medium (mir.c heavily ours) |
-| `7a909601` | union access classes must conflict with member classes | `mir-gen.c`, `mir.c`, `mir.h`, `c2mir.c` | medium; mir.h adds an API — keep adjacent to our additions; also port c2mir part to classyc.c |
-| `8864a739` (residue) | 5 community fixes | `mir-gen.c`, `mir.c` | **mostly done**: we already have `MAX_INSN_RELOAD_MEM_OPS 4`, addr_regs rebuild, lref-label preservation, and `remove_item` NULL-guards. Only take the vararg RET-count use-after-NULL bit if absent — verify during application, likely skip whole commit. |
+| Commit | What | Result |
+|---|---|---|
+| `ebf825f7` | vararg functions with no named parameter | **applied** `037154c8` |
+| `5df536f6` | x86-64: skip code-holder reservation (rel32 ±2 GB) | **applied** `85bf6a39` (composes with Phase 1 reserve: `#if !x86_64`) |
+| `c40ed469` | SysV varargs RSA boundary + mixed-class va_arg | **skipped** (empty after resolve; Phase 1 `ded4b82c` prologue-state va_start + `940eeacf` fp_offset+=16 already present) |
+| `d3a5cced` | canonical result regs for multi-RET (struct-by-value) | **applied** `948bc73a` + test `struct-ret-multi-return.c` |
+| `7a909601` | union access classes must conflict with member classes | **applied** `58cd3f91`; ClassyC adapt `2e018fb0` (TM_CLASS not TM_VECTOR); **ported to `src/classyc.c`** |
+| `8864a739` (residue) | 5 community fixes | **skipped** — all present: `MAX_INSN_RELOAD_MEM_OPS 4`, addr_regs rebuild, lref jump_opt, remove_item NULL-guards, RET-count `cf_nres` save |
 
 Skip (verified already present in our fork): `MAX_INSN_RELOAD_MEM_OPS` bump,
 addr_regs rebuild, jump_opt lref labels, remove_item guards.
