@@ -2431,15 +2431,19 @@ static int aot_pic_addrpool_p (gen_ctx_t gen_ctx) {
 #endif
 }
 
-/* Module-level .mir.addrpool slot (16-byte), shared across functions. */
+/* Module-level .mir.addrpool slot (16-byte), shared across functions.
+   Switch tables are appended into the same pool, so slot i is NOT at i*16.
+   Dedup must return the stored byte offset.  Empty item names (anonymous
+   MIR data) are treated as unnamed so they do not all collapse to one key. */
 static size_t aot_addrpool_slot (gen_ctx_t gen_ctx, uint64_t val, const char *sym) {
   size_t i, n = VARR_LENGTH (uint64_t, gen_ctx->aot_pool_vals);
+  if (sym != NULL && sym[0] == '\0') sym = NULL;
   uint64_t key_val = sym != NULL ? 0 : val;
   for (i = 0; i < n; i++) {
     const char *s = (const char *) VARR_GET (void_ptr_t, gen_ctx->aot_pool_syms, i);
     if (VARR_GET (uint64_t, gen_ctx->aot_pool_vals, i) == key_val
         && ((s == NULL && sym == NULL) || (s != NULL && sym != NULL && strcmp (s, sym) == 0)))
-      return i * 16;
+      return (size_t) VARR_GET (uint64_t, gen_ctx->aot_pool_offs, i);
   }
   size_t off = VARR_LENGTH (uint8_t, gen_ctx->aot_addrpool);
   while (off % 16 != 0) {
@@ -2461,6 +2465,7 @@ static size_t aot_addrpool_slot (gen_ctx_t gen_ctx, uint64_t val, const char *sy
   }
   VARR_PUSH (uint64_t, gen_ctx->aot_pool_vals, key_val);
   VARR_PUSH (void_ptr_t, gen_ctx->aot_pool_syms, (void *) sym);
+  VARR_PUSH (uint64_t, gen_ctx->aot_pool_offs, (uint64_t) off);
   return off;
 }
 

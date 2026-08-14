@@ -298,6 +298,7 @@ struct gen_ctx {
   VARR (MIR_code_reloc_t) * aot_addrpool_relocs;
   VARR (uint64_t) * aot_pool_vals;   /* dedup key: value (0 when sym set) */
   VARR (void_ptr_t) * aot_pool_syms; /* dedup key: symbol or NULL */
+  VARR (uint64_t) * aot_pool_offs;   /* actual byte offset of each slot in aot_addrpool */
 };
 
 #define optimize_level gen_ctx->optimize_level
@@ -10686,6 +10687,7 @@ void MIR_gen_init (MIR_context_t ctx) {
   VARR_CREATE (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs, alloc, 0);
   VARR_CREATE (uint64_t, gen_ctx->aot_pool_vals, alloc, 0);
   VARR_CREATE (void_ptr_t, gen_ctx->aot_pool_syms, alloc, 0);
+  VARR_CREATE (uint64_t, gen_ctx->aot_pool_offs, alloc, 0);
 #if !MIR_NO_GEN_DEBUG
   debug_file = NULL;
   debug_level = 100;
@@ -10768,6 +10770,7 @@ void MIR_gen_finish (MIR_context_t ctx) {
   VARR_DESTROY (MIR_code_reloc_t, gen_ctx->aot_addrpool_relocs);
   VARR_DESTROY (uint64_t, gen_ctx->aot_pool_vals);
   VARR_DESTROY (void_ptr_t, gen_ctx->aot_pool_syms);
+  VARR_DESTROY (uint64_t, gen_ctx->aot_pool_offs);
   finish_dead_vars (gen_ctx);
   gen_free (gen_ctx, gen_ctx->data_flow_ctx);
   bitmap_destroy (temp_bitmap);
